@@ -6,7 +6,7 @@
 //! - ~21% carry a language/group prefix: `NC - `, `NO - `, `SE - `, `DK -`,
 //!   `NC:`, `SE:`, `NC :` and `Vod: `. Rule: strip exactly two ASCII uppercase
 //!   letters followed by `:` or `-` (with whitespace rules below), plus the
-//!   literal `Vod:` and `Series:`. 3+ letter prefixes (`CSI:`, `FBI:`) are real
+//!   literal `Vod:` and `Series:`. 3+ letter prefixes (e.g. `XYZ:`) are real
 //!   titles and are NOT stripped.
 //! - A trailing country tag like `(US)`/`(AR)` and a year `(2019)` are kept in
 //!   the show name: "Show (2019)" and "Show" are deliberately NOT merged because
@@ -90,10 +90,17 @@ fn marker_at(b: &[u8], i: usize) -> Option<(usize, u32, u32)> {
         e = ev?;
     } else if b[i].is_ascii_digit() {
         let (j, sv) = digits(b, i);
+        // NxM style: reject resolutions like 1920x1080 (season <= 99, episode <= 999)
+        if sv.map_or(true, |v| v > 99) {
+            return None;
+        }
         if j >= b.len() || !(b[j] == b'x' || b[j] == b'X') {
             return None;
         }
         let (k, ev) = digits(b, j + 1);
+        if ev.map_or(true, |v| v > 999) {
+            return None;
+        }
         end = k;
         s = sv?;
         e = ev?;
@@ -115,7 +122,8 @@ pub fn parse_episode(name: &str) -> Option<EpisodeRef> {
             continue;
         }
         if let Some((_, s, e)) = marker_at(b, i) {
-            found = Some((i, s, e)); // keep the last marker
+            found = Some((i, s, e)); // first valid marker wins
+            break;
         }
     }
     let (i, season, episode) = found?;
@@ -123,7 +131,12 @@ pub fn parse_episode(name: &str) -> Option<EpisodeRef> {
     if show.is_empty() {
         return None;
     }
-    Some(EpisodeRef { show: show.split_whitespace().collect::<Vec<_>>().join(" "), season, episode })
+    let mut show = show.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Reserve the catch-all name: a real show called "(Unsorted)" must not collide.
+    if show.eq_ignore_ascii_case(UNSORTED) {
+        show.push_str(" (show)");
+    }
+    Some(EpisodeRef { show, season, episode })
 }
 
 fn key_of(show: &str) -> String {
@@ -209,10 +222,10 @@ mod tests {
 
     #[test]
     fn parses_sxxexx_variants() {
-        assert_eq!(parse_episode("Breaking Bad S01E02"), r("Breaking Bad", 1, 2));
-        assert_eq!(parse_episode("Breaking Bad s1e2"), r("Breaking Bad", 1, 2));
-        assert_eq!(parse_episode("Breaking Bad 1x02"), r("Breaking Bad", 1, 2));
-        assert_eq!(parse_episode("Breaking Bad S01 E02"), r("Breaking Bad", 1, 2));
+        assert_eq!(parse_episode("Fake Show S01E02"), r("Fake Show", 1, 2));
+        assert_eq!(parse_episode("Fake Show s1e2"), r("Fake Show", 1, 2));
+        assert_eq!(parse_episode("Fake Show 1x02"), r("Fake Show", 1, 2));
+        assert_eq!(parse_episode("Fake Show S01 E02"), r("Fake Show", 1, 2));
         assert_eq!(parse_episode("Show (2019) S02 E10"), r("Show (2019)", 2, 10));
         assert_eq!(parse_episode("Show - S01E01"), r("Show", 1, 1));
     }
@@ -223,8 +236,30 @@ mod tests {
         assert_eq!(parse_episode("NC - Fake Show S01E01"), r("Fake Show", 1, 1));
         assert_eq!(parse_episode("DK - Fake Show S01E01"), r("Fake Show", 1, 1));
         assert_eq!(parse_episode("Vod: Fake Show S01E01"), r("Fake Show", 1, 1));
-        assert_eq!(parse_episode("CSI: Nowhere S01E01"), r("CSI: Nowhere", 1, 1));
+        assert_eq!(parse_episode("XYZ: Nowhere S01E01"), r("XYZ: Nowhere", 1, 1));
         assert_eq!(parse_episode("Yu-Fake S01E01"), r("Yu-Fake", 1, 1));
+    }
+
+    #[test]
+    fn first_marker_wins() {
+        assert_eq!(parse_episode("Fake Show S01E01 S01E02"), r("Fake Show", 1, 1));
+        assert_eq!(parse_episode("Fake Show S01E02 Title 1x03"), r("Fake Show", 1, 2));
+    }
+
+    #[test]
+    fn resolutions_do_not_parse() {
+        assert_eq!(parse_episode("Fake Show 1920x1080"), None);
+        assert_eq!(parse_episode("Fake Show 720x480 S01E01"), r("Fake Show 720x480", 1, 1));
+    }
+
+    #[test]
+    fn show_named_unsorted_does_not_collide() {
+        let lib = Library::build(vec![s(1, "(Unsorted) S01E01"), s(2, "junk")]);
+        let sh = lib.shows();
+        assert_eq!(sh.len(), 2);
+        assert_eq!(sh[0].name, "(Unsorted) (show)");
+        assert_eq!(sh[1].name, UNSORTED);
+        assert_eq!(sh[1].seasons[0].episodes, vec![1]);
     }
 
     #[test]
