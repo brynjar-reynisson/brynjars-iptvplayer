@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn percent_decode_does_not_panic_on_multibyte() {
         assert_eq!(redact_url("http://h/x?%a\u{e9}=x"), "http://h/x?%a\u{e9}=***");
-        assert_eq!(redact_url("http://h/x?%\u{e9}=x&%=y&%4=z"), "http://h/x?%\u{e9}=***&%=y&%4=z");
+        assert_eq!(redact_url("http://h/x?%\u{e9}=x&%=y&%4=z"), "http://h/x?%\u{e9}=***&%=***&%4=***");
     }
 
     #[test]
