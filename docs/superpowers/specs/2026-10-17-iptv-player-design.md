@@ -1,10 +1,10 @@
 # IPTV Player for Windows — Design
 
 ## Intent and why
-The user has a paid IPTV subscription and an Android app that browses and plays it well. On Windows the alternatives split the job: a selector app that launches VLC, and VLC gives up on streams that stall or glitch. The goal is a single Windows desktop app, written in Rust, that browses the subscription's playlist and plays it in the same window, and that **keeps retrying a broken stream until the user changes channel**.
+The user has a paid IPTV subscription with an IPTV provider. The reference app is an Android app (licensed separately) that works as a subscription manager: on startup it lets you select a subscription, then browses and plays it well. The user has only one subscription, so a subscription-selection step is unnecessary here. On Windows the alternatives split the job: a selector app that launches VLC, and VLC gives up on streams that stall or glitch. The goal is a single Windows desktop app, written in Rust, that browses the subscription's playlist and plays it in the same window, and that **keeps retrying a broken stream until the user changes channel**.
 
 ## What was learned from the Android APK (recon, 2026-10-17)
-- The APK is a thin Android TV shell: WebView + ExoPlayer 2 (HLS/DASH/SmoothStreaming/RTSP, plus FFmpeg audio decoder extension). The browsing UI is remote JavaScript downloaded from the app's server at launch, so **there is nothing to port from the APK**; the UI is designed fresh. the Android app login/SignalR/native secrets are out of scope.
+- The APK is a thin Android TV shell: WebView + ExoPlayer 2 (HLS/DASH/SmoothStreaming/RTSP, plus FFmpeg audio decoder extension). The browsing UI is remote JavaScript downloaded from the app's server at launch, so **there is nothing to port from the APK**; the UI is designed fresh. the Android app's subscription selection, login, SignalR and native secrets are out of scope.
 - The Android "spinner, then big '!' and no retry until reselect" behaviour is something we deliberately do better.
 
 ## The input: a single Xtream-style M3U playlist
@@ -23,7 +23,7 @@ The user has a paid IPTV subscription and an Android app that browses and plays 
 7. Fast startup: parse the playlist once, store a compact local cache, load from cache on launch; refresh on demand (button/key) and optionally when stale.
 
 ## Non-goals
-- the Android app login/authentication; obtaining the playlist URL.
+- the Android app's subscription management/login; obtaining the the provider playlist URL (the user supplies it).
 - EPG/TV guide, recording, casting, Android/TV/remote-control UI, mobile.
 - Xtream `player_api.php` integration (playlist file only).
 - Cross-platform polish (Windows 11 is the target; don't gratuitously break Linux/macOS).
