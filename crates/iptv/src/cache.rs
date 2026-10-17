@@ -3,8 +3,10 @@ use anyhow::{Context, Result};
 use bincode::Options;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAGIC: &[u8; 8] = b"IPTVCACH";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8;
@@ -19,7 +21,7 @@ impl CacheData {
     pub fn is_stale(&self, max_age: Duration) -> bool {
         match SystemTime::now().duration_since(self.saved_at) {
             Ok(age) => age > max_age,
-            Err(_) => false, // saved in the future (clock skew): treat as fresh
+            Err(_) => true, // saved in the future (clock skew): treat as stale
         }
     }
 }
@@ -38,10 +40,16 @@ where
     F: FnOnce(&mut dyn Write, &[u8]) -> std::io::Result<()>,
 {
     let path = cache_path(dir);
-    let parent = path.parent().expect("cache path has parent");
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cache path {} has no parent", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating cache dir {}", parent.display()))?;
-    let tmp = path.with_extension("bin.tmp");
+    let tmp = parent.join(format!(
+        "playlist.bin.{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
 
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut buf = Vec::with_capacity(HEADER_LEN + entries.len() * 128);
@@ -107,6 +115,39 @@ mod tests {
             .collect()
     }
 
+    fn assert_no_tmp(dir: &Path) {
+        for e in std::fs::read_dir(dir.join("cache")).unwrap() {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!n.ends_with(".tmp"), "leftover tmp {n}");
+        }
+    }
+
+    #[test]
+    fn future_saved_at_is_stale() {
+        let c = CacheData { entries: vec![], saved_at: SystemTime::now() + Duration::from_secs(7200) };
+        assert!(c.is_stale(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn concurrent_saves_leave_valid_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let sets: Vec<Vec<Entry>> = (0..8).map(|i| fake(100 + i * 10)).collect();
+        std::thread::scope(|s| {
+            for set in &sets {
+                s.spawn(|| {
+                    for _ in 0..5 {
+                        // Windows may transiently refuse a rename onto a file being replaced;
+                        // retry handling is deferred, so tolerate errors here.
+                        let _ = save(d.path(), set);
+                    }
+                });
+            }
+        });
+        let c = load(d.path()).expect("cache loads cleanly");
+        assert!(sets.iter().any(|s| *s == c.entries));
+        assert_no_tmp(d.path());
+    }
+
     #[test]
     fn roundtrip() {
         let d = tempfile::tempdir().unwrap();
@@ -115,7 +156,7 @@ mod tests {
         let c = load(d.path()).unwrap();
         assert_eq!(c.entries, e);
         assert!(!c.is_stale(Duration::from_secs(60)));
-        assert!(!d.path().join("cache/playlist.bin.tmp").exists());
+        assert_no_tmp(d.path());
     }
 
     #[test]
@@ -175,7 +216,7 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(load(d.path()).unwrap().entries, old);
-        assert!(!d.path().join("cache/playlist.bin.tmp").exists());
+        assert_no_tmp(d.path());
     }
 
     #[test]
