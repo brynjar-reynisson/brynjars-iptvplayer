@@ -11,6 +11,7 @@ Rust Windows desktop IPTV player (browse + play in one window, with persistent s
 ## Build / run
 - Toolchain: Rust stable, MSVC (`rustup default stable-x86_64-pc-windows-msvc`; needs VS Build Tools with the C++ workload). Run cargo from a normal shell with `%USERPROFILE%\.cargo\bin` on PATH.
 - Workspace: `crates/iptv` (library: parsing, config, redaction, ...) and `crates/iptv-player` (egui binary).
+- Series: `iptv::series` groups Kind::Series entries into shows/seasons (strips 2-letter language prefixes like `NC - `/`SE:`/`Vod:`, keeps year in show name, unparsed go to `(Unsorted)`); exposed via `Library::shows()`.
 - `cargo test -p iptv` runs unit tests. `cargo run -p iptv-player` runs the app.
 - Config: copy `config.example.toml` to `config.toml` (gitignored) beside the exe (or in `--data-dir` / `IPTV_DATA_DIR`) and set `playlist_url`. Lookup order: CLI, env, exe directory. Always print URLs via `iptv::redact::redact_url`.
 - Dependencies are added per task; eframe, reqwest and libmpv2 arrive with the tasks that use them.

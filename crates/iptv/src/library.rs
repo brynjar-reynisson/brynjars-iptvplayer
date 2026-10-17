@@ -1,4 +1,5 @@
 use crate::playlist::{favorite_key, Entry, Kind};
+use crate::series::{Builder, Show};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub struct Library {
     countries: Vec<Country>,
     movies: Vec<usize>,
     by_key: HashMap<String, usize>,
+    shows: Vec<Show>,
 }
 
 const OTHER: &str = "Other";
@@ -23,6 +25,7 @@ impl Library {
         let mut pos: HashMap<String, usize> = HashMap::new();
         let mut other: Vec<usize> = Vec::new();
         let mut movies = Vec::new();
+        let mut series = Builder::new();
         let mut by_key = HashMap::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
             by_key.entry(favorite_key(e)).or_insert(i);
@@ -38,17 +41,21 @@ impl Library {
                     None => other.push(i),
                 },
                 Kind::Movie => movies.push(i),
-                Kind::Series => {}
+                Kind::Series => series.add(i, &e.name),
             }
         }
         if !other.is_empty() {
             countries.push(Country { name: OTHER.to_string(), channels: other });
         }
-        Library { entries, countries, movies, by_key }
+        Library { entries, countries, movies, by_key, shows: series.finish() }
     }
 
     pub fn countries(&self) -> &[Country] {
         &self.countries
+    }
+
+    pub fn shows(&self) -> &[Show] {
+        &self.shows
     }
 
     pub fn entry(&self, idx: usize) -> &Entry {
@@ -140,6 +147,8 @@ mod tests {
         let n = es.len();
         let t = std::time::Instant::now();
         let lib = Library::build(es);
-        println!("entries={n} countries={} movies={} build={:?}", lib.countries().len(), lib.movies().len(), t.elapsed());
+        let el = t.elapsed();
+        let un = lib.shows().iter().find(|s| s.name == crate::series::UNSORTED).map(|s| s.seasons[0].episodes.len()).unwrap_or(0);
+        println!("entries={n} countries={} movies={} shows={} unsorted={un} build={el:?}", lib.countries().len(), lib.movies().len(), lib.shows().len());
     }
 }
