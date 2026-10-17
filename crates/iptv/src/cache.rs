@@ -3,10 +3,8 @@ use anyhow::{Context, Result};
 use bincode::Options;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAGIC: &[u8; 8] = b"IPTVCACH";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8;
@@ -45,11 +43,7 @@ where
         .ok_or_else(|| anyhow::anyhow!("cache path {} has no parent", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating cache dir {}", parent.display()))?;
-    let tmp = parent.join(format!(
-        "playlist.bin.{}.{}.tmp",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let tmp = crate::fsutil::unique_tmp_path(&path, "tmp");
 
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut buf = Vec::with_capacity(HEADER_LEN + entries.len() * 128);
@@ -66,7 +60,7 @@ where
         f.flush()?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &path)
+        crate::fsutil::rename_with_retry(&tmp, &path, 3, Duration::from_millis(50))
     })();
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);

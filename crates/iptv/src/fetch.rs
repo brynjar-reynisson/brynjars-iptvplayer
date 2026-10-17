@@ -8,12 +8,10 @@ use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SAVE_ATTEMPTS: u32 = 3;
 const PROGRESS_STEP: u64 = 256 * 1024;
 
@@ -55,13 +53,7 @@ fn scrub(msg: &str, url: &str) -> String {
 }
 
 fn unique_tmp(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(format!(
-        ".{}.{}.part",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    dest.with_file_name(name)
+    crate::fsutil::unique_tmp_path(dest, "part")
 }
 
 /// Download `url` to `dest` (atomically: temp file + rename, only if complete).
@@ -134,17 +126,8 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u
     f.sync_all().map_err(|e| anyhow!("syncing temp file: {e}"))?;
     drop(f);
     progress(total);
-    let mut last = None;
-    for attempt in 0..SAVE_ATTEMPTS {
-        match std::fs::rename(tmp, dest) {
-            Ok(()) => return Ok(()),
-            Err(e) => last = Some(e),
-        }
-        if attempt + 1 < SAVE_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    Err(anyhow!("moving download into place: {}", last.unwrap()))
+    crate::fsutil::rename_with_retry(tmp, dest, SAVE_ATTEMPTS, Duration::from_millis(100))
+        .map_err(|e| anyhow!("moving download into place: {e}"))
 }
 
 /// Load the on-disk cache and build the library. Safe to call from a background thread.
@@ -301,6 +284,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const M3U: &str = "#EXTM3U\n#EXTINF:-1 tvg-id=\"a\" group-title=\"G\",Chan A\nhttp://example.invalid/live/1\n#EXTINF:-1 tvg-id=\"b\" group-title=\"G\",Chan B\nhttp://example.invalid/live/2\n";
 

@@ -1,12 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-// Duplicated minimally from cache.rs (unique tmp name per save) to avoid restructuring it.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_LABEL_CHARS: usize = 200;
+const FORMAT_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FavoriteItem {
@@ -14,11 +11,23 @@ pub struct FavoriteItem {
     pub label: String,
 }
 
+#[derive(Serialize)]
+struct FileOut<'a> {
+    version: u64,
+    items: &'a [FavoriteItem],
+}
+
 /// Favorites store: keys + labels only, never stream URLs or credentials.
+///
+/// Each instance is an in-memory copy; `save` rewrites the whole file, so with several
+/// instances on the same dir the last writer wins.
 #[derive(Debug, Clone)]
 pub struct Favorites {
     dir: PathBuf,
     items: Vec<FavoriteItem>,
+    /// Set when an unreadable favorites.json (corrupt, unknown/future version, read error)
+    /// could not be moved aside. `save` then refuses, so the original file is never overwritten.
+    blocked: Option<String>,
 }
 
 fn path_in(dir: &Path) -> PathBuf {
@@ -29,23 +38,83 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// First unused of `favorites.json.bad`, `.bad.1`, `.bad.2`, ... (never overwrites a backup).
+fn backup_path(dir: &Path) -> PathBuf {
+    let first = dir.join("favorites.json.bad");
+    if !first.exists() {
+        return first;
+    }
+    (1u64..)
+        .map(|n| dir.join(format!("favorites.json.bad.{n}")))
+        .find(|p| !p.exists())
+        .unwrap()
+}
+
+enum Parsed {
+    Items(Vec<FavoriteItem>),
+    Unreadable,
+}
+
+/// Accepts the legacy bare array and `{"version":1,"items":[...]}`. Anything else
+/// (invalid JSON, version > 1, unknown shape) is unreadable.
+fn parse(bytes: &[u8]) -> Parsed {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Parsed::Unreadable;
+    };
+    let arr = match v {
+        serde_json::Value::Array(_) => v,
+        serde_json::Value::Object(mut o) => {
+            if o.get("version").and_then(|x| x.as_u64()) != Some(FORMAT_VERSION) {
+                return Parsed::Unreadable;
+            }
+            match o.remove("items") {
+                Some(a) => a,
+                None => return Parsed::Unreadable,
+            }
+        }
+        _ => return Parsed::Unreadable,
+    };
+    match serde_json::from_value::<Vec<FavoriteItem>>(arr) {
+        Ok(items) => {
+            let mut seen = std::collections::HashSet::new();
+            Parsed::Items(items.into_iter().filter(|i| seen.insert(i.key.clone())).collect())
+        }
+        Err(_) => Parsed::Unreadable,
+    }
+}
+
 impl Favorites {
-    /// Missing -> empty. Corrupt -> empty, and the bad file is moved to `favorites.json.bad`.
+    /// Missing -> empty. Unreadable (corrupt, newer version, unknown shape) -> empty, and the
+    /// file is moved to the first unused `favorites.json.bad[.N]`. If that move fails, the
+    /// instance refuses to `save` so the original is not overwritten.
     pub fn load(dir: &Path) -> Favorites {
+        Self::load_with(dir, |from, to| std::fs::rename(from, to))
+    }
+
+    fn load_with(dir: &Path, mover: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Favorites {
         let path = path_in(dir);
-        let items = match std::fs::read(&path) {
-            Err(_) => Vec::new(),
-            Ok(bytes) => match serde_json::from_slice::<Vec<FavoriteItem>>(&bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    let bad = dir.join("favorites.json.bad");
-                    let _ = std::fs::remove_file(&bad);
-                    let _ = std::fs::rename(&path, &bad);
-                    Vec::new()
+        let mut fav = Favorites { dir: dir.to_path_buf(), items: Vec::new(), blocked: None };
+        let unreadable = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fav,
+            Err(_) => true,
+            Ok(bytes) => match parse(&bytes) {
+                Parsed::Items(items) => {
+                    fav.items = items;
+                    false
                 }
+                Parsed::Unreadable => true,
             },
         };
-        Favorites { dir: dir.to_path_buf(), items }
+        if unreadable {
+            let bad = backup_path(dir);
+            if let Err(e) = mover(&path, &bad) {
+                fav.blocked = Some(format!(
+                    "{} is unreadable and could not be moved aside ({e}); refusing to overwrite it",
+                    path.display()
+                ));
+            }
+        }
+        fav
     }
 
     /// Adds (at the end) or removes. Empty/blank keys are ignored.
@@ -71,42 +140,17 @@ impl Favorites {
         &self.items
     }
 
-    /// Atomic write: unique tmp file, fsync, rename (retried on transient Windows failures).
+    /// Atomic write of `{"version":1,"items":[...]}`. Refuses if the original file was
+    /// unreadable and could not be moved aside.
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("creating dir {}", self.dir.display()))?;
-        let path = path_in(&self.dir);
-        let tmp = self.dir.join(format!(
-            "favorites.json.{}.{}.tmp",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let json = serde_json::to_vec_pretty(&self.items).context("serializing favorites")?;
-        let result = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&json)?;
-            f.flush()?;
-            f.sync_all()?;
-            drop(f);
-            let mut last = None;
-            for attempt in 0..3 {
-                match std::fs::rename(&tmp, &path) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        last = Some(e);
-                        if attempt < 2 {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                    }
-                }
-            }
-            Err(last.unwrap())
-        })();
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e).with_context(|| format!("writing {}", path.display()));
+        if let Some(msg) = &self.blocked {
+            return Err(anyhow!("{msg}"));
         }
-        Ok(())
+        let path = path_in(&self.dir);
+        let json = serde_json::to_vec_pretty(&FileOut { version: FORMAT_VERSION, items: &self.items })
+            .context("serializing favorites")?;
+        crate::fsutil::atomic_write(&path, &json)
+            .with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -157,15 +201,95 @@ mod tests {
         assert!(f.list().is_empty());
         assert!(!d.path().join("favorites.json").exists());
         assert_eq!(std::fs::read(d.path().join("favorites.json.bad")).unwrap(), b"{not json");
-        // a second corrupt file overwrites the old .bad
+        // later corrupt files never overwrite earlier backups
         std::fs::write(d.path().join("favorites.json"), b"also bad").unwrap();
         let _ = Favorites::load(d.path());
-        assert_eq!(std::fs::read(d.path().join("favorites.json.bad")).unwrap(), b"also bad");
-        // saving afterwards does not touch the backup
+        std::fs::write(d.path().join("favorites.json"), b"third").unwrap();
+        let _ = Favorites::load(d.path());
+        let rd = |n: &str| std::fs::read(d.path().join(n)).unwrap();
+        assert_eq!(rd("favorites.json.bad"), b"{not json");
+        assert_eq!(rd("favorites.json.bad.1"), b"also bad");
+        assert_eq!(rd("favorites.json.bad.2"), b"third");
+        // saving afterwards does not touch the backups
         let mut f = f;
         f.toggle("live:1", "x");
         f.save().unwrap();
-        assert_eq!(std::fs::read(d.path().join("favorites.json.bad")).unwrap(), b"also bad");
+        assert_eq!(rd("favorites.json.bad"), b"{not json");
+    }
+
+    fn failing_mover(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked"))
+    }
+
+    #[test]
+    fn failed_move_aside_blocks_save() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("favorites.json");
+        std::fs::write(&p, b"{not json").unwrap();
+        let mut f = Favorites::load_with(d.path(), failing_mover);
+        f.toggle("live:1", "x");
+        let err = f.save().unwrap_err().to_string();
+        assert!(err.contains("favorites.json"), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn legacy_array_loads_and_saves_as_v1() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("favorites.json");
+        std::fs::write(&p, br#"[{"key":"live:1","label":"A"}]"#).unwrap();
+        let f = Favorites::load(d.path());
+        assert_eq!(f.list().len(), 1);
+        f.save().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(Favorites::load(d.path()).list(), f.list());
+    }
+
+    #[test]
+    fn v1_roundtrip_format() {
+        let d = tempfile::tempdir().unwrap();
+        let mut f = Favorites::load(d.path());
+        f.toggle("live:1", "A");
+        f.save().unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(d.path().join("favorites.json")).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["items"][0]["key"], "live:1");
+        assert_eq!(Favorites::load(d.path()).list(), f.list());
+    }
+
+    #[test]
+    fn future_version_preserved_and_save_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("favorites.json");
+        let future = br#"{"version":2,"items":[{"key":"live:1","label":"A"}],"extra":1}"#;
+        // move succeeds: content preserved as a backup, not discarded
+        std::fs::write(&p, future).unwrap();
+        let f = Favorites::load(d.path());
+        assert!(f.list().is_empty());
+        assert_eq!(std::fs::read(d.path().join("favorites.json.bad")).unwrap(), future);
+        // move fails: original stays in place and save refuses
+        std::fs::write(&p, future).unwrap();
+        let f = Favorites::load_with(d.path(), failing_mover);
+        assert!(f.save().is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), future);
+        // unknown shape is treated the same way
+        std::fs::write(&p, br#"{"foo":1}"#).unwrap();
+        assert!(Favorites::load_with(d.path(), failing_mover).save().is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_deduped_on_load_keeping_first() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("favorites.json"),
+            br#"{"version":1,"items":[{"key":"a","label":"1"},{"key":"b","label":"2"},{"key":"a","label":"3"}]}"#,
+        )
+        .unwrap();
+        let f = Favorites::load(d.path());
+        assert_eq!(f.list().len(), 2);
+        assert_eq!(f.list()[0].label, "1");
     }
 
     #[test]
