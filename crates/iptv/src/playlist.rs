@@ -31,7 +31,15 @@ pub struct Entry {
 /// Last URL path segment without extension (query/fragment ignored).
 pub fn stream_id(url: &str) -> Option<String> {
     let end = url.find(['?', '#']).unwrap_or(url.len());
-    let seg = url[..end].rsplit('/').next()?;
+    let mut path = &url[..end];
+    if let Some(p) = path.find("://") {
+        let rest = &path[p + 3..];
+        path = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => return None,
+        };
+    }
+    let seg = path.rsplit('/').next()?;
     let seg = match seg.rfind('.') {
         Some(i) if i > 0 => &seg[..i],
         _ => seg,
@@ -76,7 +84,7 @@ fn parse_extinf(s: &str) -> Option<Pending> {
     let b = s.as_bytes();
     let mut in_quote = false;
     let mut quote_start = 0;
-    let mut last_comma: Option<usize> = None;
+    let mut first_comma: Option<usize> = None;
     let mut tvg_name = "";
     let mut group = "";
     let mut logo = "";
@@ -106,11 +114,14 @@ fn parse_extinf(s: &str) -> Option<Pending> {
                     quote_start = i;
                 }
             }
-            b',' if !in_quote => last_comma = Some(i),
+            b',' if !in_quote => {
+                first_comma = Some(i);
+                break;
+            }
             _ => {}
         }
     }
-    let disp = last_comma.map_or("", |i| s[i + 1..].trim());
+    let disp = first_comma.map_or("", |i| s[i + 1..].trim());
     let name = if disp.is_empty() { tvg_name.trim() } else { disp };
     if name.starts_with("=====") || tvg_name.trim().starts_with("=====") {
         return None;
@@ -207,6 +218,34 @@ http://host.invalid:8080/series/USER/PASS/789.mp4\n";
         let v = p(m);
         assert_eq!(v[0].name, "Foo, Bar");
         assert_eq!(v[0].group, "A, B");
+    }
+
+    #[test]
+    fn comma_and_quotes_in_display_name_survive() {
+        let m = "#EXTINF:-1 group-title=\"G\",Foo, Bar\nhttp://host.invalid/USER/PASS/1\n\
+#EXTINF:-1 group-title=\"G\",Foo \"Bar\" Baz\nhttp://host.invalid/USER/PASS/2\n\
+#EXTINF:-1 group-title=\"H\",Odd \" quote\nhttp://host.invalid/USER/PASS/3\n";
+        let v = p(m);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].name, "Foo, Bar");
+        assert_eq!(v[0].group, "G");
+        assert_eq!(v[1].name, "Foo \"Bar\" Baz");
+        assert_eq!(v[2].name, "Odd \" quote");
+        assert_eq!(v[2].group, "H");
+    }
+
+    #[test]
+    fn stream_id_edge_cases() {
+        assert_eq!(stream_id("http://host.invalid"), None);
+        assert_eq!(stream_id("http://host.invalid:8080"), None);
+        assert_eq!(stream_id("http://host.invalid/"), None);
+        assert_eq!(stream_id("http://host.invalid/a/12#frag.x"), Some("12".into()));
+        let v = p("#EXTINF:-1 group-title=\"G\",One\n#EXTINF:-1 group-title=\"G\",Two\nhttp://host.invalid/USER/PASS/5\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "Two");
+        let v = p("#EXTINF:-1 group-title=\"G\",NoPath\nhttp://host.invalid:8080\n");
+        assert_eq!(v[0].id, "");
+        assert_eq!(favorite_key(&v[0]), "live:name:nopath|G");
     }
 
     #[test]
