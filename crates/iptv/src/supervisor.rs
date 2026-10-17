@@ -23,7 +23,16 @@
 //! Auth failures (401/403/458/459, "too many connections", "unauthorized"):
 //! 3 s, 6 s, 12 s, then 15 s forever — never faster than the network cap.
 //! The attempt counter (saturating) resets after `Started` followed by
-//! [`STABLE_RESET`] of uninterrupted playing (no buffering).
+//! [`STABLE_RESET`] of uninterrupted playing (no buffering). One counter
+//! serves both tables, so network failures followed by an auth failure jump
+//! straight to the auth delay for that attempt number.
+//!
+//! # Watchdogs
+//! Before `Started`: a growing start timeout ([`START_TIMEOUT_BASE`] + step per
+//! failed attempt, capped at [`START_TIMEOUT_MAX`]), extended by progress
+//! events. After `Started`: `Buffering(true)` longer than [`STALL_TIMEOUT`].
+//! Pause and user seeks must not be reported as `Buffering(true)`; a paused
+//! stream stays `Playing` (Task 10 contract).
 //!
 //! # Credentials
 //! The URL is stored only to reload it; it is never logged and the manual
@@ -49,19 +58,36 @@ pub enum ErrorClass {
 
 impl ErrorClass {
     /// Classify a player/HTTP error message (case-insensitive).
+    ///
+    /// Auth covers account rejection and connection-limit wordings, including
+    /// ffmpeg's catch-all "Server returned 4XX Client Error, but not one of
+    /// 40{0,1,3,4}" (how 458/459 connection-limit replies surface). Auth is
+    /// checked first; plain 404/"not found", timeouts, refused connections,
+    /// DNS and TLS failures are Network. Note "too many" is deliberately broad.
     pub fn from_message(msg: &str) -> ErrorClass {
         let m = msg.to_ascii_lowercase();
         const AUTH_CODES: [&str; 4] = ["401", "403", "458", "459"];
-        const AUTH_WORDS: [&str; 4] =
-            ["too many connections", "unauthorized", "unauthorised", "forbidden"];
+        const AUTH_WORDS: [&str; 10] = [
+            "too many",
+            "max connections",
+            "maximum connections",
+            "connection limit",
+            "simultaneous",
+            "4xx client error",
+            "unauthorized",
+            "unauthorised",
+            "forbidden",
+            "authorization failed",
+        ];
         if AUTH_CODES.iter().any(|c| contains_code(&m, c))
             || AUTH_WORDS.iter().any(|w| m.contains(w))
         {
             return ErrorClass::Auth;
         }
-        const NET_WORDS: [&str; 15] = [
+        const NET_WORDS: [&str; 18] = [
             "http", "network", "connection", "connect", "timed out", "timeout", "refused",
             "reset", "unreachable", "resolve", "dns", "tls", "ssl", "socket", "i/o error",
+            "not found", "server returned", "unknown host",
         ];
         if NET_WORDS.iter().any(|w| m.contains(w)) {
             return ErrorClass::Network;
@@ -111,12 +137,32 @@ pub const NETWORK_BACKOFF_MS: [u64; 4] = [500, 1_000, 2_000, 3_000];
 pub const AUTH_BACKOFF_MS: [u64; 4] = [3_000, 6_000, 12_000, 15_000];
 /// Uninterrupted playing after `Started` needed to reset the backoff.
 pub const STABLE_RESET: Duration = Duration::from_secs(10);
-/// Stall watchdog: buffering/loading longer than this (strictly) is a drop.
-/// Applies to live and VOD, and to a load that never reaches `Started`.
+/// Stall watchdog: `Buffering(true)` *after* `Started` lasting longer than
+/// this (strictly) is treated as a drop. Applies to live and VOD.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Pre-`Started` watchdog: a load gets `START_TIMEOUT_BASE` +
+/// `START_TIMEOUT_STEP` per consecutive failed attempt, capped at
+/// `START_TIMEOUT_MAX`, to reach `Started` (strictly-greater comparison).
+/// The deadline grows so a slow open (large file on a slow link, resume load
+/// needing a long seek) cannot be reloaded forever, and any current-generation
+/// progress event before `Started` (`Position`, `Duration`, `Buffering(false)`)
+/// pushes the deadline back, since progress proves the load is alive.
+pub const START_TIMEOUT_BASE: Duration = Duration::from_secs(30);
+pub const START_TIMEOUT_STEP: Duration = Duration::from_secs(15);
+pub const START_TIMEOUT_MAX: Duration = Duration::from_secs(120);
+
+fn start_timeout(attempt: u32) -> Duration {
+    START_TIMEOUT_STEP
+        .checked_mul(attempt)
+        .and_then(|d| d.checked_add(START_TIMEOUT_BASE))
+        .map_or(START_TIMEOUT_MAX, |d| d.min(START_TIMEOUT_MAX))
+}
 /// VOD `Ended` within this many seconds of the duration is a natural finish.
 pub const VOD_END_TOLERANCE_SECS: f64 = 5.0;
 
+/// One attempt counter serves both tables: the delay comes from the table of
+/// the *latest* failure's class indexed by the shared count, so e.g. three
+/// network failures followed by an auth failure wait the 4th auth delay (15 s).
 fn backoff(attempt: u32, auth: bool) -> Duration {
     let table = if auth { &AUTH_BACKOFF_MS } else { &NETWORK_BACKOFF_MS };
     let i = (attempt.saturating_sub(1) as usize).min(table.len() - 1);
@@ -141,8 +187,10 @@ pub struct Supervisor<B: Backend> {
     /// Last known playback position (VOD resume point); survives retries.
     position: Option<f64>,
     duration: Option<f64>,
-    /// When loading/buffering began; drives the stall watchdog.
+    /// When post-`Started` buffering began; drives the stall watchdog.
     stall_since: Option<Instant>,
+    /// Pre-`Started` watchdog deadline for the current load.
+    start_deadline: Option<Instant>,
     /// When uninterrupted playing began; drives the backoff reset.
     stable_since: Option<Instant>,
 }
@@ -172,6 +220,7 @@ impl<B: Backend> Supervisor<B> {
             position: None,
             duration: None,
             stall_since: None,
+            start_deadline: None,
             stable_since: None,
         }
     }
@@ -207,23 +256,31 @@ impl<B: Backend> Supervisor<B> {
                 self.started = true;
                 self.status = Status::Playing;
                 self.stall_since = None;
+                self.start_deadline = None;
                 self.stable_since = Some(now);
             }
             PlayerEvent::Position(p) => {
                 if p.is_finite() {
                     self.position = Some(p);
                 }
+                self.note_progress(now);
                 self.check_stable(now);
             }
             PlayerEvent::Duration(d) => {
                 if d.is_finite() && d > 0.0 {
                     self.duration = Some(d);
                 }
+                self.note_progress(now);
             }
+            // Task 10 contract: only network/cache buffering is reported as
+            // Buffering(true). A user pause or user seek must NOT be reported
+            // (a paused stream stays Playing), or a pause > STALL_TIMEOUT
+            // would trigger a reconnect.
             PlayerEvent::Buffering(true) => {
-                self.stall_since.get_or_insert(now);
-                self.stable_since = None;
+                // Before Started, the start deadline governs instead.
                 if self.started {
+                    self.stall_since.get_or_insert(now);
+                    self.stable_since = None;
                     self.status = Status::Buffering;
                 }
             }
@@ -232,6 +289,8 @@ impl<B: Backend> Supervisor<B> {
                     self.stall_since = None;
                     self.stable_since = Some(now);
                     self.status = Status::Playing;
+                } else {
+                    self.note_progress(now);
                 }
             }
             PlayerEvent::Ended => {
@@ -239,6 +298,7 @@ impl<B: Backend> Supervisor<B> {
                     self.dead = true;
                     self.status = Status::Finished;
                     self.stall_since = None;
+                    self.start_deadline = None;
                     self.stable_since = None;
                 } else {
                     self.fail(false, now);
@@ -262,6 +322,12 @@ impl<B: Backend> Supervisor<B> {
         if self.dead {
             return;
         }
+        if let Some(deadline) = self.start_deadline {
+            if now > deadline {
+                self.fail(false, now);
+                return;
+            }
+        }
         if let Some(since) = self.stall_since {
             if now.saturating_duration_since(since) > STALL_TIMEOUT {
                 self.fail(false, now);
@@ -281,6 +347,7 @@ impl<B: Backend> Supervisor<B> {
         self.position = None;
         self.duration = None;
         self.stall_since = None;
+        self.start_deadline = None;
         self.stable_since = None;
         self.generation = self.generation.wrapping_add(1);
         self.status = Status::Idle;
@@ -311,9 +378,18 @@ impl<B: Backend> Supervisor<B> {
         self.dead = false;
         self.started = false;
         self.stable_since = None;
-        self.stall_since = Some(now);
+        self.stall_since = None;
+        self.start_deadline = Some(now + start_timeout(self.attempt));
         if let Some(url) = self.url.as_deref() {
             self.backend.load(url, start_at, self.generation);
+        }
+    }
+
+    /// Progress before `Started` proves the load is alive: push the
+    /// pre-start deadline back (never earlier than it already is).
+    fn note_progress(&mut self, now: Instant) {
+        if let Some(old) = self.start_deadline {
+            self.start_deadline = Some(old.max(now + start_timeout(self.attempt)));
         }
     }
 
@@ -329,6 +405,7 @@ impl<B: Backend> Supervisor<B> {
         self.dead = true;
         self.started = false;
         self.stall_since = None;
+        self.start_deadline = None;
         self.stable_since = None;
         self.attempt = self.attempt.saturating_add(1);
         self.retry_at = Some(now + backoff(self.attempt, auth));
@@ -437,6 +514,35 @@ mod tests {
         // Codes embedded in longer numbers are not auth codes.
         assert_eq!(ErrorClass::from_message("port 14010 refused"), ErrorClass::Network);
         assert_eq!(ErrorClass::from_message("id 94031"), ErrorClass::Other);
+    }
+
+    #[test]
+    fn error_class_real_mpv_ffmpeg_wordings() {
+        use ErrorClass::*;
+        let cases = [
+            ("HTTP error 401 Unauthorized", Auth),
+            ("HTTP error 403 Forbidden", Auth),
+            ("Server returned 4XX Client Error, but not one of 40{0,1,3,4}", Auth),
+            ("server returned 4xx client error, but not one of 40{0,1,3,4}", Auth),
+            ("Max connections reached", Auth),
+            ("Maximum connections exceeded", Auth),
+            ("connection limit reached", Auth),
+            ("Too many connections", Auth),
+            ("too many open streams", Auth),
+            ("Simultaneous streams limit", Auth),
+            ("Server returned 401 Unauthorized (authorization failed)", Auth),
+            ("Server returned 403 Forbidden (access denied)", Auth),
+            ("Server returned 404 Not Found", Network),
+            ("Not Found", Network),
+            ("Connection refused", Network),
+            ("tls handshake failure", Network),
+            ("Connection timed out", Network),
+            ("Failed to resolve hostname host: Unknown host", Network),
+            ("DNS lookup failed", Network),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(ErrorClass::from_message(msg), want, "{msg}");
+        }
     }
 
     // ---------- required tests ----------
@@ -820,20 +926,97 @@ mod tests {
     }
 
     #[test]
-    fn stall_watchdog_covers_load_that_never_starts() {
+    fn start_watchdog_covers_load_that_never_starts() {
         let mut s = sup();
         let now = Instant::now();
         s.play(URL_A.to_string(), true, now);
-        s.tick(now + Duration::from_secs(10));
+        s.tick(now + START_TIMEOUT_BASE);
         assert_eq!(s.status(), Status::Buffering);
-        s.tick(now + Duration::from_secs(16));
+        s.tick(now + START_TIMEOUT_BASE + ms(1));
         assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
-        // And a retry that hangs is also caught.
-        let t = now + Duration::from_secs(17);
+        // And a retry that hangs is also caught (with the grown timeout).
+        let t = now + Duration::from_secs(31);
         s.tick(t);
         assert_eq!(load_count(&s), 2);
-        s.tick(t + Duration::from_secs(16));
+        s.tick(t + Duration::from_secs(45));
+        assert!(matches!(s.status(), Status::Reconnecting { attempt: 1, .. }));
+        s.tick(t + Duration::from_secs(45) + ms(1));
         assert_eq!(s.status(), Status::Reconnecting { attempt: 2, auth: false });
+    }
+
+    #[test]
+    fn buffering_before_started_uses_start_timeout_not_stall() {
+        let mut s = sup();
+        let now = Instant::now();
+        s.play(URL_A.to_string(), false, now);
+        s.on_event(s.generation(), PlayerEvent::Buffering(true), now);
+        s.tick(now + Duration::from_secs(20));
+        assert_eq!(s.status(), Status::Buffering);
+        assert_eq!(load_count(&s), 1);
+    }
+
+    #[test]
+    fn slow_open_plays_on_second_attempt() {
+        // An open that takes 40 s: the old 15 s watchdog reloaded it forever.
+        let mut s = sup();
+        let mut now = Instant::now();
+        s.play(URL_A.to_string(), false, now);
+        now += START_TIMEOUT_BASE + ms(1);
+        s.tick(now);
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        now += ms(500);
+        s.tick(now);
+        assert_eq!(load_count(&s), 2);
+        let g = s.generation();
+        s.tick(now + Duration::from_secs(40));
+        assert_eq!(load_count(&s), 2);
+        s.on_event(g, PlayerEvent::Started, now + Duration::from_secs(40));
+        assert_eq!(s.status(), Status::Playing);
+        s.tick(now + Duration::from_secs(200));
+        assert_eq!(s.status(), Status::Playing);
+        assert_eq!(load_count(&s), 2);
+    }
+
+    #[test]
+    fn progress_before_started_extends_start_deadline() {
+        for ev in [PlayerEvent::Position(1.0), PlayerEvent::Duration(100.0), PlayerEvent::Buffering(false)] {
+            let mut s = sup();
+            let now = Instant::now();
+            s.play(URL_A.to_string(), false, now);
+            let g = s.generation();
+            s.on_event(g, ev.clone(), now + Duration::from_secs(25));
+            s.tick(now + Duration::from_secs(50));
+            assert_eq!(s.status(), Status::Buffering, "{ev:?} should extend the deadline");
+            s.tick(now + Duration::from_secs(55) + ms(1));
+            assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false }, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn start_timeout_grows_per_attempt_and_caps() {
+        let mut s = sup();
+        let mut now = Instant::now();
+        s.play(URL_A.to_string(), true, now);
+        let mut timeouts = vec![];
+        for _ in 0..9 {
+            // Find the exact deadline: still alive at T, failed at T + 1 ms.
+            let loaded_at = now;
+            let before = s.attempt();
+            let mut t = Duration::from_secs(1);
+            loop {
+                s.tick(loaded_at + t + ms(1));
+                if s.attempt() != before {
+                    break;
+                }
+                t += Duration::from_secs(1);
+                assert!(t < Duration::from_secs(1000));
+            }
+            timeouts.push(t.as_secs());
+            now = loaded_at + t + ms(1);
+            now += s.next_retry_in(now).unwrap();
+            s.tick(now);
+        }
+        assert_eq!(timeouts, vec![30, 45, 60, 75, 90, 105, 120, 120, 120]);
     }
 
     #[test]
