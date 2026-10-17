@@ -108,13 +108,18 @@ impl EndReason {
 /// `error_text` is the (scrubbed) ffmpeg/stream log text collected for the
 /// entry plus mpv's generic error string. A stop/quit (user stop or
 /// replacement by a new `loadfile`) and a playlist redirect produce nothing.
+///
+/// URLs and decimal numbers are neutralised first ([`neutralize_for_classification`])
+/// so a stream id like `/401.ts` or a timestamp like `458.200` never reads as
+/// an HTTP status.
 pub fn map_end_file(reason: EndReason, error_text: &str) -> Option<PlayerEvent> {
+    let text = neutralize_for_classification(error_text);
     match reason {
-        EndReason::Error => Some(PlayerEvent::Error(ErrorClass::from_message(error_text))),
-        // ffmpeg's reconnect gives up with EOF; if the server rejected the
+        EndReason::Error => Some(PlayerEvent::Error(ErrorClass::from_message(&text))),
+        // A reconnect that gives up ends with EOF; if the server rejected the
         // account meanwhile, back off like an auth failure.
         EndReason::Eof | EndReason::Unknown(_) => {
-            if !error_text.is_empty() && ErrorClass::from_message(error_text) == ErrorClass::Auth {
+            if !text.trim().is_empty() && ErrorClass::from_message(&text) == ErrorClass::Auth {
                 Some(PlayerEvent::Error(ErrorClass::Auth))
             } else {
                 Some(PlayerEvent::Ended)
@@ -124,9 +129,66 @@ pub fn map_end_file(reason: EndReason, error_text: &str) -> Option<PlayerEvent> 
     }
 }
 
+/// Replace every URL-ish token (contains `://`, or a redacted path `/***`)
+/// with `<url>` and every decimal number (`458.200`) with `<num>`, so only
+/// the wording and real status codes are left for `ErrorClass::from_message`.
+pub fn neutralize_for_classification(text: &str) -> String {
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | '`' | '(' | ')' | ',');
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.contains("://") || token.contains("/***") {
+            out.push_str("<url>");
+        } else {
+            out.push_str(&neutralize_decimals(token));
+        }
+        token.clear();
+    };
+    for c in text.chars() {
+        if is_sep(c) {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// `458.200` -> `<num>`; integers are left alone.
+fn neutralize_decimals(token: &str) -> String {
+    let b = token.as_bytes();
+    let mut out = String::with_capacity(token.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push_str("<num>");
+            } else {
+                out.push_str(&token[start..i]);
+            }
+        } else {
+            let ch = token[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 /// True for log prefixes that describe the stream/network (scraped for error
-/// classification). Decoder/output prefixes are excluded: their messages
-/// contain arbitrary numbers ("MB 401") that must not look like HTTP codes.
+/// classification). Decoder/output/player prefixes (`ffmpeg/video`, `vd`,
+/// `cplayer`, ...) are excluded: their messages contain arbitrary numbers
+/// ("MB 401", "pts 458.2") that must not look like HTTP codes.
 pub fn is_stream_log_prefix(prefix: &str) -> bool {
     let p = prefix.to_ascii_lowercase();
     if p == "ffmpeg" || p.starts_with("ffmpeg/demuxer") || p.starts_with("ffmpeg/http")
@@ -134,7 +196,7 @@ pub fn is_stream_log_prefix(prefix: &str) -> bool {
     {
         return true;
     }
-    ["stream", "lavf", "curl", "demux", "cplayer", "file", "http", "tcp", "tls", "network"]
+    ["stream", "lavf", "curl", "demux", "http", "tcp", "tls", "network"]
         .iter()
         .any(|k| p == *k || p.starts_with(&format!("{k}/")) || p.starts_with(&format!("{k}_")))
 }
@@ -247,6 +309,8 @@ struct RenderState {
     ctx: *mut sys::mpv_render_context,
     update_cb: *mut Callback,
     target: Option<GlTarget>,
+    /// Size whose FBO creation failed (logged once, not retried every frame).
+    failed_size: Option<(i32, i32)>,
 }
 
 /// The libmpv OpenGL render context. All methods must be called on the thread
@@ -297,7 +361,7 @@ impl MpvRenderer {
         unsafe {
             sys::mpv_render_context_set_update_callback(ctx, Some(call_callback), update_cb as *mut c_void);
         }
-        Ok(MpvRenderer { state: Mutex::new(RenderState { ctx, update_cb, target: None }), _core: core })
+        Ok(MpvRenderer { state: Mutex::new(RenderState { ctx, update_cb, target: None, failed_size: None }), _core: core })
     }
 
     /// Render the current video frame into framebuffer `fbo` (0 = default)
@@ -328,10 +392,19 @@ impl MpvRenderer {
                     gl.delete_framebuffer(t.fbo);
                     gl.delete_texture(t.tex);
                 }
+                if st.failed_size == Some((w, h)) {
+                    return;
+                }
                 match create_target(gl, w, h) {
-                    Ok(t) => st.target = Some(t),
+                    Ok(t) => {
+                        st.target = Some(t);
+                        st.failed_size = None;
+                    }
                     Err(e) => {
-                        eprintln!("video target: {e}");
+                        // create_target may have left its FBO bound.
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
+                        eprintln!("video target {w}x{h}: {e}"); // once per size
+                        st.failed_size = Some((w, h));
                         return;
                     }
                 }
@@ -373,6 +446,10 @@ impl MpvRenderer {
 impl Drop for MpvRenderer {
     fn drop(&mut self) {
         // Fallback; the GL objects leak if `destroy` was not called.
+        let leaked = !self.state.lock().map(|s| s.ctx.is_null()).unwrap_or(true);
+        if leaked {
+            eprintln!("warning: MpvRenderer dropped without destroy(); call it in App::on_exit with the GL context current");
+        }
         self.destroy(None);
     }
 }
@@ -424,13 +501,55 @@ unsafe fn create_target(gl: &glow::Context, w: i32, h: i32) -> Result<GlTarget, 
 // ---------------------------------------------------------------------------
 // Backend
 
+/// How long an error/EOF END_FILE waits for late log lines before it is
+/// mapped. Well below the shortest retry backoff (500 ms).
+pub const END_GRACE: Duration = Duration::from_millis(250);
+
+/// After an entry ends (any reason), stream log lines that arrive within this
+/// window after the next START_FILE are taken to be the old entry's late
+/// lines and are not attributed to the new entry (mpv delivers log messages
+/// only when the regular event queue is empty). Shorter than the minimum
+/// retry gap (`END_GRACE` + 500 ms backoff), so automatic retries are never
+/// affected; only a user switch / watchdog replacement is.
+pub const ATTRIBUTION_WINDOW: Duration = Duration::from_millis(500);
+
+/// One mpv event, already decoded and scrubbed, as fed to [`EventMapper`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawEvent {
+    StartFile(i64),
+    PlaybackRestart,
+    /// `error` is mpv's generic error string for reason=error.
+    EndFile { entry: i64, reason: EndReason, error: Option<String> },
+    /// `None` = property unavailable.
+    TimePos(Option<f64>),
+    Duration(Option<f64>),
+    PausedForCache(bool),
+    Pause(bool),
+    Seeking(bool),
+    /// A scrubbed warn/error log line.
+    Log { prefix: String, text: String },
+}
+
+/// A load whose END_FILE is still pending.
+struct Entry {
+    generation: u32,
+    start_at: Option<f64>,
+}
+
 /// Per-entry state between START_FILE and END_FILE.
 struct Current {
     entry: i64,
     generation: u32,
+    start_at: Option<f64>,
     started: bool,
     buffering: bool,
+    /// Stream log lines of this entry (cleared at PLAYBACK_RESTART, so an
+    /// EOF->Auth upgrade only uses lines logged while playing).
     errors: Vec<String>,
+    /// Latest duration seen before PLAYBACK_RESTART, emitted at restart.
+    pending_duration: Option<f64>,
+    /// Stream lines before this instant belong to the previous entry.
+    quarantine_until: Option<Instant>,
 }
 
 /// An END_FILE waiting for its late log lines.
@@ -441,9 +560,157 @@ struct Ending {
     deadline: Instant,
 }
 
-/// How long an error/EOF END_FILE waits for late log lines before it is
-/// mapped. Well below the shortest retry backoff (500 ms).
-pub const END_GRACE: Duration = Duration::from_millis(250);
+/// Pure attribution of mpv events to supervisor generations (no FFI, time
+/// passed in), so the ordering rules are unit-testable.
+#[derive(Default)]
+pub struct EventMapper {
+    entries: HashMap<i64, Entry>,
+    current: Option<Current>,
+    ending: Vec<Ending>,
+    last_end: Option<Instant>,
+    pause: bool,
+    seeking: bool,
+    paused_for_cache: bool,
+}
+
+impl EventMapper {
+    /// `loadfile` returned `entry` for this generation.
+    pub fn loaded(&mut self, entry: i64, generation: u32, start_at: Option<f64>) {
+        self.entries.insert(entry, Entry { generation, start_at });
+    }
+
+    /// User stop: nothing pending may be reported any more.
+    pub fn stopped(&mut self) {
+        self.ending.clear();
+    }
+
+    /// Number of loads whose END_FILE is pending (for tests/diagnostics).
+    pub fn pending_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn handle(&mut self, ev: RawEvent, now: Instant, out: &mut Vec<(u32, PlayerEvent)>) {
+        match ev {
+            RawEvent::StartFile(id) => {
+                // A new file begins: earlier endings get no more lines.
+                self.flush(None, out);
+                // Ids grow; older ids that never ended are dead (replaced).
+                self.entries.retain(|&k, _| k >= id);
+                // Cache/seek state belongs to the previous file.
+                self.paused_for_cache = false;
+                self.seeking = false;
+                let quarantine_until = self.last_end.map(|t| t + ATTRIBUTION_WINDOW).filter(|q| now < *q);
+                self.current = self.entries.get(&id).map(|e| Current {
+                    entry: id,
+                    generation: e.generation,
+                    start_at: e.start_at,
+                    started: false,
+                    buffering: false,
+                    errors: Vec::new(),
+                    pending_duration: None,
+                    quarantine_until,
+                });
+            }
+            RawEvent::PlaybackRestart => {
+                if let Some(c) = self.current.as_mut() {
+                    if !c.started {
+                        c.started = true;
+                        c.errors.clear();
+                        c.quarantine_until = None;
+                        out.push((c.generation, PlayerEvent::Started));
+                        if let Some(d) = c.pending_duration.take() {
+                            out.push((c.generation, PlayerEvent::Duration(d)));
+                        }
+                    }
+                }
+            }
+            RawEvent::EndFile { entry, reason, error } => {
+                self.last_end = Some(now);
+                let generation = self.entries.remove(&entry).map(|e| e.generation);
+                let mut errors = Vec::new();
+                if self.current.as_ref().is_some_and(|c| c.entry == entry) {
+                    errors = self.current.take().unwrap().errors;
+                }
+                if let (Some(generation), Some(_)) = (generation, map_end_file(reason, "")) {
+                    if reason == EndReason::Error {
+                        errors.extend(error);
+                    }
+                    // The log lines explaining the failure can arrive after
+                    // END_FILE: map it once they had time to come.
+                    self.ending.push(Ending { generation, reason, errors, deadline: now + END_GRACE });
+                }
+            }
+            RawEvent::TimePos(v) => {
+                if let (Some(c), Some(v)) = (&self.current, v) {
+                    // Before the first restart a time-pos can still be the
+                    // old file's: only accept it if it is at/after start=.
+                    if c.started || c.start_at.is_some_and(|s| v >= s) {
+                        out.push((c.generation, PlayerEvent::Position(v)));
+                    }
+                }
+            }
+            RawEvent::Duration(v) => {
+                if let Some(c) = self.current.as_mut() {
+                    if c.started {
+                        if let Some(v) = v {
+                            out.push((c.generation, PlayerEvent::Duration(v)));
+                        }
+                    } else {
+                        c.pending_duration = v;
+                    }
+                }
+            }
+            RawEvent::PausedForCache(b) => self.set_flags(Some(b), None, None, out),
+            RawEvent::Pause(b) => self.set_flags(None, Some(b), None, out),
+            RawEvent::Seeking(b) => self.set_flags(None, None, Some(b), out),
+            RawEvent::Log { prefix, text } => {
+                if !is_stream_log_prefix(&prefix) {
+                    return;
+                }
+                // Between START_FILE and END_FILE lines belong to the playing
+                // entry (unless quarantined: late lines of the previous one);
+                // after END_FILE (no current entry) to the latest ending.
+                let errors = match (self.current.as_mut(), self.ending.last_mut()) {
+                    (Some(c), _) if c.quarantine_until.is_some_and(|q| now < q) => None,
+                    (Some(c), _) => Some(&mut c.errors),
+                    (None, Some(e)) => Some(&mut e.errors),
+                    (None, None) => None,
+                };
+                if let Some(errors) = errors {
+                    if errors.len() >= MAX_ENTRY_ERRORS {
+                        errors.remove(0);
+                    }
+                    errors.push(text);
+                }
+            }
+        }
+    }
+
+    fn set_flags(&mut self, pfc: Option<bool>, pause: Option<bool>, seeking: Option<bool>, out: &mut Vec<(u32, PlayerEvent)>) {
+        self.paused_for_cache = pfc.unwrap_or(self.paused_for_cache);
+        self.pause = pause.unwrap_or(self.pause);
+        self.seeking = seeking.unwrap_or(self.seeking);
+        let buffering = effective_buffering(self.paused_for_cache, self.pause, self.seeking);
+        if let Some(c) = self.current.as_mut() {
+            if c.buffering != buffering {
+                c.buffering = buffering;
+                out.push((c.generation, PlayerEvent::Buffering(buffering)));
+            }
+        }
+    }
+
+    /// Emit endings whose grace period is over (all of them if `now` is None).
+    pub fn flush(&mut self, now: Option<Instant>, out: &mut Vec<(u32, PlayerEvent)>) {
+        let (due, keep): (Vec<Ending>, Vec<Ending>) =
+            std::mem::take(&mut self.ending).into_iter().partition(|e| now.is_none_or(|n| n >= e.deadline));
+        self.ending = keep;
+        for e in due {
+            if let Some(ev) = map_end_file(e.reason, &e.errors.join(" | ")) {
+                out.push((e.generation, ev));
+            }
+        }
+    }
+}
 
 /// Construction options.
 #[derive(Default)]
@@ -458,25 +725,30 @@ pub struct MpvOptions {
 pub struct MpvBackend {
     core: Arc<Core>,
     renderer: Option<Arc<MpvRenderer>>,
-    /// playlist_entry_id -> generation, for loads whose END_FILE is pending.
-    entries: HashMap<i64, u32>,
-    current: Option<Current>,
-    /// Ended entries waiting for late log lines (see [`END_GRACE`]).
-    ending: Vec<Ending>,
+    mapper: EventMapper,
     /// Events produced outside the mpv event queue (failed loadfile).
     pending: Vec<(u32, PlayerEvent)>,
     /// Recently loaded URLs, for scrubbing (old entries can still log).
     urls: VecDeque<String>,
     log: VecDeque<String>,
-    pause: bool,
-    seeking: bool,
-    paused_for_cache: bool,
 }
 
 impl std::fmt::Debug for MpvBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MpvBackend").field("entries", &self.entries.len()).finish_non_exhaustive()
+        f.debug_struct("MpvBackend").field("entries", &self.mapper.pending_entries()).finish_non_exhaustive()
     }
+}
+
+/// Oldest mpv with the `loadfile <url> <flags> <index> <options>` signature.
+pub const MIN_MPV_VERSION: (u32, u32) = (0, 38);
+
+/// Parse "mpv v0.41.0-1200-g..." / "mpv 0.38.0" into (major, minor).
+pub fn parse_mpv_version(s: &str) -> Option<(u32, u32)> {
+    let v = s.split_whitespace().nth(1)?.trim_start_matches('v');
+    let mut it = v.split(|c: char| !c.is_ascii_digit());
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 impl MpvBackend {
@@ -508,6 +780,16 @@ impl MpvBackend {
         if r < 0 {
             bail!("mpv_initialize: {}", mpv_err(r));
         }
+        let version = get_string(handle, "mpv-version");
+        match parse_mpv_version(&version) {
+            Some(v) if v < MIN_MPV_VERSION => bail!(
+                "libmpv-2.dll is {version}; need mpv >= {}.{} (loadfile index argument)",
+                MIN_MPV_VERSION.0,
+                MIN_MPV_VERSION.1
+            ),
+            Some(_) => {}
+            None => eprintln!("warning: cannot parse mpv version {version:?}; assuming >= 0.38"),
+        }
         let level = cstr("warn")?;
         unsafe { sys::mpv_request_log_messages(handle, level.as_ptr()) };
         for (id, name, fmt) in [
@@ -535,30 +817,16 @@ impl MpvBackend {
         Ok(MpvBackend {
             core,
             renderer,
-            entries: HashMap::new(),
-            current: None,
-            ending: Vec::new(),
+            mapper: EventMapper::default(),
             pending: Vec::new(),
             urls: VecDeque::new(),
             log: VecDeque::new(),
-            pause: false,
-            seeking: false,
-            paused_for_cache: false,
         })
     }
 
-    /// mpv version string (e.g. "mpv v0.40.0-...").
+    /// mpv version string (e.g. "mpv v0.41.0-...").
     pub fn mpv_version(&self) -> String {
-        let name = CString::new("mpv-version").unwrap();
-        unsafe {
-            let p = sys::mpv_get_property_string(self.core.handle, name.as_ptr());
-            if p.is_null() {
-                return String::from("?");
-            }
-            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
-            sys::mpv_free(p as *mut c_void);
-            s
-        }
+        get_string(self.core.handle, "mpv-version")
     }
 
     /// The render context (in-app mode only), for use in paint callbacks.
@@ -584,142 +852,81 @@ impl MpvBackend {
         self.log.drain(..).collect()
     }
 
+    fn push_log(&mut self, line: String) {
+        if self.log.len() >= MAX_LOG {
+            self.log.pop_front();
+        }
+        self.log.push_back(line);
+    }
+
     /// Drain mpv's event queue (non-blocking) and map it to supervisor events,
     /// each tagged with the generation of the load that caused it.
     pub fn poll_events(&mut self) -> Vec<(u32, PlayerEvent)> {
         let mut out = std::mem::take(&mut self.pending);
         loop {
             let ev = unsafe { &*sys::mpv_wait_event(self.core.handle, 0.0) };
-            match ev.event_id {
+            let now = Instant::now();
+            let raw = match ev.event_id {
                 sys::mpv_event_id_MPV_EVENT_NONE => break,
                 sys::mpv_event_id_MPV_EVENT_START_FILE => {
                     let d = unsafe { &*(ev.data as *const sys::mpv_event_start_file) };
-                    // A new file begins: earlier endings get no more lines.
-                    self.flush_endings(None, &mut out);
-                    self.current = self.entries.get(&d.playlist_entry_id).map(|&generation| Current {
-                        entry: d.playlist_entry_id,
-                        generation,
-                        started: false,
-                        buffering: false,
-                        errors: Vec::new(),
-                    });
+                    RawEvent::StartFile(d.playlist_entry_id)
                 }
-                sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART => {
-                    if let Some(c) = self.current.as_mut() {
-                        if !c.started {
-                            c.started = true;
-                            out.push((c.generation, PlayerEvent::Started));
-                        }
-                    }
-                }
+                sys::mpv_event_id_MPV_EVENT_PLAYBACK_RESTART => RawEvent::PlaybackRestart,
                 sys::mpv_event_id_MPV_EVENT_END_FILE => {
                     let d = unsafe { &*(ev.data as *const sys::mpv_event_end_file) };
-                    let generation = self.entries.remove(&d.playlist_entry_id);
-                    let mut errors = Vec::new();
-                    if self.current.as_ref().is_some_and(|c| c.entry == d.playlist_entry_id) {
-                        errors = self.current.take().unwrap().errors;
-                    }
-                    let reason = EndReason::from_raw(d.reason);
-                    if let (Some(generation), Some(_)) = (generation, map_end_file(reason, "")) {
-                        if reason == EndReason::Error && d.error < 0 {
-                            errors.push(mpv_err(d.error));
-                        }
-                        // The log lines explaining the failure can arrive
-                        // after END_FILE: map it once they had time to come.
-                        self.ending.push(Ending {
-                            generation,
-                            reason,
-                            errors,
-                            deadline: Instant::now() + END_GRACE,
-                        });
+                    RawEvent::EndFile {
+                        entry: d.playlist_entry_id,
+                        reason: EndReason::from_raw(d.reason),
+                        error: (d.error < 0).then(|| mpv_err(d.error)),
                     }
                 }
                 sys::mpv_event_id_MPV_EVENT_PROPERTY_CHANGE => {
                     let p = unsafe { &*(ev.data as *const sys::mpv_event_property) };
-                    self.on_property(ev.reply_userdata, p, &mut out);
+                    let double = (p.format == sys::mpv_format_MPV_FORMAT_DOUBLE && !p.data.is_null())
+                        .then(|| unsafe { *(p.data as *const f64) });
+                    let flag = p.format == sys::mpv_format_MPV_FORMAT_FLAG
+                        && !p.data.is_null()
+                        && unsafe { *(p.data as *const c_int) } != 0;
+                    match ev.reply_userdata {
+                        OBS_TIME_POS => RawEvent::TimePos(double),
+                        OBS_DURATION => RawEvent::Duration(double),
+                        OBS_PAUSED_FOR_CACHE => RawEvent::PausedForCache(flag),
+                        OBS_PAUSE => RawEvent::Pause(flag),
+                        OBS_SEEKING => RawEvent::Seeking(flag),
+                        _ => continue,
+                    }
                 }
                 sys::mpv_event_id_MPV_EVENT_LOG_MESSAGE => {
                     let m = unsafe { &*(ev.data as *const sys::mpv_event_log_message) };
                     let s = |p: *const c_char| {
                         if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
                     };
-                    let (prefix, level, text) = (s(m.prefix), s(m.level), s(m.text));
-                    self.on_log(&prefix, &level, &text);
+                    let known: Vec<&str> = self.urls.iter().map(String::as_str).collect();
+                    let text = scrub(s(m.text).trim_end(), &known);
+                    let prefix = scrub(&s(m.prefix), &known);
+                    self.push_log(format!("[{prefix}] {}: {text}", s(m.level)));
+                    RawEvent::Log { prefix, text }
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            self.mapper.handle(raw, now, &mut out);
         }
-        self.flush_endings(Some(Instant::now()), &mut out);
+        self.mapper.flush(Some(Instant::now()), &mut out);
         out
     }
+}
 
-    /// Emit endings whose grace period is over (all of them if `now` is None).
-    fn flush_endings(&mut self, now: Option<Instant>, out: &mut Vec<(u32, PlayerEvent)>) {
-        let (due, keep): (Vec<Ending>, Vec<Ending>) =
-            std::mem::take(&mut self.ending).into_iter().partition(|e| now.is_none_or(|n| n >= e.deadline));
-        self.ending = keep;
-        for e in due {
-            if let Some(ev) = map_end_file(e.reason, &e.errors.join(" | ")) {
-                out.push((e.generation, ev));
-            }
+fn get_string(handle: *mut sys::mpv_handle, name: &str) -> String {
+    let name = CString::new(name).unwrap();
+    unsafe {
+        let p = sys::mpv_get_property_string(handle, name.as_ptr());
+        if p.is_null() {
+            return String::from("?");
         }
-    }
-
-    fn on_property(&mut self, id: u64, p: &sys::mpv_event_property, out: &mut Vec<(u32, PlayerEvent)>) {
-        let double = || (p.format == sys::mpv_format_MPV_FORMAT_DOUBLE && !p.data.is_null())
-            .then(|| unsafe { *(p.data as *const f64) });
-        let flag = || p.format == sys::mpv_format_MPV_FORMAT_FLAG && !p.data.is_null()
-            && unsafe { *(p.data as *const c_int) } != 0;
-        match id {
-            OBS_TIME_POS => {
-                if let (Some(c), Some(v)) = (&self.current, double()) {
-                    out.push((c.generation, PlayerEvent::Position(v)));
-                }
-            }
-            OBS_DURATION => {
-                if let (Some(c), Some(v)) = (&self.current, double()) {
-                    out.push((c.generation, PlayerEvent::Duration(v)));
-                }
-            }
-            OBS_PAUSED_FOR_CACHE => self.paused_for_cache = flag(),
-            OBS_PAUSE => self.pause = flag(),
-            OBS_SEEKING => self.seeking = flag(),
-            _ => return,
-        }
-        if matches!(id, OBS_PAUSED_FOR_CACHE | OBS_PAUSE | OBS_SEEKING) {
-            let buffering = effective_buffering(self.paused_for_cache, self.pause, self.seeking);
-            if let Some(c) = self.current.as_mut() {
-                if c.buffering != buffering {
-                    c.buffering = buffering;
-                    out.push((c.generation, PlayerEvent::Buffering(buffering)));
-                }
-            }
-        }
-    }
-
-    fn on_log(&mut self, prefix: &str, level: &str, text: &str) {
-        let known: Vec<&str> = self.urls.iter().map(String::as_str).collect();
-        let clean = scrub(text.trim_end(), &known);
-        let prefix = scrub(prefix, &known);
-        if self.log.len() >= MAX_LOG {
-            self.log.pop_front();
-        }
-        self.log.push_back(format!("[{prefix}] {level}: {clean}"));
-        if is_stream_log_prefix(&prefix) {
-            // Between START_FILE and END_FILE lines belong to the playing
-            // entry; after END_FILE (no current entry) to the latest ending.
-            let errors = match (self.current.as_mut(), self.ending.last_mut()) {
-                (Some(c), _) => Some(&mut c.errors),
-                (None, Some(e)) => Some(&mut e.errors),
-                (None, None) => None,
-            };
-            if let Some(errors) = errors {
-                if errors.len() >= MAX_ENTRY_ERRORS {
-                    errors.remove(0);
-                }
-                errors.push(clean);
-            }
-        }
+        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+        sys::mpv_free(p as *mut c_void);
+        s
     }
 }
 
@@ -742,38 +949,32 @@ impl Backend for MpvBackend {
             }
             self.urls.push_back(url.to_string());
         }
-        let mut args: Vec<CString> = Vec::new();
-        let ok = (|| -> Result<()> {
-            args.push(cstr("loadfile")?);
-            args.push(cstr(url)?);
-            args.push(cstr("replace")?);
-            args.push(cstr("-1")?);
-            if let Some(opt) = start_option(start_at) {
-                args.push(cstr(&opt)?);
-            }
-            Ok(())
-        })();
-        if ok.is_err() {
+        let start_opt = start_option(start_at);
+        let args: Result<Vec<CString>> = ["loadfile", url, "replace", "-1"]
+            .into_iter()
+            .chain(start_opt.as_deref())
+            .map(cstr)
+            .collect();
+        let Ok(args) = args else {
             self.pending.push((generation, PlayerEvent::Error(ErrorClass::Other)));
             return;
-        }
+        };
         let mut argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
         argv.push(ptr::null());
         let mut res: sys::mpv_node = unsafe { std::mem::zeroed() };
         let r = unsafe { sys::mpv_command_ret(self.core.handle, argv.as_mut_ptr(), &mut res) };
         if r < 0 {
-            self.log.push_back(format!("[backend] error: loadfile failed: {}", mpv_err(r)));
+            self.push_log(format!("[backend] error: loadfile failed: {}", mpv_err(r)));
             self.pending.push((generation, PlayerEvent::Error(ErrorClass::Other)));
             return;
         }
         let id = unsafe { node_map_int(&res, "playlist_entry_id") };
         unsafe { sys::mpv_free_node_contents(&mut res) };
         match id {
-            Some(id) => {
-                self.entries.insert(id, generation);
-            }
+            // Only the start= that was actually passed gates early positions.
+            Some(id) => self.mapper.loaded(id, generation, start_opt.and(start_at)),
             None => {
-                self.log.push_back("[backend] error: loadfile returned no playlist_entry_id".into());
+                self.push_log("[backend] error: loadfile returned no playlist_entry_id".into());
                 self.pending.push((generation, PlayerEvent::Error(ErrorClass::Other)));
             }
         }
@@ -785,7 +986,7 @@ impl Backend for MpvBackend {
         unsafe { sys::mpv_command(self.core.handle, argv.as_mut_ptr()) };
         // END_FILE(reason=stop) follows and produces nothing.
         self.pending.clear();
-        self.ending.clear();
+        self.mapper.stopped();
     }
 }
 
@@ -877,10 +1078,10 @@ mod tests {
 
     #[test]
     fn stream_prefixes_only() {
-        for p in ["ffmpeg", "ffmpeg/demuxer", "stream", "lavf", "curl", "demux", "cplayer", "stream_lavf"] {
+        for p in ["ffmpeg", "ffmpeg/demuxer", "stream", "lavf", "curl", "demux", "stream_lavf"] {
             assert!(is_stream_log_prefix(p), "{p}");
         }
-        for p in ["ffmpeg/video", "ffmpeg/audio", "vd", "ad", "vo/gpu", "ao/wasapi", "sub", "ytdl_hook"] {
+        for p in ["ffmpeg/video", "ffmpeg/audio", "vd", "ad", "vo/gpu", "ao/wasapi", "sub", "ytdl_hook", "cplayer", "file"] {
             assert!(!is_stream_log_prefix(p), "{p}");
         }
     }
@@ -901,5 +1102,310 @@ mod tests {
         assert_eq!(start_option(Some(f64::NAN)), None);
         assert_eq!(start_option(Some(1234.5)), Some("start=1234.500".into()));
         assert_eq!(start_option(Some(1e7)), Some("start=10000000.000".into()));
+    }
+
+    // ---------- I1: stream ids / timestamps never classify as auth ----------
+
+    #[test]
+    fn auth_code_in_stream_id_is_not_auth() {
+        use ErrorClass::*;
+        // A channel whose id is 401/458 failing with a plain connection error.
+        for id in ["401", "403", "458", "459"] {
+            let text = format!(
+                "error: Could not connect to server | Failed to open http://h:8080/live/***/***/{id}.ts. | loading failed"
+            );
+            assert_eq!(map_end_file(EndReason::Error, &text), Some(PlayerEvent::Error(Network)), "{id}");
+            let eof = format!("transfer failed: Failure when receiving data from the peer http://h/***/***/{id}");
+            assert_eq!(map_end_file(EndReason::Eof, &eof), Some(PlayerEvent::Ended), "{id}");
+        }
+        // Real status codes still are.
+        assert_eq!(
+            map_end_file(EndReason::Error, "HTTP error 401 | Failed to open http://h/live/***/***/401.ts."),
+            Some(PlayerEvent::Error(Auth))
+        );
+        assert_eq!(map_end_file(EndReason::Error, "HTTP error 458"), Some(PlayerEvent::Error(Auth)));
+        // Decimal timestamps are not codes.
+        assert_eq!(map_end_file(EndReason::Eof, "mpegts: Invalid timestamp 458.200 (401.5)"), Some(PlayerEvent::Ended));
+    }
+
+    #[test]
+    fn neutralize_keeps_wording() {
+        assert_eq!(
+            neutralize_for_classification("Failed to open 'http://h/a/***/***/401.ts'. HTTP error 401 at 12.5s"),
+            "Failed to open '<url>'. HTTP error 401 at <num>s"
+        );
+        assert_eq!(neutralize_for_classification("é 1.2 x"), "é <num> x");
+    }
+
+    // ---------- EventMapper ----------
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn log(prefix: &str, text: &str) -> RawEvent {
+        RawEvent::Log { prefix: prefix.into(), text: text.into() }
+    }
+
+    fn end(entry: i64, reason: EndReason) -> RawEvent {
+        let error = (reason == EndReason::Error).then(|| "loading failed".to_string());
+        RawEvent::EndFile { entry, reason, error }
+    }
+
+    /// Feed (offset ms, event) pairs (flushing as time passes), then flush
+    /// well after the last one; return the output.
+    fn run(m: &mut EventMapper, base: Instant, evs: Vec<(u64, RawEvent)>) -> Vec<(u32, PlayerEvent)> {
+        let mut out = vec![];
+        let mut last = 0;
+        for (t, e) in evs {
+            m.flush(Some(base + ms(t)), &mut out);
+            m.handle(e, base + ms(t), &mut out);
+            last = t;
+        }
+        m.flush(Some(base + ms(last + 10_000)), &mut out);
+        out
+    }
+
+    #[test]
+    fn late_auth_lines_of_replaced_entry_do_not_taint_new_entry() {
+        // Gen 1 is failing with 458 when the user switches to gen 2; the old
+        // lines arrive after START_FILE of the new entry. Gen 2 later ends
+        // with EOF: that must be Ended, not Auth.
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![(0, RawEvent::StartFile(1)), (5, log("curl", "HTTP error 458"))]);
+        assert!(out.is_empty(), "{out:?}");
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (100, end(1, EndReason::Stop)),
+            (100, RawEvent::StartFile(2)),
+            (110, log("curl", "HTTP error 458")),
+            (120, log("stream", "Failed to open http://h/***/***/9.ts.")),
+            (900, RawEvent::PlaybackRestart),
+            (60_000, end(2, EndReason::Eof)),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Started), (2, PlayerEvent::Ended)]);
+    }
+
+    #[test]
+    fn late_auth_lines_of_replaced_entry_do_not_taint_new_load_failure() {
+        // Same, but gen 2 fails to load before ever starting: Other, not Auth.
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (50, end(1, EndReason::Stop)),
+            (50, RawEvent::StartFile(2)),
+            (60, log("curl", "HTTP error 458")),
+            (80, end(2, EndReason::Error)),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Error(ErrorClass::Other))]);
+    }
+
+    #[test]
+    fn retry_lines_are_attributed_to_the_retry() {
+        // Automatic retry: START_FILE comes >= 750 ms after the old END_FILE,
+        // outside the window, so the retry's own late 401 line is used.
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, end(1, EndReason::Error)),
+            (12, log("curl", "HTTP error 401")),
+        ]);
+        assert_eq!(out, vec![(1, PlayerEvent::Error(ErrorClass::Auth))]);
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (800, RawEvent::StartFile(2)),
+            (810, end(2, EndReason::Error)),
+            (812, log("curl", "HTTP error 401")),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Error(ErrorClass::Auth))]);
+    }
+
+    #[test]
+    fn eof_auth_upgrade_only_from_lines_after_restart() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, log("curl", "HTTP error 403")), // load-phase line
+            (20, RawEvent::PlaybackRestart),
+            (5_000, end(1, EndReason::Eof)),
+        ]);
+        assert_eq!(out, vec![(1, PlayerEvent::Started), (1, PlayerEvent::Ended)]);
+        // While playing, the server cuts the stream off with 458: Auth.
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (10_000, RawEvent::StartFile(2)),
+            (10_020, RawEvent::PlaybackRestart),
+            (15_000, log("curl", "HTTP error 458")),
+            (15_010, end(2, EndReason::Eof)),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Started), (2, PlayerEvent::Error(ErrorClass::Auth))]);
+    }
+
+    #[test]
+    fn cplayer_timestamp_line_ignored() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, RawEvent::PlaybackRestart),
+            (20, log("cplayer", "Invalid video timestamp: 458.200 -> 401")),
+            (30, log("ffmpeg/video", "h264: error while decoding MB 401 23")),
+            (40, end(1, EndReason::Error)),
+        ]);
+        assert_eq!(out, vec![(1, PlayerEvent::Started), (1, PlayerEvent::Error(ErrorClass::Other))]);
+    }
+
+    #[test]
+    fn stale_time_pos_and_duration_of_old_file_ignored() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, RawEvent::PlaybackRestart),
+            (20, RawEvent::Duration(Some(3600.0))),
+            (30, RawEvent::TimePos(Some(100.0))),
+        ]);
+        assert_eq!(
+            out,
+            vec![(1, PlayerEvent::Started), (1, PlayerEvent::Duration(3600.0)), (1, PlayerEvent::Position(100.0))]
+        );
+        // Resume load of another file at 1234.5; old values trail in.
+        m.loaded(2, 2, Some(1234.5));
+        let out = run(&mut m, base, vec![
+            (40, end(1, EndReason::Stop)),
+            (40, RawEvent::StartFile(2)),
+            (41, RawEvent::TimePos(Some(100.04))),
+            (42, RawEvent::Duration(Some(3600.0))),
+            (43, RawEvent::TimePos(None)),
+            (44, RawEvent::Duration(Some(1800.0))),
+            (45, RawEvent::TimePos(Some(1234.6))),
+            (50, RawEvent::PlaybackRestart),
+            (60, RawEvent::TimePos(Some(1235.0))),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                (2, PlayerEvent::Position(1234.6)),
+                (2, PlayerEvent::Started),
+                (2, PlayerEvent::Duration(1800.0)),
+                (2, PlayerEvent::Position(1235.0)),
+            ]
+        );
+        // Live (no start=): nothing before restart.
+        m.loaded(3, 3, None);
+        let out = run(&mut m, base, vec![
+            (70, end(2, EndReason::Stop)),
+            (70, RawEvent::StartFile(3)),
+            (71, RawEvent::TimePos(Some(1236.0))),
+            (72, RawEvent::Duration(Some(1800.0))),
+            (73, RawEvent::Duration(None)),
+            (80, RawEvent::PlaybackRestart),
+        ]);
+        assert_eq!(out, vec![(3, PlayerEvent::Started)]);
+    }
+
+    #[test]
+    fn stop_and_replace_produce_nothing() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, RawEvent::PlaybackRestart),
+            (20, end(1, EndReason::Stop)),
+        ]);
+        assert_eq!(out, vec![(1, PlayerEvent::Started)]);
+        // User stop while an error END_FILE waits for its grace period.
+        m.loaded(2, 2, None);
+        let mut out = vec![];
+        m.handle(RawEvent::StartFile(2), base + ms(100), &mut out);
+        m.handle(end(2, EndReason::Error), base + ms(110), &mut out);
+        m.stopped();
+        m.flush(Some(base + ms(5_000)), &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn entries_that_never_started_are_pruned() {
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        m.loaded(2, 2, None);
+        m.loaded(3, 3, None);
+        let mut out = vec![];
+        m.handle(RawEvent::StartFile(3), Instant::now(), &mut out);
+        assert_eq!(m.pending_entries(), 1);
+        m.handle(end(3, EndReason::Stop), Instant::now(), &mut out);
+        assert_eq!(m.pending_entries(), 0);
+    }
+
+    #[test]
+    fn stale_paused_for_cache_does_not_leak_into_next_file() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, RawEvent::PlaybackRestart),
+            (20, RawEvent::PausedForCache(true)),
+            (30, end(1, EndReason::Stop)),
+            (30, RawEvent::StartFile(2)),
+            (40, RawEvent::PlaybackRestart),
+            // A pause toggle re-evaluates the flags: must not report buffering.
+            (50, RawEvent::Pause(true)),
+            (60, RawEvent::Pause(false)),
+        ]);
+        assert_eq!(
+            out,
+            vec![(1, PlayerEvent::Started), (1, PlayerEvent::Buffering(true)), (2, PlayerEvent::Started)]
+        );
+    }
+
+    #[test]
+    fn user_pause_or_seek_during_cache_wait_is_not_buffering() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (10, RawEvent::PlaybackRestart),
+            (20, RawEvent::PausedForCache(true)),
+            (30, RawEvent::Pause(true)),
+            (40, RawEvent::Seeking(true)),
+            (50, RawEvent::Pause(false)),
+            (60, RawEvent::Seeking(false)),
+            (70, RawEvent::PausedForCache(false)),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                (1, PlayerEvent::Started),
+                (1, PlayerEvent::Buffering(true)),
+                (1, PlayerEvent::Buffering(false)),
+                (1, PlayerEvent::Buffering(true)),
+                (1, PlayerEvent::Buffering(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mpv_version_parsing() {
+        assert_eq!(parse_mpv_version("mpv v0.41.0-1200-gdde067107"), Some((0, 41)));
+        assert_eq!(parse_mpv_version("mpv 0.38.0"), Some((0, 38)));
+        assert!(parse_mpv_version("mpv v0.37.0-dirty").unwrap() < MIN_MPV_VERSION);
+        assert!(parse_mpv_version("mpv v0.38.0").unwrap() >= MIN_MPV_VERSION);
+        assert_eq!(parse_mpv_version("mpv dde067107"), None);
+        assert_eq!(parse_mpv_version("?"), None);
     }
 }

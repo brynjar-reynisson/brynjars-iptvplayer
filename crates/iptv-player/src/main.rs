@@ -90,8 +90,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
-        self.renderer.destroy(gl);
+        // Stop playback first, then free the render context (GL current).
         self.sup.stop();
+        self.renderer.destroy(gl);
     }
 }
 
