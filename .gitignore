@@ -4,3 +4,4 @@ config.toml
 *.m3u
 *.dll
 .superpowers/
+/libmpv/

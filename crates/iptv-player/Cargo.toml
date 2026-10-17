@@ -1,0 +1,8 @@
+[package]
+name = "iptv-player"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iptv = { path = "../iptv" }
+anyhow = "1"
