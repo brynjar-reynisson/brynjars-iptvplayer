@@ -5,3 +5,4 @@ pub mod library;
 pub mod series;
 pub mod cache;
 pub mod fetch;
+pub mod favorites;
