@@ -7,3 +7,4 @@ pub mod cache;
 pub mod fetch;
 pub mod fsutil;
 pub mod favorites;
+pub mod supervisor;
