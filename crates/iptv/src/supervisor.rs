@@ -28,9 +28,12 @@
 //! straight to the auth delay for that attempt number.
 //!
 //! # Watchdogs
-//! Before `Started`: a growing start timeout ([`START_TIMEOUT_BASE`] + step per
-//! failed attempt, capped at [`START_TIMEOUT_MAX`]), extended by progress
-//! events. After `Started`: `Buffering(true)` longer than [`STALL_TIMEOUT`].
+//! Before `Started`: a growing start timeout ([`START_TIMEOUT_BASE`] for VOD,
+//! [`START_TIMEOUT_BASE_LIVE`] for live, + step per failed attempt, capped at
+//! [`START_TIMEOUT_MAX`]), extended by progress events but never beyond
+//! [`START_ABSOLUTE_MAX`] after the load. After `Started`: `Buffering(true)`
+//! longer than [`STALL_TIMEOUT`] (armed at `Started` if buffering was already
+//! in progress).
 //! Pause and user seeks must not be reported as `Buffering(true)`; a paused
 //! stream stays `Playing` (Task 10 contract).
 //!
@@ -140,21 +143,29 @@ pub const STABLE_RESET: Duration = Duration::from_secs(10);
 /// Stall watchdog: `Buffering(true)` *after* `Started` lasting longer than
 /// this (strictly) is treated as a drop. Applies to live and VOD.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(15);
-/// Pre-`Started` watchdog: a load gets `START_TIMEOUT_BASE` +
-/// `START_TIMEOUT_STEP` per consecutive failed attempt, capped at
-/// `START_TIMEOUT_MAX`, to reach `Started` (strictly-greater comparison).
+/// Pre-`Started` watchdog: a load gets `START_TIMEOUT_BASE` (VOD) or
+/// `START_TIMEOUT_BASE_LIVE` (live) + `START_TIMEOUT_STEP` per consecutive
+/// failed attempt, capped at `START_TIMEOUT_MAX`, to reach `Started`
+/// (strictly-greater comparison).
 /// The deadline grows so a slow open (large file on a slow link, resume load
 /// needing a long seek) cannot be reloaded forever, and any current-generation
 /// progress event before `Started` (`Position`, `Duration`, `Buffering(false)`)
-/// pushes the deadline back, since progress proves the load is alive.
+/// pushes the deadline back, since progress proves the load is alive, but
+/// never past `START_ABSOLUTE_MAX` after the load began: a load that keeps
+/// emitting progress without ever reaching `Started` is still failed.
 pub const START_TIMEOUT_BASE: Duration = Duration::from_secs(30);
+/// Shorter base for live: a dead live stream should be retried quickly.
+pub const START_TIMEOUT_BASE_LIVE: Duration = Duration::from_secs(15);
+/// Absolute cap from load to `Started`, regardless of progress events.
+pub const START_ABSOLUTE_MAX: Duration = Duration::from_secs(180);
 pub const START_TIMEOUT_STEP: Duration = Duration::from_secs(15);
 pub const START_TIMEOUT_MAX: Duration = Duration::from_secs(120);
 
-fn start_timeout(attempt: u32) -> Duration {
+fn start_timeout(attempt: u32, live: bool) -> Duration {
+    let base = if live { START_TIMEOUT_BASE_LIVE } else { START_TIMEOUT_BASE };
     START_TIMEOUT_STEP
         .checked_mul(attempt)
-        .and_then(|d| d.checked_add(START_TIMEOUT_BASE))
+        .and_then(|d| d.checked_add(base))
         .map_or(START_TIMEOUT_MAX, |d| d.min(START_TIMEOUT_MAX))
 }
 /// VOD `Ended` within this many seconds of the duration is a natural finish.
@@ -191,6 +202,10 @@ pub struct Supervisor<B: Backend> {
     stall_since: Option<Instant>,
     /// Pre-`Started` watchdog deadline for the current load.
     start_deadline: Option<Instant>,
+    /// When the current load was issued (absolute pre-`Started` cap).
+    load_started_at: Option<Instant>,
+    /// Last `Buffering` value seen for the current generation.
+    buffering: bool,
     /// When uninterrupted playing began; drives the backoff reset.
     stable_since: Option<Instant>,
 }
@@ -221,6 +236,8 @@ impl<B: Backend> Supervisor<B> {
             duration: None,
             stall_since: None,
             start_deadline: None,
+            load_started_at: None,
+            buffering: false,
             stable_since: None,
         }
     }
@@ -254,10 +271,19 @@ impl<B: Backend> Supervisor<B> {
         match ev {
             PlayerEvent::Started => {
                 self.started = true;
-                self.status = Status::Playing;
-                self.stall_since = None;
                 self.start_deadline = None;
-                self.stable_since = Some(now);
+                self.load_started_at = None;
+                if self.buffering {
+                    // Buffering began before Started and is still going:
+                    // arm the stall watchdog now.
+                    self.stall_since = Some(now);
+                    self.stable_since = None;
+                    self.status = Status::Buffering;
+                } else {
+                    self.stall_since = None;
+                    self.stable_since = Some(now);
+                    self.status = Status::Playing;
+                }
             }
             PlayerEvent::Position(p) => {
                 if p.is_finite() {
@@ -277,6 +303,7 @@ impl<B: Backend> Supervisor<B> {
             // (a paused stream stays Playing), or a pause > STALL_TIMEOUT
             // would trigger a reconnect.
             PlayerEvent::Buffering(true) => {
+                self.buffering = true;
                 // Before Started, the start deadline governs instead.
                 if self.started {
                     self.stall_since.get_or_insert(now);
@@ -285,6 +312,7 @@ impl<B: Backend> Supervisor<B> {
                 }
             }
             PlayerEvent::Buffering(false) => {
+                self.buffering = false;
                 if self.started {
                     self.stall_since = None;
                     self.stable_since = Some(now);
@@ -323,7 +351,8 @@ impl<B: Backend> Supervisor<B> {
             return;
         }
         if let Some(deadline) = self.start_deadline {
-            if now > deadline {
+            let hard = self.load_started_at.map(|t| t + START_ABSOLUTE_MAX);
+            if now > deadline || hard.is_some_and(|h| now > h) {
                 self.fail(false, now);
                 return;
             }
@@ -379,7 +408,9 @@ impl<B: Backend> Supervisor<B> {
         self.started = false;
         self.stable_since = None;
         self.stall_since = None;
-        self.start_deadline = Some(now + start_timeout(self.attempt));
+        self.start_deadline = Some(now + start_timeout(self.attempt, self.is_live));
+        self.load_started_at = Some(now);
+        self.buffering = false;
         if let Some(url) = self.url.as_deref() {
             self.backend.load(url, start_at, self.generation);
         }
@@ -389,7 +420,7 @@ impl<B: Backend> Supervisor<B> {
     /// pre-start deadline back (never earlier than it already is).
     fn note_progress(&mut self, now: Instant) {
         if let Some(old) = self.start_deadline {
-            self.start_deadline = Some(old.max(now + start_timeout(self.attempt)));
+            self.start_deadline = Some(old.max(now + start_timeout(self.attempt, self.is_live)));
         }
     }
 
@@ -930,17 +961,17 @@ mod tests {
         let mut s = sup();
         let now = Instant::now();
         s.play(URL_A.to_string(), true, now);
-        s.tick(now + START_TIMEOUT_BASE);
+        s.tick(now + START_TIMEOUT_BASE_LIVE);
         assert_eq!(s.status(), Status::Buffering);
-        s.tick(now + START_TIMEOUT_BASE + ms(1));
+        s.tick(now + START_TIMEOUT_BASE_LIVE + ms(1));
         assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
         // And a retry that hangs is also caught (with the grown timeout).
-        let t = now + Duration::from_secs(31);
+        let t = now + Duration::from_secs(16);
         s.tick(t);
         assert_eq!(load_count(&s), 2);
-        s.tick(t + Duration::from_secs(45));
+        s.tick(t + Duration::from_secs(30));
         assert!(matches!(s.status(), Status::Reconnecting { attempt: 1, .. }));
-        s.tick(t + Duration::from_secs(45) + ms(1));
+        s.tick(t + Duration::from_secs(30) + ms(1));
         assert_eq!(s.status(), Status::Reconnecting { attempt: 2, auth: false });
     }
 
@@ -994,9 +1025,70 @@ mod tests {
 
     #[test]
     fn start_timeout_grows_per_attempt_and_caps() {
+        assert_eq!(measure_start_timeouts(false), vec![30, 45, 60, 75, 90, 105, 120, 120, 120]);
+    }
+
+    #[test]
+    fn live_start_timeout_shorter_base() {
+        assert_eq!(measure_start_timeouts(true), vec![15, 30, 45, 60, 75, 90, 105, 120, 120]);
+    }
+
+    #[test]
+    fn progress_cannot_extend_start_past_absolute_cap() {
+        for live in [false, true] {
+            let mut s = sup();
+            let now = Instant::now();
+            s.play(URL_A.to_string(), live, now);
+            let g = s.generation();
+            let mut failed_at = None;
+            for i in 1..=60u64 {
+                let t = now + Duration::from_secs(10 * i);
+                s.on_event(g, PlayerEvent::Duration(100.0), t);
+                s.tick(t);
+                if failed_at.is_none() && matches!(s.status(), Status::Reconnecting { .. }) {
+                    failed_at = Some(10 * i);
+                }
+            }
+            let failed_at = failed_at.expect("load emitting progress but never Started must fail");
+            assert!(failed_at > START_ABSOLUTE_MAX.as_secs() && failed_at <= START_ABSOLUTE_MAX.as_secs() + 10);
+            assert!(load_count(&s) >= 2, "the reload must happen");
+        }
+    }
+
+    #[test]
+    fn buffering_in_progress_when_started_arms_stall() {
+        let mut s = sup();
+        let now = Instant::now();
+        s.play(URL_A.to_string(), true, now);
+        let g = s.generation();
+        s.on_event(g, PlayerEvent::Buffering(true), now);
+        s.on_event(g, PlayerEvent::Started, now + Duration::from_secs(2));
+        s.tick(now + Duration::from_secs(2) + STALL_TIMEOUT);
+        assert!(!matches!(s.status(), Status::Reconnecting { .. }));
+        s.tick(now + Duration::from_secs(2) + STALL_TIMEOUT + ms(1));
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        s.tick(now + Duration::from_secs(20));
+        assert_eq!(load_count(&s), 2);
+    }
+
+    #[test]
+    fn buffering_ended_before_started_does_not_arm_stall() {
+        let mut s = sup();
+        let now = Instant::now();
+        s.play(URL_A.to_string(), true, now);
+        let g = s.generation();
+        s.on_event(g, PlayerEvent::Buffering(true), now);
+        s.on_event(g, PlayerEvent::Buffering(false), now + ms(500));
+        s.on_event(g, PlayerEvent::Started, now + Duration::from_secs(1));
+        s.tick(now + Duration::from_secs(60));
+        assert_eq!(s.status(), Status::Playing);
+        assert_eq!(load_count(&s), 1);
+    }
+
+    fn measure_start_timeouts(live: bool) -> Vec<u64> {
         let mut s = sup();
         let mut now = Instant::now();
-        s.play(URL_A.to_string(), true, now);
+        s.play(URL_A.to_string(), live, now);
         let mut timeouts = vec![];
         for _ in 0..9 {
             // Find the exact deadline: still alive at T, failed at T + 1 ms.
@@ -1016,7 +1108,7 @@ mod tests {
             now += s.next_retry_in(now).unwrap();
             s.tick(now);
         }
-        assert_eq!(timeouts, vec![30, 45, 60, 75, 90, 105, 120, 120, 120]);
+        timeouts
     }
 
     #[test]
