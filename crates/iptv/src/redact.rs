@@ -1,7 +1,8 @@
-/// Replace credentials in a URL with `***`.
-///
-/// Handles Xtream-style paths (`/USER/PASS/ID`, `/movie|series|live/USER/PASS/ID.ext`)
-/// and `username=` / `password=` query values. Anything else is returned unchanged.
+/// Query keys whose values are known to be harmless; every other value is redacted.
+const SAFE_QUERY_KEYS: &[&str] = &["type", "output"];
+
+/// Replace credentials in a URL with `***`. Fails closed: userinfo, credential-looking
+/// path segments and every non-allowlisted query value are redacted.
 pub fn redact_url(s: &str) -> String {
     let (before_frag, frag) = match s.find('#') {
         Some(i) => (&s[..i], &s[i..]),
@@ -17,10 +18,15 @@ pub fn redact_url(s: &str) -> String {
         let parts: Vec<String> = q
             .split('&')
             .map(|kv| match kv.split_once('=') {
-                Some((k, _)) if k.eq_ignore_ascii_case("username") || k.eq_ignore_ascii_case("password") => {
-                    format!("{k}=***")
+                Some((k, _)) => {
+                    let dk = percent_decode(k).to_ascii_lowercase();
+                    if SAFE_QUERY_KEYS.contains(&dk.as_str()) {
+                        kv.to_string()
+                    } else {
+                        format!("{k}=***")
+                    }
                 }
-                _ => kv.to_string(),
+                None => kv.to_string(),
             })
             .collect();
         out.push_str(&parts.join("&"));
@@ -29,36 +35,61 @@ pub fn redact_url(s: &str) -> String {
     out
 }
 
-fn redact_path(base: &str) -> String {
-    let (prefix, rest) = match base.find("://") {
-        Some(i) => {
-            let after = &base[i + 3..];
-            match after.find('/') {
-                Some(j) => (&base[..i + 3 + j], &after[j..]),
-                None => return base.to_string(),
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
             }
         }
-        None => return base.to_string(),
-    };
-    let mut segs: Vec<String> = rest.split('/').skip(1).map(str::to_string).collect();
-    let kind_prefix = matches!(segs.first().map(String::as_str), Some("movie" | "series" | "live"));
-    let cred_at = if kind_prefix && segs.len() == 4 {
-        Some(1)
-    } else if segs.len() == 3 && stem_is_numeric(&segs[2]) {
-        Some(0)
-    } else {
-        None
-    };
-    if let Some(i) = cred_at {
-        segs[i] = "***".into();
-        segs[i + 1] = "***".into();
+        out.push(b[i]);
+        i += 1;
     }
-    format!("{prefix}/{}", segs.join("/"))
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-fn stem_is_numeric(seg: &str) -> bool {
-    let stem = seg.split('.').next().unwrap_or("");
-    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
+fn redact_path(base: &str) -> String {
+    let Some(i) = base.find("://") else {
+        return base.to_string();
+    };
+    let scheme_end = i + 3;
+    let after = &base[scheme_end..];
+    let (authority, rest) = match after.find('/') {
+        Some(j) => (&after[..j], &after[j..]),
+        None => (after, ""),
+    };
+    let authority = match authority.rfind('@') {
+        Some(at) => format!("***{}", &authority[at..]),
+        None => authority.to_string(),
+    };
+    if rest.is_empty() {
+        return format!("{}{}", &base[..scheme_end], authority);
+    }
+    let mut segs: Vec<String> = rest.split('/').skip(1).map(str::to_string).collect();
+    // Ignore trailing empty segments (trailing slash) when positioning.
+    let mut n = segs.len();
+    while n > 0 && segs[n - 1].is_empty() {
+        n -= 1;
+    }
+    let kind_at = segs[..n]
+        .iter()
+        .position(|g| ["movie", "series", "live"].contains(&g.to_ascii_lowercase().as_str()));
+    let start = match kind_at {
+        Some(k) if n >= k + 3 => Some(k + 1),
+        Some(_) => None,
+        None if n >= 3 => Some(0),
+        None => None,
+    };
+    if let Some(st) = start {
+        segs[st] = "***".into();
+        segs[st + 1] = "***".into();
+    }
+    format!("{}{}/{}", &base[..scheme_end], authority, segs.join("/"))
 }
 
 #[cfg(test)]
@@ -86,8 +117,39 @@ mod tests {
     }
 
     #[test]
+    fn redacts_trailing_slash_and_non_numeric_id() {
+        assert_eq!(redact_url("http://h:8080/USER/PASS/123/"), "http://h:8080/***/***/123/");
+        assert_eq!(redact_url("http://h/USER/PASS/abc"), "http://h/***/***/abc");
+        assert_eq!(redact_url("http://h/USER/PASS/123.ts"), "http://h/***/***/123.ts");
+    }
+
+    #[test]
+    fn redacts_case_insensitive_kind_and_extra_prefix() {
+        assert_eq!(redact_url("http://h/Movie/U/P/9.mkv"), "http://h/Movie/***/***/9.mkv");
+        assert_eq!(redact_url("http://h/proxy/movie/U/P/9.mkv"), "http://h/proxy/movie/***/***/9.mkv");
+        assert_eq!(redact_url("http://h/live/U/P/5.m3u8"), "http://h/live/***/***/5.m3u8");
+    }
+
+    #[test]
+    fn redacts_userinfo() {
+        assert_eq!(redact_url("http://user:pass@h:80/a"), "http://***@h:80/a");
+        assert_eq!(redact_url("http://user:pass@h"), "http://***@h");
+    }
+
+    #[test]
+    fn redacts_unknown_and_encoded_query_keys() {
+        assert_eq!(redact_url("http://h/x?user=a&pass=b&token=c"), "http://h/x?user=***&pass=***&token=***");
+        assert_eq!(redact_url("http://h/x?user%6Eame=a&PASSWORD=b"), "http://h/x?user%6Eame=***&PASSWORD=***");
+    }
+
+    #[test]
+    fn https_with_port() {
+        assert_eq!(redact_url("https://h:8443/U/P/7"), "https://h:8443/***/***/7");
+    }
+
+    #[test]
     fn leaves_non_credential_url_unchanged() {
-        for u in ["http://h/a/b", "http://h/", "http://h", "https://example.com/path/to/file.m3u", "not a url"] {
+        for u in ["http://h/a/b", "http://h/", "http://h", "not a url"] {
             assert_eq!(redact_url(u), u);
         }
     }
