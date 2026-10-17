@@ -513,6 +513,11 @@ pub const END_GRACE: Duration = Duration::from_millis(250);
 /// affected; only a user switch / watchdog replacement is.
 pub const ATTRIBUTION_WINDOW: Duration = Duration::from_millis(500);
 
+/// Before the first PLAYBACK_RESTART of a load with `start=s`, only
+/// `time-pos` values in `[s, s + PRE_RESTART_POS_WINDOW]` are passed on (any
+/// other value can be the previous file's). Loads without `start=` pass none.
+pub const PRE_RESTART_POS_WINDOW: f64 = 30.0;
+
 /// One mpv event, already decoded and scrubbed, as fed to [`EventMapper`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RawEvent {
@@ -548,7 +553,8 @@ struct Current {
     errors: Vec<String>,
     /// Latest duration seen before PLAYBACK_RESTART, emitted at restart.
     pending_duration: Option<f64>,
-    /// Stream lines before this instant belong to the previous entry.
+    /// Stream lines before this instant belong to the previous entry. Runs
+    /// until it expires (also through PLAYBACK_RESTART and into the ending).
     quarantine_until: Option<Instant>,
 }
 
@@ -558,6 +564,8 @@ struct Ending {
     reason: EndReason,
     errors: Vec<String>,
     deadline: Instant,
+    /// Inherited from the entry: lines before this are the previous entry's.
+    quarantine_until: Option<Instant>,
 }
 
 /// Pure attribution of mpv events to supervisor generations (no FFI, time
@@ -616,7 +624,6 @@ impl EventMapper {
                     if !c.started {
                         c.started = true;
                         c.errors.clear();
-                        c.quarantine_until = None;
                         out.push((c.generation, PlayerEvent::Started));
                         if let Some(d) = c.pending_duration.take() {
                             out.push((c.generation, PlayerEvent::Duration(d)));
@@ -628,8 +635,11 @@ impl EventMapper {
                 self.last_end = Some(now);
                 let generation = self.entries.remove(&entry).map(|e| e.generation);
                 let mut errors = Vec::new();
+                let mut quarantine_until = None;
                 if self.current.as_ref().is_some_and(|c| c.entry == entry) {
-                    errors = self.current.take().unwrap().errors;
+                    let c = self.current.take().unwrap();
+                    errors = c.errors;
+                    quarantine_until = c.quarantine_until;
                 }
                 if let (Some(generation), Some(_)) = (generation, map_end_file(reason, "")) {
                     if reason == EndReason::Error {
@@ -637,14 +647,14 @@ impl EventMapper {
                     }
                     // The log lines explaining the failure can arrive after
                     // END_FILE: map it once they had time to come.
-                    self.ending.push(Ending { generation, reason, errors, deadline: now + END_GRACE });
+                    self.ending.push(Ending { generation, reason, errors, deadline: now + END_GRACE, quarantine_until });
                 }
             }
             RawEvent::TimePos(v) => {
                 if let (Some(c), Some(v)) = (&self.current, v) {
                     // Before the first restart a time-pos can still be the
-                    // old file's: only accept it if it is at/after start=.
-                    if c.started || c.start_at.is_some_and(|s| v >= s) {
+                    // old file's: only accept it if it is just at/after start=.
+                    if c.started || c.start_at.is_some_and(|s| v >= s && v <= s + PRE_RESTART_POS_WINDOW) {
                         out.push((c.generation, PlayerEvent::Position(v)));
                     }
                 }
@@ -673,6 +683,7 @@ impl EventMapper {
                 let errors = match (self.current.as_mut(), self.ending.last_mut()) {
                     (Some(c), _) if c.quarantine_until.is_some_and(|q| now < q) => None,
                     (Some(c), _) => Some(&mut c.errors),
+                    (None, Some(e)) if e.quarantine_until.is_some_and(|q| now < q) => None,
                     (None, Some(e)) => Some(&mut e.errors),
                     (None, None) => None,
                 };
@@ -1397,6 +1408,97 @@ mod tests {
                 (1, PlayerEvent::Buffering(false)),
             ]
         );
+    }
+
+    // ---------- fix round 2 ----------
+
+    #[test]
+    fn late_old_line_after_new_entry_end_is_quarantined() {
+        // The old entry's 458 line arrives only after the new entry's own
+        // error END_FILE: it must not land in the new entry's ending.
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (50, end(1, EndReason::Stop)),
+            (50, RawEvent::StartFile(2)),
+            (80, end(2, EndReason::Error)),
+            (90, log("curl", "HTTP error 458")),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Error(ErrorClass::Other))]);
+    }
+
+    #[test]
+    fn quarantine_survives_early_restart() {
+        // New entry restarts within the window; an old line arriving after
+        // the restart must not later turn its EOF into Auth.
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        m.loaded(1, 1, None);
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (50, end(1, EndReason::Stop)),
+            (50, RawEvent::StartFile(2)),
+            (100, RawEvent::PlaybackRestart),
+            (200, log("curl", "HTTP error 458")),
+            (60_000, end(2, EndReason::Eof)),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Started), (2, PlayerEvent::Ended)]);
+        // After the window, lines while playing count again.
+        m.loaded(3, 3, None);
+        let out = run(&mut m, base, vec![
+            (61_000, RawEvent::StartFile(3)),
+            (61_020, RawEvent::PlaybackRestart),
+            (70_000, log("curl", "HTTP error 458")),
+            (70_010, end(3, EndReason::Eof)),
+        ]);
+        assert_eq!(out, vec![(3, PlayerEvent::Started), (3, PlayerEvent::Error(ErrorClass::Auth))]);
+    }
+
+    #[test]
+    fn pre_restart_positions_only_near_start() {
+        let base = Instant::now();
+        let mut m = EventMapper::default();
+        // Resume at 100: a stale old-file position of 5000 must not pass.
+        m.loaded(1, 1, Some(100.0));
+        let out = run(&mut m, base, vec![
+            (0, RawEvent::StartFile(1)),
+            (1, RawEvent::TimePos(Some(5000.0))),
+            (2, RawEvent::TimePos(Some(99.0))),
+            (3, RawEvent::TimePos(Some(130.5))),
+            (4, RawEvent::TimePos(Some(100.4))),
+            (5, RawEvent::PlaybackRestart),
+            (6, RawEvent::TimePos(Some(5000.0))), // after restart: real
+        ]);
+        assert_eq!(
+            out,
+            vec![(1, PlayerEvent::Position(100.4)), (1, PlayerEvent::Started), (1, PlayerEvent::Position(5000.0))]
+        );
+        // Live / no start=: nothing before restart, whatever the value.
+        m.loaded(2, 2, None);
+        let out = run(&mut m, base, vec![
+            (2_000, end(1, EndReason::Stop)),
+            (2_000, RawEvent::StartFile(2)),
+            (2_001, RawEvent::TimePos(Some(0.0))),
+            (2_002, RawEvent::TimePos(Some(7.0))),
+            (2_010, RawEvent::PlaybackRestart),
+        ]);
+        assert_eq!(out, vec![(2, PlayerEvent::Started)]);
+    }
+
+    #[test]
+    fn more_auth_wordings_through_map_end_file() {
+        use ErrorClass::*;
+        for text in [
+            "Too many connections",
+            "HTTP error 403 Forbidden",
+            "curl: (22) The requested URL returned error: 401",
+        ] {
+            assert_eq!(map_end_file(EndReason::Error, text), Some(PlayerEvent::Error(Auth)), "{text}");
+        }
     }
 
     #[test]
