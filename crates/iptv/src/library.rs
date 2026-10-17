@@ -15,6 +15,84 @@ pub struct Library {
     movies: Vec<usize>,
     by_key: HashMap<String, usize>,
     shows: Vec<Show>,
+    live_idx: NameIndex,
+    movie_idx: NameIndex,
+    show_idx: NameIndex,
+}
+
+/// Precomputed normalised names, parallel to `ids` (entry index or show index).
+#[derive(Debug, Default)]
+struct NameIndex {
+    ids: Vec<usize>,
+    names: Vec<String>,
+}
+
+impl NameIndex {
+    fn push(&mut self, id: usize, name: &str) {
+        self.ids.push(id);
+        self.names.push(normalize(name));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Live,
+    Movies,
+    Series,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchHit {
+    pub entry: Option<usize>,
+    pub show: Option<usize>,
+}
+
+fn fold_char(c: char, out: &mut String) {
+    let r = match c {
+        '\u{e0}'..='\u{e5}' | '\u{c0}'..='\u{c5}' | '\u{100}'..='\u{105}' => 'a',
+        '\u{e7}' | '\u{c7}' | '\u{106}'..='\u{10d}' => 'c',
+        '\u{10e}'..='\u{111}' | '\u{f0}' | '\u{d0}' => 'd',
+        '\u{e8}'..='\u{eb}' | '\u{c8}'..='\u{cb}' | '\u{112}'..='\u{11b}' => 'e',
+        '\u{ec}'..='\u{ef}' | '\u{cc}'..='\u{cf}' | '\u{128}'..='\u{131}' => 'i',
+        '\u{139}'..='\u{142}' => 'l',
+        '\u{f1}' | '\u{d1}' | '\u{143}'..='\u{148}' => 'n',
+        '\u{f2}'..='\u{f6}' | '\u{d2}'..='\u{d6}' | '\u{f8}' | '\u{d8}' | '\u{14c}'..='\u{151}' => 'o',
+        '\u{154}'..='\u{159}' => 'r',
+        '\u{15a}'..='\u{161}' => 's',
+        '\u{162}'..='\u{167}' => 't',
+        '\u{f9}'..='\u{fc}' | '\u{d9}'..='\u{dc}' | '\u{168}'..='\u{173}' => 'u',
+        '\u{fd}' | '\u{ff}' | '\u{dd}' | '\u{176}'..='\u{178}' => 'y',
+        '\u{179}'..='\u{17e}' => 'z',
+        '\u{e6}' | '\u{c6}' => {
+            out.push_str("ae");
+            return;
+        }
+        '\u{153}' | '\u{152}' => {
+            out.push_str("oe");
+            return;
+        }
+        '\u{df}' => {
+            out.push_str("ss");
+            return;
+        }
+        _ => {
+            out.extend(c.to_lowercase());
+            return;
+        }
+    };
+    out.push(r);
+}
+
+/// Lowercase and fold common Latin diacritics to base letters (no dependency).
+fn normalize(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        fold_char(c, &mut out);
+    }
+    out
 }
 
 const OTHER: &str = "Other";
@@ -26,28 +104,70 @@ impl Library {
         let mut other: Vec<usize> = Vec::new();
         let mut movies = Vec::new();
         let mut series = Builder::new();
+        let mut live_idx = NameIndex::default();
+        let mut movie_idx = NameIndex::default();
         let mut by_key = HashMap::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
             by_key.entry(favorite_key(e)).or_insert(i);
             match e.kind {
-                Kind::Live => match e.group.split_once(" - ") {
-                    Some((c, _)) => {
-                        let p = *pos.entry(c.to_string()).or_insert_with(|| {
-                            countries.push(Country { name: c.to_string(), channels: Vec::new() });
-                            countries.len() - 1
-                        });
-                        countries[p].channels.push(i);
+                Kind::Live => {
+                    live_idx.push(i, &e.name);
+                    match e.group.split_once(" - ") {
+                        Some((c, _)) => {
+                            let p = *pos.entry(c.to_string()).or_insert_with(|| {
+                                countries.push(Country { name: c.to_string(), channels: Vec::new() });
+                                countries.len() - 1
+                            });
+                            countries[p].channels.push(i);
+                        }
+                        None => other.push(i),
                     }
-                    None => other.push(i),
-                },
-                Kind::Movie => movies.push(i),
+                }
+                Kind::Movie => {
+                    movies.push(i);
+                    movie_idx.push(i, &e.name);
+                }
                 Kind::Series => series.add(i, &e.name),
             }
         }
         if !other.is_empty() {
             countries.push(Country { name: OTHER.to_string(), channels: other });
         }
-        Library { entries, countries, movies, by_key, shows: series.finish() }
+        let shows = series.finish();
+        let mut show_idx = NameIndex::default();
+        for (i, s) in shows.iter().enumerate() {
+            show_idx.push(i, &s.name);
+        }
+        Library { entries, countries, movies, by_key, shows, live_idx, movie_idx, show_idx }
+    }
+
+    /// Case- and diacritic-insensitive substring search; every whitespace-separated
+    /// term must match. Hits are in file order (shows in first-seen order) and stop
+    /// at `limit`. Series hits carry `show`, Live/Movies hits carry `entry`.
+    pub fn search(&self, scope: SearchScope, query: &str, limit: usize) -> Vec<SearchHit> {
+        let q = normalize(query);
+        let terms: Vec<&str> = q.split_whitespace().collect();
+        let mut hits = Vec::new();
+        if terms.is_empty() || limit == 0 {
+            return hits;
+        }
+        let idx = match scope {
+            SearchScope::Live => &self.live_idx,
+            SearchScope::Movies => &self.movie_idx,
+            SearchScope::Series => &self.show_idx,
+        };
+        for (id, name) in idx.ids.iter().zip(&idx.names) {
+            if terms.iter().all(|t| name.contains(t)) {
+                hits.push(match scope {
+                    SearchScope::Series => SearchHit { entry: None, show: Some(*id) },
+                    _ => SearchHit { entry: Some(*id), show: None },
+                });
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        hits
     }
 
     pub fn countries(&self) -> &[Country] {
@@ -136,6 +256,109 @@ mod tests {
     fn library_is_send_sync() {
         fn ok<T: Send + Sync>() {}
         ok::<Library>();
+    }
+
+    fn lib3() -> Library {
+        Library::build(vec![
+            e(Kind::Movie, "1", "The Red Falcon", "Action"),
+            e(Kind::Movie, "2", "Red Harbor Story", "Drama"),
+            e(Kind::Movie, "3", "Le Fran\u{e7}ais Tranquille", "Drama"),
+            e(Kind::Live, "4", "SVT \u{c5}rjang", "Sweden - News"),
+            e(Kind::Series, "5", "Blue Island S01 E01", "S"),
+            e(Kind::Series, "6", "Blue Island S01 E02", "S"),
+            e(Kind::Series, "7", "Red Moon S01 E01", "S"),
+        ])
+    }
+
+    #[test]
+    fn all_terms_must_match() {
+        let l = lib3();
+        let h = l.search(SearchScope::Movies, "red falcon", 10);
+        assert_eq!(h, vec![SearchHit { entry: Some(0), show: None }]);
+        assert_eq!(l.search(SearchScope::Movies, "red", 10).len(), 2);
+        assert!(l.search(SearchScope::Movies, "red zebra", 10).is_empty());
+    }
+
+    #[test]
+    fn case_and_diacritics_insensitive() {
+        let l = lib3();
+        assert_eq!(l.search(SearchScope::Movies, "francais", 10)[0].entry, Some(2));
+        assert_eq!(l.search(SearchScope::Movies, "FRAN\u{c7}AIS", 10)[0].entry, Some(2));
+        assert_eq!(l.search(SearchScope::Live, "arjang", 10)[0].entry, Some(3));
+        assert_eq!(l.search(SearchScope::Live, "\u{e5}rjang", 10).len(), 1);
+    }
+
+    #[test]
+    fn series_hits_are_shows() {
+        let l = lib3();
+        let h = l.search(SearchScope::Series, "island", 10);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].entry, None);
+        assert_eq!(l.shows()[h[0].show.unwrap()].name, "Blue Island");
+        assert_eq!(l.search(SearchScope::Series, "red", 10).len(), 1);
+    }
+
+    #[test]
+    fn empty_query_returns_empty() {
+        let l = lib3();
+        assert!(l.search(SearchScope::Movies, "", 10).is_empty());
+        assert!(l.search(SearchScope::Movies, "  \t ", 10).is_empty());
+    }
+
+    #[test]
+    fn limit_respected() {
+        let l = lib3();
+        assert_eq!(l.search(SearchScope::Movies, "r", 1).len(), 1);
+        assert!(l.search(SearchScope::Movies, "r", 0).is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn sample_search_perf() {
+        let Ok(p) = std::env::var("IPTV_SAMPLE") else { return };
+        let f = std::io::BufReader::new(std::fs::File::open(p).unwrap());
+        let es = crate::playlist::parse(f);
+        let t = std::time::Instant::now();
+        let lib = Library::build(es);
+        println!("build={:?}", t.elapsed());
+        let words = [
+            "the", "ca", "man", "a", "e", "s", "love", "dark", "night", "king", "war", "life", "star", "big", "new",
+            "red", "city", "dead", "last", "first", "home", "world", "blood", "time", "day", "girl", "boy", "house",
+            "fire", "dream", "zz", "xq", "qj", "zx", "ab", "co", "de", "la", "le", "un",
+        ];
+        let mut qs: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        for i in 0..words.len() {
+            qs.push(format!("{} {}", words[i], words[(i * 7 + 3) % words.len()]));
+        }
+        for i in 0..words.len() {
+            qs.push(format!("{} {} {}", words[i], words[(i * 5 + 1) % words.len()], words[(i * 11 + 2) % words.len()]));
+        }
+        qs.push("qqqqzzzz nomatchatall".into());
+        qs.push("the the the the".into());
+        for c in 'a'..='z' {
+            qs.push(c.to_string());
+        }
+        qs.push("fran\u{e7}ais".into());
+        qs.push("\u{e5}".into());
+        for (a, b) in [('t', 'h'), ('e', 'r'), ('o', 'n'), ('s', 't'), ('m', 'a')] {
+            for c in 'a'..='j' {
+                qs.push(format!("{a}{b}{c}"));
+            }
+        }
+        qs.truncate(200);
+        let mut times = Vec::new();
+        for q in &qs {
+            for sc in [SearchScope::Movies, SearchScope::Series] {
+                let t = std::time::Instant::now();
+                let h = lib.search(sc, q, 500);
+                times.push(t.elapsed());
+                std::hint::black_box(h);
+            }
+        }
+        times.sort();
+        let p95 = times[times.len() * 95 / 100];
+        println!("queries={} searches={} max={:?} p95={:?}", qs.len(), times.len(), times.last().unwrap(), p95);
+        assert!(*times.last().unwrap() < std::time::Duration::from_millis(50));
     }
 
     #[test]
