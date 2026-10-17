@@ -1261,6 +1261,7 @@ dependencies = [
  "eframe",
  "iptv",
  "libmpv2-sys",
+ "tempfile",
 ]
 
 [[package]]

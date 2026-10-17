@@ -84,7 +84,9 @@ fn fold_char(c: char, out: &mut String) {
 }
 
 /// Lowercase and fold common Latin diacritics to base letters (no dependency).
-fn normalize(s: &str) -> String {
+/// Case- and diacritic-insensitive form used by search (exposed so the UI can
+/// filter a sub-list with the same rules).
+pub fn normalize(s: &str) -> String {
     if s.is_ascii() {
         return s.to_ascii_lowercase();
     }

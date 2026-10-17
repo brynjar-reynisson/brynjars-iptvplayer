@@ -43,6 +43,9 @@ impl std::fmt::Debug for RefreshEvent {
 
 /// Replace the raw URL in `msg` with its redacted form.
 fn scrub(msg: &str, url: &str) -> String {
+    if url.is_empty() {
+        return msg.to_string();
+    }
     let mut out = msg.replace(url, &redact_url(url));
     // Also catch a URL as reqwest/url may re-serialise it (e.g. trailing slash added).
     let trimmed = url.trim_end_matches('/');
@@ -136,6 +139,41 @@ pub fn load_cached(dir: &Path) -> Option<(Arc<Library>, SystemTime)> {
     Some((Arc::new(Library::build(c.entries)), c.saved_at))
 }
 
+/// Where a refresh reads the playlist from.
+#[derive(Clone)]
+pub enum Source {
+    /// Download over HTTP(S) (credentials in the URL; never printed).
+    Url(String),
+    /// Parse a local `.m3u` file (dev/testing: `--playlist-file`).
+    File(PathBuf),
+}
+
+/// Manual Debug: the URL is redacted.
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Url(u) => write!(f, "Url({})", redact_url(u)),
+            Source::File(p) => write!(f, "File({})", p.display()),
+        }
+    }
+}
+
+/// Options for a refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshOptions {
+    /// Skip ONLY the "much smaller than the cached playlist" safety check
+    /// (the user confirmed the shrink is real). Empty playlists still fail.
+    pub force: bool,
+}
+
+const SHRINK_MARKER: &str = "much smaller than the cached one";
+
+/// True if a `RefreshEvent::Failed` message is the shrink safety refusal,
+/// i.e. a forced refresh would replace the cache.
+pub fn is_shrink_refusal(msg: &str) -> bool {
+    msg.contains(SHRINK_MARKER)
+}
+
 type Saver = Arc<dyn Fn(&Path, &[playlist::Entry]) -> Result<()> + Send + Sync>;
 
 fn running_dirs() -> &'static Mutex<HashSet<PathBuf>> {
@@ -161,18 +199,44 @@ pub struct Refresher {
 
 impl Refresher {
     pub fn spawn(url: String, dir: PathBuf) -> Refresher {
-        Self::try_spawn(url, dir).unwrap_or_else(|| {
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions::default())
+    }
+
+    /// Like [`Refresher::spawn`] but replaces the cache even when the new
+    /// playlist is much smaller than the cached one.
+    pub fn spawn_forced(url: String, dir: PathBuf) -> Refresher {
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: true })
+    }
+
+    pub fn try_spawn(url: String, dir: PathBuf) -> Option<Refresher> {
+        Self::try_spawn_source(Source::Url(url), dir, RefreshOptions::default())
+    }
+
+    /// General form: any [`Source`], with [`RefreshOptions`].
+    pub fn spawn_source(source: Source, dir: PathBuf, opts: RefreshOptions) -> Refresher {
+        Self::try_spawn_source(source, dir, opts).unwrap_or_else(|| {
             let (tx, rx) = channel();
             let _ = tx.send(RefreshEvent::Failed("refresh already running".into()));
             Refresher { rx }
         })
     }
 
-    pub fn try_spawn(url: String, dir: PathBuf) -> Option<Refresher> {
-        Self::try_spawn_with(url, dir, Arc::new(|d, e| cache::save(d, e)), Duration::from_millis(200))
+    pub fn try_spawn_source(source: Source, dir: PathBuf, opts: RefreshOptions) -> Option<Refresher> {
+        Self::try_spawn_full(source, dir, opts, Arc::new(cache::save), Duration::from_millis(200))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_spawn_with(url: String, dir: PathBuf, saver: Saver, retry_delay: Duration) -> Option<Refresher> {
+        Self::try_spawn_full(Source::Url(url), dir, RefreshOptions::default(), saver, retry_delay)
+    }
+
+    fn try_spawn_full(
+        source: Source,
+        dir: PathBuf,
+        opts: RefreshOptions,
+        saver: Saver,
+        retry_delay: Duration,
+    ) -> Option<Refresher> {
         {
             let mut s = running_dirs().lock().ok()?;
             if !s.insert(dir.clone()) {
@@ -184,7 +248,7 @@ impl Refresher {
         std::thread::spawn(move || {
             // Fixed message on panic: the payload could contain the URL.
             let ev = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&url, &dir, &saver, retry_delay, &tx)
+                run(&source, opts, &dir, &saver, retry_delay, &tx)
             }))
             .unwrap_or_else(|_| RefreshEvent::Failed("internal error".into()));
             // Release the single-run guard before the terminal event so a UI reacting
@@ -222,7 +286,8 @@ fn sweep_stale(cache_dir: &Path) {
 }
 
 fn run(
-    url: &str,
+    source: &Source,
+    opts: RefreshOptions,
     dir: &Path,
     saver: &Saver,
     retry_delay: Duration,
@@ -230,20 +295,36 @@ fn run(
 ) -> RefreshEvent {
     let m3u = dir.join("cache").join("playlist.m3u.tmp");
     sweep_stale(&dir.join("cache"));
+    // Only a URL source has credentials to scrub.
+    let url = match source {
+        Source::Url(u) => u.as_str(),
+        Source::File(_) => "",
+    };
     let res = (|| -> Result<RefreshEvent> {
-        download_with_progress(url, &m3u, &mut |n| {
-            let _ = tx.send(RefreshEvent::Progress(n));
-        })?;
-        let f = std::fs::File::open(&m3u).map_err(|e| anyhow!("opening downloaded playlist: {e}"))?;
-        let entries = playlist::parse(BufReader::new(f));
+        let entries = match source {
+            Source::Url(url) => {
+                download_with_progress(url, &m3u, &mut |n| {
+                    let _ = tx.send(RefreshEvent::Progress(n));
+                })?;
+                let f = std::fs::File::open(&m3u).map_err(|e| anyhow!("opening downloaded playlist: {e}"))?;
+                playlist::parse(BufReader::new(f))
+            }
+            Source::File(p) => {
+                let f = std::fs::File::open(p).map_err(|e| anyhow!("opening playlist file: {}", e.kind()))?;
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let entries = playlist::parse(BufReader::new(f));
+                let _ = tx.send(RefreshEvent::Progress(len));
+                entries
+            }
+        };
         if entries.is_empty() {
             return Err(anyhow!("downloaded playlist contained no entries"));
         }
         // A truncated body without Content-Length must not replace a good cache.
-        if let Some(old) = cache::load(dir) {
+        if let (false, Some(old)) = (opts.force, cache::load(dir)) {
             if entries.len() * 2 < old.entries.len() {
                 return Err(anyhow!(
-                    "downloaded playlist is much smaller than the cached one ({} vs {} entries); keeping the old data",
+                    "downloaded playlist is {SHRINK_MARKER} ({} vs {} entries); keeping the old data",
                     entries.len(),
                     old.entries.len()
                 ));
@@ -473,6 +554,69 @@ mod tests {
         assert!(m.contains("2 vs 10 entries"), "{m}");
         assert_eq!(cache::load(d.path()).unwrap().entries, e);
         no_leftovers(d.path());
+    }
+
+    fn ten_entry_cache(dir: &Path) -> Vec<playlist::Entry> {
+        let mut big = String::from("#EXTM3U\n");
+        for i in 0..10 {
+            big.push_str(&format!("#EXTINF:-1 tvg-id=\"i{i}\" group-title=\"G\",Chan {i}\nhttp://example.invalid/live/{i}\n"));
+        }
+        let e = playlist::parse(BufReader::new(big.as_bytes()));
+        cache::save(dir, &e).unwrap();
+        e
+    }
+
+    #[test]
+    fn shrink_refusal_is_detectable() {
+        let d = tempfile::tempdir().unwrap();
+        ten_entry_cache(d.path());
+        let base = ok_server(M3U);
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
+        assert!(is_shrink_refusal(&m), "{m}");
+        assert!(!is_shrink_refusal("server returned HTTP 500"));
+    }
+
+    #[test]
+    fn forced_refresh_skips_only_the_size_check() {
+        let d = tempfile::tempdir().unwrap();
+        ten_entry_cache(d.path());
+        let base = ok_server(M3U); // 2 entries < 50% of 10
+        let r = Refresher::spawn_forced(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let (_, ev) = wait(&r);
+        assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+        assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
+        no_leftovers(d.path());
+        // Forced still fails on an empty playlist and keeps the cache.
+        let empty = ok_server("#EXTM3U\n");
+        let (_, ev) = wait(&Refresher::spawn_forced(format!("{empty}/a.m3u"), d.path().to_path_buf()));
+        assert!(matches!(ev, RefreshEvent::Failed(_)), "{ev:?}");
+        assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn file_source_parses_local_playlist_into_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("local.m3u");
+        std::fs::write(&src, M3U).unwrap();
+        let r = Refresher::spawn_source(Source::File(src.clone()), d.path().to_path_buf(), RefreshOptions::default());
+        let (seen, ev) = wait(&r);
+        let RefreshEvent::Done(lib) = ev else { panic!("{ev:?}") };
+        assert_eq!(lib.entry_count(), 2);
+        assert!(seen.iter().any(|e| matches!(e, RefreshEvent::Progress(n) if *n == M3U.len() as u64)));
+        assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
+        assert!(src.exists(), "source file must be left alone");
+        // Missing file: Failed, cache untouched.
+        let missing = d.path().join("nope.m3u");
+        let (_, ev) = wait(&Refresher::spawn_source(Source::File(missing), d.path().to_path_buf(), RefreshOptions::default()));
+        assert!(matches!(ev, RefreshEvent::Failed(_)), "{ev:?}");
+        assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn source_debug_redacts_url() {
+        let s = format!("{:?}", Source::Url("http://h.invalid/SECRETUSER/SECRETPASS/get.m3u".into()));
+        assert!(!s.contains("SECRETUSER") && !s.contains("SECRETPASS"), "{s}");
     }
 
     #[test]

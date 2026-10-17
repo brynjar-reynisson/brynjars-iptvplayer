@@ -410,7 +410,24 @@ impl MpvRenderer {
                 }
             }
             let t = st.target.as_ref().unwrap();
+            // egui calls us with SCISSOR_TEST on and the scissor box set to the
+            // clip rect in *window* coordinates; inside our offscreen FBO
+            // (origin 0,0) that would clip mpv's render for any video rect not
+            // at the window origin.
+            gl.disable(glow::SCISSOR_TEST);
             render_to(st.ctx, w, h, t.fbo.0.get() as i32);
+            // State egui does not reset in prepare_painting (it re-sets blend,
+            // viewport, program, VAO, scissor enable, sRGB): pixel-store state
+            // used by its texture uploads and the bound unpack buffer.
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
+            gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+            gl.active_texture(glow::TEXTURE0);
+            // The blit honours the scissor: clip it to egui's clip rect.
+            let clip = info.clip_rect_in_pixels();
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(clip.left_px, clip.from_bottom_px, clip.width_px, clip.height_px);
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(t.fbo));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, painter.intermediate_fbo());
             gl.blit_framebuffer(
