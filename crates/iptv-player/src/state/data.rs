@@ -60,12 +60,15 @@ pub struct DataState {
     refresh: RefreshState,
     library: Option<Arc<Library>>,
     warning: Option<String>,
+    /// A refresh was started this session (user or automatic): the
+    /// stale-cache refresh must not start a second one.
+    refresh_requested: bool,
 }
 
 impl DataState {
     /// Initial state: loading the cache.
     pub fn new(source: SourceStatus) -> (DataState, Vec<Action>) {
-        let s = DataState { source, phase: Phase::Loading, refresh: RefreshState::Idle, library: None, warning: None };
+        let s = DataState { source, phase: Phase::Loading, refresh: RefreshState::Idle, library: None, warning: None, refresh_requested: false };
         (s, vec![Action::LoadCache])
     }
 
@@ -112,7 +115,9 @@ impl DataState {
             }
             None => true,
         };
-        if !stale || matches!(self.refresh, RefreshState::Running { .. }) {
+        // A refresh already requested this session (still running, done or
+        // failed) supersedes the stale-cache one.
+        if !stale || self.refresh_requested {
             return vec![];
         }
         match &self.source {
@@ -172,6 +177,7 @@ impl DataState {
     }
 
     fn start(&mut self, force: bool) -> Vec<Action> {
+        self.refresh_requested = true;
         self.refresh = RefreshState::Running { bytes: 0, forced: force };
         if self.library.is_none() {
             self.phase = Phase::Loading;
@@ -261,6 +267,27 @@ mod tests {
         assert!(s.request_refresh(false).is_empty());
         let RefreshState::Failed { msg, can_force } = s.refresh() else { panic!("{:?}", s.refresh()) };
         assert!(msg.contains("config.toml") && !can_force, "{msg}");
+    }
+
+    #[test]
+    fn user_refresh_during_cache_load_suppresses_the_stale_refresh() {
+        let now = SystemTime::now();
+        let stale = now - MAX_CACHE_AGE * 2;
+        // F5 while the cache is still loading, refresh finishes first.
+        let (mut s, _) = avail();
+        assert_eq!(s.request_refresh(false), vec![Action::StartRefresh { force: false }]);
+        let fresh = lib();
+        assert!(s.on_refresh_event(RefreshEvent::Done(fresh.clone())));
+        assert!(s.on_cache_loaded(Some((lib(), stale)), now).is_empty(), "no second refresh");
+        assert!(Arc::ptr_eq(s.library().unwrap(), &fresh), "older cache never replaces refreshed data");
+        // F5 while loading, refresh fails before the stale cache arrives:
+        // the user already saw that attempt fail; no automatic second one.
+        let (mut s, _) = avail();
+        s.request_refresh(false);
+        s.on_refresh_event(RefreshEvent::Failed("server returned HTTP 500".into()));
+        assert!(s.on_cache_loaded(Some((lib(), stale)), now).is_empty());
+        assert_eq!(s.phase(), &Phase::Ready, "cached data still shown");
+        assert!(matches!(s.refresh(), RefreshState::Failed { .. }), "failure stays visible");
     }
 
     #[test]

@@ -18,11 +18,13 @@ use eframe::egui;
 use iptv::favorites::Favorites;
 use iptv::fetch::{self, RefreshEvent, RefreshOptions, Refresher, Source};
 use iptv::library::Library;
+use iptv::playlist::favorite_key;
 
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
-use crate::state::favs::{toggle_favorite, toggle_key, FavBrowser};
+use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
 use crate::state::playback::Playback;
+use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::{format_bytes, safe_text, Tab};
 use live::{ListView, RowAction};
 use player::Player;
@@ -94,6 +96,8 @@ struct App {
     view: View,
     player: Result<Player, String>,
     playback: Option<Playback>,
+    /// Debounced Up/Down channel switch (see `state::zap`).
+    zap: Debounce<Playback>,
     /// Transient on-screen message (favorite toggled, save error, ...).
     message: Option<String>,
     filter: String,
@@ -132,6 +136,7 @@ impl App {
             view: View::Browse,
             player,
             playback: None,
+            zap: Debounce::new(ZAP_DELAY),
             message: None,
             filter: String::new(),
             focus_filter: false,
@@ -205,8 +210,10 @@ impl App {
             let mut done = false;
             while let Some(ev) = r.poll() {
                 done |= matches!(ev, RefreshEvent::Done(_) | RefreshEvent::Failed(_));
-                if let RefreshEvent::Failed(m) = &ev {
-                    eprintln!("refresh failed: {}", safe_text(m));
+                match &ev {
+                    RefreshEvent::Failed(m) => eprintln!("refresh failed: {}", safe_text(m)),
+                    RefreshEvent::Done(l) => eprintln!("refresh done: {} entries", l.entry_count()),
+                    _ => {}
                 }
                 self.data.on_refresh_event(ev);
             }
@@ -217,7 +224,9 @@ impl App {
         self.sync_library();
     }
 
-    /// Adopt a new library (cache loaded or refresh done) atomically.
+    /// Adopt a new library (cache loaded or refresh done) atomically. The
+    /// playback (and a pending zap) are re-pointed at it by favorite key, so
+    /// the old library (~250 MB) is released.
     fn sync_library(&mut self) {
         let Some(new) = self.data.library().cloned() else { return };
         if self.shown_lib.as_ref().is_some_and(|l| Arc::ptr_eq(l, &new)) {
@@ -226,6 +235,12 @@ impl App {
         self.live.set_library(self.shown_lib.as_deref(), &new);
         self.live.set_filter(&new, &self.filter);
         self.fav.reload(Some(&new), &self.favs);
+        if let Some(pb) = &mut self.playback {
+            pb.rebase(new.clone());
+        }
+        if let Some(pb) = self.zap.pending_mut() {
+            pb.rebase(new.clone());
+        }
         self.scroll_to = self.live.list().cursor();
         self.shown_lib = Some(new.clone());
         if !self.ready_logged {
@@ -240,9 +255,12 @@ impl App {
 
     // ---- playback ----------------------------------------------------------
 
+    /// Load `pb` now (click/Enter, or a zap that became due). Cancels any
+    /// pending zap.
     fn start(&mut self, pb: Playback) {
+        self.zap.cancel();
         match &mut self.player {
-            Ok(p) => p.play(&pb.entry().url, pb.is_live()),
+            Ok(p) => p.play(pb.url(), pb.is_live()),
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
         self.playback = Some(pb);
@@ -255,6 +273,7 @@ impl App {
     }
 
     fn stop(&mut self) {
+        self.zap.cancel();
         if let Ok(p) = &mut self.player {
             p.stop();
         }
@@ -262,9 +281,23 @@ impl App {
         self.view = View::Browse;
     }
 
+    /// Load the zap target once navigation has been quiet for ZAP_DELAY.
+    fn fire_zap(&mut self) {
+        if let Some(pb) = self.zap.due(Instant::now()) {
+            self.start(pb);
+        }
+    }
+
+    /// Entry (in the shown library) that is loaded in the player.
     fn playing_entry(&self) -> Option<usize> {
         let lib = self.shown_lib.as_ref()?;
-        self.playback.as_ref().filter(|p| p.same_library(lib)).map(Playback::entry_index)
+        self.playback.as_ref().filter(|p| p.same_library(lib)).and_then(Playback::entry_index)
+    }
+
+    /// The pending zap target, else the loaded entry (Up/Down start point).
+    fn target_entry(&self) -> Option<usize> {
+        let lib = self.shown_lib.as_ref()?;
+        self.zap.pending().filter(|p| p.same_library(lib)).and_then(Playback::entry_index).or(self.playing_entry())
     }
 
     /// The Up/Down list of the visible tab.
@@ -276,24 +309,26 @@ impl App {
         }
     }
 
-    /// Up/Down: in the player view walk the playback list; in the browse
-    /// view move the cursor, and switch channel too if something is playing.
+    /// Up/Down: move the selection at once; if something is playing, queue
+    /// the new channel as a debounced zap (loaded after ZAP_DELAY without
+    /// further navigation, so key repeat never opens a connection per key).
+    /// In the player view, walk the list playback started from.
     fn step(&mut self, delta: i32) {
+        let now = Instant::now();
         if self.view == View::Player {
-            if let Some(pb) = &mut self.playback {
-                let e = pb.step(delta);
-                let (url, live) = (pb.entry().url.clone(), pb.is_live());
-                if let Ok(p) = &mut self.player {
-                    p.play(&url, live);
-                }
-                if pb.tab == Tab::Live && self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)) {
-                    self.live.list_mut().select_entry(e);
-                    self.scroll_to = self.live.list().cursor();
+            let base = self.zap.pending().or(self.playback.as_ref()).cloned();
+            if let Some(mut pb) = base {
+                if let Some(e) = pb.step(delta) {
+                    if pb.tab == Tab::Live && self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)) {
+                        self.live.list_mut().select_entry(e);
+                        self.scroll_to = self.live.list().cursor();
+                    }
+                    self.zap.push(pb, now);
                 }
             }
             return;
         }
-        let playing = self.playing_entry();
+        let playing = self.target_entry();
         let picked = match self.tab {
             Tab::Live => {
                 // Nothing selected but the playing channel is listed: step from it.
@@ -311,16 +346,18 @@ impl App {
             }
             Tab::Movies | Tab::Series => None,
         };
-        if let (Some(e), true) = (picked, self.playback.is_some()) {
-            self.play_from(self.tab_list(), e, self.tab);
+        let active = self.playback.is_some() || self.zap.pending().is_some();
+        if let (Some(e), true, Some(lib)) = (picked, active, self.shown_lib.clone()) {
+            self.zap.push(Playback::new(lib, self.tab_list(), e, self.tab), now);
         }
     }
 
-    /// Enter: play the selected row; on the row already playing, open the
+    /// Enter: play the selected row; on the row already loaded, open the
     /// full player view.
     fn activate(&mut self) {
+        let loaded = self.playing_entry();
         match self.selected_entry() {
-            Some(e) if self.playing_entry() == Some(e) => self.view = View::Player,
+            Some(e) if loaded == Some(e) && self.zap.pending().is_none() => self.view = View::Player,
             Some(e) => self.play_from(self.tab_list(), e, self.tab),
             None if self.tab == Tab::Favorites && self.fav.cursor().is_some() => {
                 self.message = Some("This favorite is not in the current playlist.".into())
@@ -337,23 +374,19 @@ impl App {
         }
     }
 
-    /// `F`: toggle favorite on the playing channel, else the selected row.
+    /// `F`: Favorites tab = the row under the cursor; otherwise the playing
+    /// channel, else the selected one (see `state::favs::toggle_target`).
     fn toggle_favorite(&mut self) {
-        let res = if let Some(pb) = &self.playback {
-            let name = pb.entry().name.clone();
-            toggle_favorite(&mut self.favs, pb.library(), pb.entry_index()).map(|on| (on, name))
-        } else if let (Some(lib), Some(e)) = (self.shown_lib.clone(), self.selected_entry()) {
-            let name = lib.entry(e).name.clone();
-            toggle_favorite(&mut self.favs, &lib, e).map(|on| (on, name))
-        } else if let Some(row) = (self.tab == Tab::Favorites).then(|| self.fav.cursor()).flatten() {
-            let row = self.fav.rows()[row].clone();
-            toggle_key(&mut self.favs, &row.key, &row.label).map(|on| (on, row.label))
-        } else {
-            return;
-        };
-        self.message = Some(match res {
-            Ok((true, n)) => format!("Added to favorites: {n}"),
-            Ok((false, n)) => format!("Removed from favorites: {n}"),
+        let fav_row = self.fav.cursor().and_then(|c| self.fav.rows().get(c)).cloned();
+        let playing = self.playback.as_ref().map(|p| (p.key().to_string(), p.name().to_string()));
+        let selected = self.shown_lib.as_ref().zip(self.selected_entry()).map(|(lib, e)| {
+            let en = lib.entry(e);
+            (favorite_key(en), en.name.clone())
+        });
+        let Some((key, label)) = toggle_target(self.tab, fav_row.as_ref(), playing, selected) else { return };
+        self.message = Some(match toggle_key(&mut self.favs, &key, &label) {
+            Ok(true) => format!("Added to favorites: {label}"),
+            Ok(false) => format!("Removed from favorites: {label}"),
             Err(e) => safe_text(&e),
         });
         self.fav.reload(self.shown_lib.as_deref(), &self.favs);
@@ -573,8 +606,13 @@ impl App {
             let rect = ui.max_rect();
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
-                    let fav = if self.favs.contains(&pb.key()) { "  · Favorite" } else { "" };
-                    p.show(ui, rect, &format!("{}{fav}", pb.entry().name));
+                    let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
+                    let gone = if pb.in_playlist() { "" } else { "  (not in playlist)" };
+                    let mut title = format!("{}{fav}{gone}", pb.name());
+                    if let Some(next) = self.zap.pending() {
+                        title = format!("{title}  →  {}…", next.name());
+                    }
+                    p.show(ui, rect, &title);
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
                         self.view = if self.view == View::Player { View::Browse } else { View::Player };
@@ -630,8 +668,10 @@ impl App {
                     if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
                         self.live.list_mut().set_cursor(i);
                         let e = self.live.list().current();
-                        if let Some(e) = e.filter(|e| Some(*e) != playing) {
-                            self.play_from(self.tab_list(), e, Tab::Live);
+                        // A click plays at once and cancels a pending zap.
+                        match e {
+                            Some(e) if Some(e) != playing => self.play_from(self.tab_list(), e, Tab::Live),
+                            _ => drop(self.zap.cancel()),
                         }
                         if matches!(a, Some(RowAction::DoubleClick(_))) {
                             self.view = View::Player;
@@ -656,8 +696,9 @@ impl App {
                         self.fav.set_cursor(i);
                         match self.fav.play_target() {
                             Some(e) if Some(e) != playing => self.play_from(self.tab_list(), e, Tab::Favorites),
-                            Some(_) => {}
+                            Some(_) => drop(self.zap.cancel()),
                             None => {
+                                self.zap.cancel();
                                 self.message = Some("This favorite is not in the current playlist.".into())
                             }
                         }
@@ -691,6 +732,7 @@ impl eframe::App for App {
             p.update();
         }
         self.handle_keys(&ctx);
+        self.fire_zap();
 
         if self.view == View::Player && self.playback.is_some() {
             self.video_area(ui);
@@ -713,6 +755,10 @@ impl eframe::App for App {
         // Keep timers (supervisor, refresh/cache polling) running.
         let busy = self.cache_rx.is_some() || self.refresher.is_some();
         let player_tick = self.player.as_ref().ok().and_then(Player::repaint_interval);
+        if let Some(w) = self.zap.wait(Instant::now()) {
+            // Fire the pending zap without waiting for input.
+            ctx.request_repaint_after(w);
+        }
         if busy || player_tick.is_some() {
             ctx.request_repaint_after(player_tick.unwrap_or(Duration::from_millis(100)));
         }

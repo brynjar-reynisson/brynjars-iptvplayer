@@ -4,6 +4,8 @@ use iptv::favorites::Favorites;
 use iptv::library::Library;
 use iptv::playlist::favorite_key;
 
+use super::Tab;
+
 /// One row of the Favorites tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FavRow {
@@ -48,6 +50,24 @@ pub fn toggle_key(favs: &mut Favorites, key: &str, label: &str) -> Result<bool, 
             favs.toggle(key, label);
             Err(format!("Could not save favorites: {err:#}"))
         }
+    }
+}
+
+/// A favorite toggle target: (favorite key, label).
+pub type FavTarget = (String, String);
+
+/// What `F` toggles. In the Favorites tab the row under the cursor wins (so
+/// an unavailable favorite can be removed while something plays); in other
+/// tabs the playing channel, else the selected one.
+pub fn toggle_target(
+    tab: Tab,
+    fav_row: Option<&FavRow>,
+    playing: Option<FavTarget>,
+    selected: Option<FavTarget>,
+) -> Option<FavTarget> {
+    match (tab, fav_row) {
+        (Tab::Favorites, Some(r)) => Some((r.key.clone(), r.label.clone())),
+        _ => playing.or(selected),
     }
 }
 
@@ -176,6 +196,23 @@ mod tests {
         // Without a library nothing is playable.
         b.reload(None, &favs);
         assert!(b.rows().iter().all(|r| !r.playable()));
+    }
+
+    #[test]
+    fn f_prefers_favorites_row_then_playing_then_selected() {
+        let t = |k: &str| Some((k.to_string(), k.to_uppercase()));
+        let gone = FavRow { key: "live:999".into(), label: "Gone".into(), entry: None };
+        // Favorites tab: the row under the cursor, even while something plays.
+        assert_eq!(
+            toggle_target(Tab::Favorites, Some(&gone), t("live:1"), t("live:2")),
+            Some(("live:999".into(), "Gone".into()))
+        );
+        // Favorites tab without a row selected: falls back to the playing channel.
+        assert_eq!(toggle_target(Tab::Favorites, None, t("live:1"), None), t("live:1"));
+        // Other tabs: playing beats selected; selected when nothing plays.
+        assert_eq!(toggle_target(Tab::Live, Some(&gone), t("live:1"), t("live:2")), t("live:1"));
+        assert_eq!(toggle_target(Tab::Live, None, None, t("live:2")), t("live:2"));
+        assert_eq!(toggle_target(Tab::Live, None, None, None), None);
     }
 
     #[test]
