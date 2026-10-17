@@ -40,12 +40,11 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            let hex = |c: u8| (c as char).to_digit(16).unwrap() as u8;
+            out.push(hex(b[i + 1]) * 16 + hex(b[i + 2]));
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -140,6 +139,21 @@ mod tests {
     fn redacts_unknown_and_encoded_query_keys() {
         assert_eq!(redact_url("http://h/x?user=a&pass=b&token=c"), "http://h/x?user=***&pass=***&token=***");
         assert_eq!(redact_url("http://h/x?user%6Eame=a&PASSWORD=b"), "http://h/x?user%6Eame=***&PASSWORD=***");
+    }
+
+    #[test]
+    fn percent_decode_does_not_panic_on_multibyte() {
+        assert_eq!(redact_url("http://h/x?%a\u{e9}=x"), "http://h/x?%a\u{e9}=***");
+        assert_eq!(redact_url("http://h/x?%\u{e9}=x&%=y&%4=z"), "http://h/x?%\u{e9}=***&%=y&%4=z");
+    }
+
+    #[test]
+    fn over_redacts_unprefixed_three_segment_url_by_design() {
+        // Fail closed: indistinguishable from /USER/PASS/ID, so it is redacted.
+        assert_eq!(
+            redact_url("https://example.com/path/to/file.m3u"),
+            "https://example.com/***/***/file.m3u"
+        );
     }
 
     #[test]
