@@ -1,4 +1,4 @@
-﻿//! Playlist download and background refresh.
+//! Playlist download and background refresh.
 //!
 //! Credentials safety: every error string produced here is scrubbed (the raw URL is
 //! replaced by its `redact_url` form and reqwest's own URL echo is stripped).
@@ -18,7 +18,7 @@ const SAVE_ATTEMPTS: u32 = 3;
 const PROGRESS_STEP: u64 = 256 * 1024;
 
 /// Events emitted by a [`Refresher`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum RefreshEvent {
     /// Bytes downloaded so far.
     Progress(u64),
@@ -29,6 +29,18 @@ pub enum RefreshEvent {
     Warning(String),
     /// Refresh failed; old cache/data untouched (terminal event). Message is redacted.
     Failed(String),
+}
+
+/// Manual Debug: never dumps the Library (it would print every stream URL).
+impl std::fmt::Debug for RefreshEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshEvent::Progress(n) => write!(f, "Progress({n})"),
+            RefreshEvent::Done(l) => write!(f, "Done(<library: {} entries>)", l.entry_count()),
+            RefreshEvent::Warning(m) => write!(f, "Warning({m:?})"),
+            RefreshEvent::Failed(m) => write!(f, "Failed({m:?})"),
+        }
+    }
 }
 
 /// Replace the raw URL in `msg` with its redacted form.
@@ -72,10 +84,24 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).map_err(|e| anyhow!("creating download dir: {e}"))?;
     }
+    // Only follow redirects to the same host: path credentials must not reach a third party.
+    let policy = reqwest::redirect::Policy::custom(|a| {
+        let same = a.previous().last().and_then(|u| u.host_str()) == a.url().host_str();
+        if a.previous().len() >= 10 {
+            a.error("too many redirects")
+        } else if same {
+            a.follow()
+        } else {
+            a.error("blocked redirect to a different host")
+        }
+    });
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        // reqwest::blocking has no per-read timeout; use a generous overall cap instead.
-        .timeout(Duration::from_secs(600))
+        // Blocking reqwest has no per-read timeout, only an overall one. A stalled
+        // connection can therefore hold the worker for up to this long (the UI stays
+        // usable meanwhile), so keep it generous for large playlists.
+        .timeout(Duration::from_secs(1800))
+        .redirect(policy)
         .build()
         .map_err(net)?;
     let mut resp = client.get(url).send().map_err(net)?;
@@ -108,8 +134,17 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u
     f.sync_all().map_err(|e| anyhow!("syncing temp file: {e}"))?;
     drop(f);
     progress(total);
-    std::fs::rename(tmp, dest).map_err(|e| anyhow!("moving download into place: {e}"))?;
-    Ok(())
+    let mut last = None;
+    for attempt in 0..SAVE_ATTEMPTS {
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        if attempt + 1 < SAVE_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(anyhow!("moving download into place: {}", last.unwrap()))
 }
 
 /// Load the on-disk cache and build the library. Safe to call from a background thread.
@@ -135,15 +170,19 @@ impl Drop for RunGuard {
 }
 
 /// Background playlist refresh. Single saver: at most one refresh runs per data dir
-/// at a time (`try_spawn` returns `None` while one is running; `spawn` then returns an
-/// inert Refresher that never yields events).
+/// at a time (`try_spawn` returns `None` while one is running; `spawn` then returns a
+/// Refresher whose first event is `Failed("refresh already running")`).
 pub struct Refresher {
     rx: Receiver<RefreshEvent>,
 }
 
 impl Refresher {
     pub fn spawn(url: String, dir: PathBuf) -> Refresher {
-        Self::try_spawn(url, dir).unwrap_or_else(|| Refresher { rx: channel().1 })
+        Self::try_spawn(url, dir).unwrap_or_else(|| {
+            let (tx, rx) = channel();
+            let _ = tx.send(RefreshEvent::Failed("refresh already running".into()));
+            Refresher { rx }
+        })
     }
 
     pub fn try_spawn(url: String, dir: PathBuf) -> Option<Refresher> {
@@ -160,8 +199,14 @@ impl Refresher {
         let guard = RunGuard(dir.clone());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _guard = guard;
-            let ev = run(&url, &dir, &saver, retry_delay, &tx);
+            // Fixed message on panic: the payload could contain the URL.
+            let ev = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&url, &dir, &saver, retry_delay, &tx)
+            }))
+            .unwrap_or_else(|_| RefreshEvent::Failed("internal error".into()));
+            // Release the single-run guard before the terminal event so a UI reacting
+            // to it can immediately spawn again.
+            drop(guard);
             let _ = tx.send(ev);
         });
         Some(Refresher { rx })
@@ -182,6 +227,17 @@ impl std::fmt::Debug for Refresher {
     }
 }
 
+/// Remove leftovers of a crashed run (only `*.part` and `playlist.m3u.tmp` in the cache dir).
+fn sweep_stale(cache_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(cache_dir) else { return };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.ends_with(".part") || n == "playlist.m3u.tmp" {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn run(
     url: &str,
     dir: &Path,
@@ -190,6 +246,7 @@ fn run(
     tx: &std::sync::mpsc::Sender<RefreshEvent>,
 ) -> RefreshEvent {
     let m3u = dir.join("cache").join("playlist.m3u.tmp");
+    sweep_stale(&dir.join("cache"));
     let res = (|| -> Result<RefreshEvent> {
         download_with_progress(url, &m3u, &mut |n| {
             let _ = tx.send(RefreshEvent::Progress(n));
@@ -198,6 +255,16 @@ fn run(
         let entries = playlist::parse(BufReader::new(f));
         if entries.is_empty() {
             return Err(anyhow!("downloaded playlist contained no entries"));
+        }
+        // A truncated body without Content-Length must not replace a good cache.
+        if let Some(old) = cache::load(dir) {
+            if entries.len() * 2 < old.entries.len() {
+                return Err(anyhow!(
+                    "downloaded playlist is much smaller than the cached one ({} vs {} entries); keeping the old data",
+                    entries.len(),
+                    old.entries.len()
+                ));
+            }
         }
         let mut save_err = None;
         for attempt in 0..SAVE_ATTEMPTS {
@@ -375,7 +442,106 @@ mod tests {
         assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_none());
         let (_, ev) = wait(&r);
         assert!(matches!(ev, RefreshEvent::Done(_)));
-        std::thread::sleep(Duration::from_millis(100));
+        // guard is released before the terminal event: immediate respawn works
         assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_some());
+    }
+
+    #[test]
+    fn spawn_while_running_emits_failed_already_running() {
+        let base = raw_server(|s| {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", M3U.len(), M3U);
+        });
+        let d = tempfile::tempdir().unwrap();
+        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let r2 = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let (_, ev) = wait(&r2);
+        assert!(matches!(&ev, RefreshEvent::Failed(m) if m == "refresh already running"), "{ev:?}");
+        assert!(matches!(wait(&r).1, RefreshEvent::Done(_)));
+    }
+
+    #[test]
+    fn worker_panic_yields_failed_internal_error() {
+        let base = ok_server(M3U);
+        let d = tempfile::tempdir().unwrap();
+        let saver: Saver = Arc::new(|_, _| panic!("boom http://x/SECRETUSER/SECRETPASS/1"));
+        let r = Refresher::try_spawn_with(format!("{base}/a.m3u"), d.path().to_path_buf(), saver, Duration::from_millis(1))
+            .unwrap();
+        let (_, ev) = wait(&r);
+        assert!(matches!(&ev, RefreshEvent::Failed(m) if m == "internal error"), "{ev:?}");
+        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_some());
+    }
+
+    #[test]
+    fn much_smaller_playlist_keeps_old_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let mut big = String::from("#EXTM3U\n");
+        for i in 0..10 {
+            big.push_str(&format!("#EXTINF:-1 tvg-id=\"i{i}\" group-title=\"G\",Chan {i}\nhttp://example.invalid/live/{i}\n"));
+        }
+        let e = playlist::parse(BufReader::new(big.as_bytes()));
+        assert_eq!(e.len(), 10);
+        cache::save(d.path(), &e).unwrap();
+        let base = ok_server(M3U); // 2 entries < 50% of 10
+        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let (_, ev) = wait(&r);
+        let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
+        assert!(m.contains("2 vs 10 entries"), "{m}");
+        assert_eq!(cache::load(d.path()).unwrap().entries, e);
+        no_leftovers(d.path());
+    }
+
+    #[test]
+    fn debug_of_done_does_not_dump_urls() {
+        let d = tempfile::tempdir().unwrap();
+        let base = ok_server(M3U);
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let s = format!("{ev:?}");
+        assert!(!s.contains("example.invalid") && s.contains("2 entries"), "{s}");
+    }
+
+    #[test]
+    fn cross_host_redirect_is_blocked() {
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let h2 = hit.clone();
+        let target = raw_server(move |s| {
+            h2.store(true, Ordering::SeqCst);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let target = target.replace("127.0.0.1", "localhost");
+        let base = raw_server(move |s| {
+            let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {target}/SECRETUSER/SECRETPASS/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let d = tempfile::tempdir().unwrap();
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/a.m3u"), d.path().to_path_buf()));
+        let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
+        assert!(!m.contains("SECRETUSER") && !m.contains("SECRETPASS"), "{m}");
+        assert!(!hit.load(Ordering::SeqCst), "redirect target was contacted");
+    }
+
+    #[test]
+    fn same_host_redirect_is_followed() {
+        let ok = ok_server(M3U);
+        let base = raw_server(move |s| {
+            let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {ok}/b.m3u\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let d = tempfile::tempdir().unwrap();
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+    }
+
+    #[test]
+    fn stale_part_files_are_swept() {
+        let d = tempfile::tempdir().unwrap();
+        old_cache(d.path());
+        let c = d.path().join("cache");
+        std::fs::write(c.join("playlist.m3u.tmp"), b"x").unwrap();
+        std::fs::write(c.join("playlist.m3u.tmp.1.2.part"), b"x").unwrap();
+        std::fs::write(c.join("keep.txt"), b"x").unwrap();
+        let base = ok_server(M3U);
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+        assert!(!c.join("playlist.m3u.tmp").exists() && !c.join("playlist.m3u.tmp.1.2.part").exists());
+        assert!(c.join("keep.txt").exists());
     }
 }

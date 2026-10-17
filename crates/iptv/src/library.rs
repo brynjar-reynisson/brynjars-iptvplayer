@@ -170,6 +170,10 @@ impl Library {
         hits
     }
 
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn countries(&self) -> &[Country] {
         &self.countries
     }
