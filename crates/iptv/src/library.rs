@@ -260,6 +260,21 @@ mod tests {
     }
 
     #[test]
+    fn third_party_master_m3u8_entries_have_distinct_keys() {
+        let m = "#EXTINF:-1 group-title=\"Sweden - X\",Alpha\nhttp://cdn.invalid/a/master.m3u8\n\
+#EXTINF:-1 group-title=\"Sweden - X\",Beta\nhttp://cdn.invalid/b/master.m3u8\n\
+#EXTINF:-1 group-title=\"Sweden - X\",Num\nhttp://host.invalid/USER/PASS/123\n";
+        let es = crate::playlist::parse(std::io::Cursor::new(m));
+        let lib = Library::build(es);
+        for i in 0..3 {
+            assert_eq!(lib.find_by_key(&favorite_key(lib.entry(i))), Some(i));
+        }
+        // A favorite saved by an earlier version (numeric id key) still resolves.
+        assert_eq!(lib.find_by_key("live:123"), Some(2));
+        assert_eq!(lib.find_by_key("live:master"), None);
+    }
+
+    #[test]
     fn find_by_key_roundtrips_favorite_key() {
         let es = vec![
             e(Kind::Live, "1", "A", "Sweden - X"),

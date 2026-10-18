@@ -28,7 +28,9 @@ pub struct Entry {
     pub url: String,
 }
 
-/// Last URL path segment without extension (query/fragment ignored).
+/// Numeric stream id: the last URL path segment without extension (query/
+/// fragment ignored), only if it is all ASCII digits. Third-party URLs ending
+/// in e.g. `master.m3u8` have no id (they would all share one key).
 pub fn stream_id(url: &str) -> Option<String> {
     let end = url.find(['?', '#']).unwrap_or(url.len());
     let mut path = &url[..end];
@@ -41,19 +43,23 @@ pub fn stream_id(url: &str) -> Option<String> {
         Some(i) if i > 0 => &seg[..i],
         _ => seg,
     };
-    if seg.is_empty() {
-        None
-    } else {
-        Some(seg.to_string())
-    }
+    is_numeric_id(seg).then(|| seg.to_string())
+}
+
+fn is_numeric_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
+/// Stable key for favorites/selection: `{kind}:{numeric id}`, else
+/// `{kind}:name:{normalized name}|{group}` (also for a non-numeric id left in
+/// a cache written by an older version). Duplicate name+group pairs share a
+/// key; `Library::find_by_key` keeps the first.
 pub fn favorite_key(e: &Entry) -> String {
-    if !e.id.is_empty() {
+    if is_numeric_id(&e.id) {
         format!("{}:{}", e.kind.as_str(), e.id)
     } else {
         format!("{}:name:{}|{}", e.kind.as_str(), normalize(&e.name), e.group)
@@ -289,8 +295,48 @@ http://host.invalid:8080/series/USER/PASS/789.mp4\n";
     fn stream_id_strips_extension() {
         assert_eq!(stream_id("http://host.invalid/movie/USER/PASS/456.mkv"), Some("456".into()));
         assert_eq!(stream_id("http://host.invalid/USER/PASS/123"), Some("123".into()));
-        assert_eq!(stream_id("http://host.invalid/a/b.m3u8?x=1"), Some("b".into()));
+        assert_eq!(stream_id("http://host.invalid/series/USER/PASS/789.mp4"), Some("789".into()));
+        assert_eq!(stream_id("http://host.invalid/live/USER/PASS/5.ts"), Some("5".into()));
+        // Only numeric stream ids count: third-party names are not ids.
+        assert_eq!(stream_id("http://host.invalid/a/b.m3u8?x=1"), None);
+        assert_eq!(stream_id("http://host.invalid/x/master.m3u8"), None);
+        assert_eq!(stream_id("http://host.invalid/12a.ts"), None);
         assert_eq!(stream_id("http://host.invalid/a/"), None);
+    }
+
+    #[test]
+    fn third_party_urls_get_distinct_name_keys() {
+        let m = "#EXTINF:-1 group-title=\"G\",Alpha TV\nhttp://cdn.invalid/alpha/master.m3u8\n\
+#EXTINF:-1 group-title=\"G\",Beta TV\nhttp://cdn.invalid/beta/master.m3u8\n\
+#EXTINF:-1 group-title=\"G\",Gamma\nhttp://cdn.invalid/g/playlist.m3u8?token=x\n";
+        let v = p(m);
+        let keys: Vec<String> = v.iter().map(favorite_key).collect();
+        assert_eq!(keys, ["live:name:alpha tv|G", "live:name:beta tv|G", "live:name:gamma|G"]);
+    }
+
+    #[test]
+    fn numeric_id_keys_unchanged_for_all_kinds() {
+        // Keys already saved in favorites.json by earlier versions stay valid.
+        let m = "#EXTINF:-1 group-title=\"G\",L\nhttp://host.invalid/USER/PASS/123\n\
+#EXTINF:-1 group-title=\"G\",L2\nhttp://host.invalid/USER/PASS/124.ts\n\
+#EXTINF:-1 group-title=\"M\",Mo\nhttp://host.invalid/movie/USER/PASS/456.mkv\n\
+#EXTINF:-1 group-title=\"S\",Se\nhttp://host.invalid/series/USER/PASS/789.mp4\n";
+        let keys: Vec<String> = p(m).iter().map(favorite_key).collect();
+        assert_eq!(keys, ["live:123", "live:124", "movie:456", "series:789"]);
+    }
+
+    #[test]
+    fn stale_non_numeric_id_from_old_cache_falls_back_to_name() {
+        // A cache written by an older version may still carry id "master".
+        let e = Entry {
+            kind: Kind::Live,
+            id: "master".into(),
+            name: "Alpha".into(),
+            group: "G".into(),
+            logo: String::new(),
+            url: String::new(),
+        };
+        assert_eq!(favorite_key(&e), "live:name:alpha|G");
     }
 
     #[test]

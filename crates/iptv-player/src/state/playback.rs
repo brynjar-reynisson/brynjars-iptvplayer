@@ -284,6 +284,17 @@ mod tests {
     }
 
     #[test]
+    fn zap_between_third_party_master_m3u8_channels_is_not_same_key() {
+        let m = "#EXTINF:-1 group-title=\"Sweden - X\",Alpha\nhttp://cdn.invalid/a/master.m3u8\n\
+#EXTINF:-1 group-title=\"Sweden - X\",Beta\nhttp://cdn.invalid/b/master.m3u8\n";
+        let lib = Arc::new(Library::build(iptv::playlist::parse(std::io::Cursor::new(m))));
+        let loaded = Playback::new(lib.clone(), vec![0, 1], 0, Tab::Live);
+        let mut z = Debounce::new(ZAP_DELAY);
+        queue_zap(&mut z, Some(&loaded), Playback::new(lib, vec![0, 1], 1, Tab::Live), Instant::now());
+        assert_eq!(z.pending().and_then(Playback::entry_index), Some(1));
+    }
+
+    #[test]
     fn vod_targets_never_auto_play() {
         let lib = Arc::new(mixed_lib());
         let loaded = Playback::new(lib.clone(), vec![0, 2], 0, Tab::Favorites);
