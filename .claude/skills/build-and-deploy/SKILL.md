@@ -17,6 +17,7 @@ The user runs the app from `dist\iptv-player\iptv-player.exe` (a pinned taskbar 
    powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
    ```
    This runs `cargo build --release -p iptv-player` and copies `iptv-player.exe`, `libmpv-2.dll` (from `libmpv\`) and `config.example.toml` into `dist\iptv-player\`. It does **not** touch `config.toml`, `cache\`, `favorites.json` or `settings.json` in that folder: the app keeps its data beside the exe, so those survive a redeploy.
+   - Windows PowerShell 5.1 prints cargo's progress lines (stderr) as a red `NativeCommandError`; ignore that noise. Success is the final `Release folder: ...` line, and the script throws on a real build failure. An "already up to date" build (`Finished ... in 0.5s`) is normal when nothing changed.
    - If it fails with "libmpv\libmpv-2.dll not found", follow README.md (libmpv section) to fetch it; do not guess.
 4. **Verify the result.** `Get-ChildItem dist\iptv-player` shows the exe (new timestamp), the DLL, and `config.example.toml`. If there is no `config.toml` in the folder, tell the user to copy `config.example.toml` to `config.toml` and set `playlist_url` (their credentials; never print or read the file's contents).
 5. **Report** the exe's path and build time, and what changed (`git log --oneline -5`). Do not launch the app unless asked.
