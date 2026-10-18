@@ -41,7 +41,7 @@ only files needed at runtime.
 
 ### Data directory
 
-`config.toml`, `cache/` (parsed playlist), `favorites.json` and `settings.json` (hidden
+`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points) and `settings.json` (hidden
 groups) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 
@@ -58,6 +58,12 @@ groups) live in the data directory. The app looks for it in this order:
   the channel list. **Esc** goes back to how it was before. Otherwise **Esc** leaves the filter box, or stops
   playback and leaves the player view. **F5** refreshes the playlist.
 - **Ctrl+F** or **/** focuses the channel filter (on Movies/Series, the search box).
+- A play/pause button sits left of the full-screen button and shows the action a click
+  performs (**Space** does the same).
+- Movies and episodes resume where you stopped (closing the app, stopping, or picking
+  something else). Positions are saved every 15 s in `positions.json`. Anything watched to
+  within the last minute (or 95 %) counts as finished and starts over, as does anything
+  stopped in the first 15 s. Live channels are never remembered.
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups
   from the results.
 - The status overlay shows what is happening while a stream is not playing:

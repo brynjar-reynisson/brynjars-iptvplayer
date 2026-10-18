@@ -39,12 +39,17 @@ impl Player {
 
     /// Start (or switch to) a stream. Clears a user pause.
     pub fn play(&mut self, url: &str, live: bool) {
+        self.play_from(url, live, None);
+    }
+
+    /// Like [`play`](Self::play), starting a movie/episode at `start_at` seconds.
+    pub fn play_from(&mut self, url: &str, live: bool, start_at: Option<f64>) {
         if self.paused {
             self.sup.backend_mut().set_pause(false);
             self.paused = false;
         }
         eprintln!("{:>9.3}s play (generation {})", self.t0.elapsed().as_secs_f64(), self.sup.generation() + 1);
-        self.sup.play(url.to_string(), live, Instant::now());
+        self.sup.play_from(url.to_string(), live, start_at, Instant::now());
     }
 
     pub fn stop(&mut self) {
@@ -63,6 +68,11 @@ impl Player {
         }
         self.paused = !self.paused;
         self.sup.backend_mut().set_pause(self.paused);
+    }
+
+    /// Current movie/episode position and duration in seconds (never live).
+    pub fn position(&self) -> Option<(f64, Option<f64>)> {
+        self.sup.position()
     }
 
     pub fn paused(&self) -> bool {

@@ -23,6 +23,7 @@ use iptv::favorites::Favorites;
 use iptv::fetch::{self, RefreshEvent, RefreshOptions, Refresher, Source};
 use iptv::library::{Library, SearchScope};
 use iptv::playlist::favorite_key;
+use iptv::positions::Positions;
 use iptv::settings::Settings;
 use iptv::supervisor::Status;
 
@@ -71,6 +72,19 @@ enum View {
     Player,
 }
 
+/// How often the position of a playing movie/episode is written to disk.
+const POSITION_SAVE_EVERY: Duration = Duration::from_secs(15);
+
+/// `h:mm:ss` / `m:ss` for a position in seconds.
+fn clock(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
 /// UI build time above this is logged (responsiveness diagnostics).
 const SLOW_FRAME: Duration = Duration::from_millis(25);
 
@@ -113,6 +127,10 @@ struct App {
     top_country: Option<String>,
     /// View to return to when leaving fullscreen.
     fs_return_view: Option<View>,
+    /// Where movies/episodes stopped (`positions.json`), for resuming.
+    positions: Positions,
+    /// Last time the playing position was written to disk.
+    positions_saved: Instant,
     data: DataState,
     cache_rx: Option<Receiver<CacheResult>>,
     refresher: Option<Refresher>,
@@ -168,6 +186,7 @@ impl App {
             eprintln!("player unavailable: {e}");
         }
         let favs = Favorites::load(&opts.data_dir);
+        let positions = Positions::load(&opts.data_dir);
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
         let wake = cc.egui_ctx.clone();
@@ -180,6 +199,8 @@ impl App {
             user_agent,
             top_country,
             fs_return_view: None,
+            positions,
+            positions_saved: Instant::now(),
             data,
             cache_rx: None,
             refresher: None,
@@ -412,11 +433,31 @@ impl App {
     /// pending zap.
     fn start(&mut self, pb: Playback) {
         self.zap.cancel();
+        self.save_position();
+        let resume = if pb.is_live() { None } else { self.positions.resume_for(pb.key()) };
         match &mut self.player {
-            Ok(p) => p.play(pb.url(), pb.is_live()),
+            Ok(p) => p.play_from(pb.url(), pb.is_live(), resume),
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
+        if let Some(t) = resume {
+            self.message = Some(format!("Resuming at {}", clock(t)));
+        }
         self.playback = Some(pb);
+    }
+
+    /// Remember where the playing movie/episode is (live is never saved).
+    fn save_position(&mut self) {
+        self.positions_saved = Instant::now();
+        if let (Some(pb), Ok(p)) = (&self.playback, &self.player) {
+            if !pb.is_live() {
+                if let Some((pos, dur)) = p.position() {
+                    self.positions.record(pb.key(), pos, dur);
+                }
+            }
+        }
+        if let Err(e) = self.positions.save_if_dirty() {
+            eprintln!("could not save positions: {}", safe_text(&format!("{e:#}")));
+        }
     }
 
     fn play_from(&mut self, list: Vec<usize>, entry: usize, tab: Tab) {
@@ -441,6 +482,7 @@ impl App {
 
     fn stop(&mut self) {
         self.zap.cancel();
+        self.save_position();
         if let Ok(p) = &mut self.player {
             p.stop();
         }
@@ -475,6 +517,7 @@ impl App {
             self.playback = Some(pb);
             return;
         }
+        self.positions.forget(pb.key());
         self.stop();
         self.message = Some(format!("Finished: {}", pb.name()));
         let e = pb.entry_index().filter(|_| self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)));
@@ -919,6 +962,7 @@ impl App {
     fn video_area(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
+            let mut toggle_pause = false;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
@@ -937,6 +981,29 @@ impl App {
                     }
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
+                    // Play/pause button, left of it: shows the action a click performs.
+                    let pbtn = btn.translate(egui::vec2(-38.0, 0.0));
+                    let pb_resp = ui.interact(pbtn, egui::Id::unique("pause_btn"), egui::Sense::click());
+                    let paused = p.paused();
+                    let pa = if pb_resp.hovered() { 230 } else { 140 };
+                    let pp = ui.painter_at(rect);
+                    pp.rect_filled(pbtn, 4.0, egui::Color32::from_black_alpha(pa / 2));
+                    let white = egui::Color32::from_white_alpha(pa);
+                    let c = pbtn.center();
+                    if paused {
+                        pp.add(egui::Shape::convex_polygon(
+                            vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(-5.0, 8.0), c + egui::vec2(7.0, 0.0)],
+                            white,
+                            egui::Stroke::NONE,
+                        ));
+                    } else {
+                        for dx in [-6.0, 2.0] {
+                            pp.rect_filled(egui::Rect::from_min_size(c + egui::vec2(dx, -8.0), egui::vec2(4.0, 16.0)), 0.0, white);
+                        }
+                    }
+                    if pb_resp.on_hover_text(if paused { "Play (Space)" } else { "Pause (Space)" }).clicked() {
+                        toggle_pause = true;
+                    }
                     let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
                     let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
                     let alpha = if b.hovered() { 230 } else { 140 };
@@ -969,6 +1036,11 @@ impl App {
                         egui::FontId::proportional(15.0),
                         ui.visuals().weak_text_color(),
                     );
+                }
+            }
+            if toggle_pause {
+                if let Ok(p) = &mut self.player {
+                    p.toggle_pause();
                 }
             }
         });
@@ -1165,6 +1237,9 @@ impl eframe::App for App {
                 std::process::exit(0);
             });
         }
+        if self.positions_saved.elapsed() >= POSITION_SAVE_EVERY {
+            self.save_position();
+        }
         self.handle_keys(&ctx);
         self.fire_zap();
 
@@ -1217,6 +1292,7 @@ impl eframe::App for App {
             std::thread::sleep(Duration::from_secs(3));
             std::process::exit(0);
         });
+        self.save_position();
         if let Ok(p) = &mut self.player {
             p.shutdown(gl);
         }

@@ -41,7 +41,7 @@ Known gaps and ideas that were found during implementation and review but not do
 
 ## Ideas (not requested)
 
-- Remember playback position for movies and episodes.
+- Show watched/resumable marks (and the saved position) in the movie and episode lists.
 - EPG / programme guide (the playlist carries `tvg-id`).
 - Per-country ordering or hiding of live channels.
 - Audio-track and subtitle selection UI (mpv defaults are used now).

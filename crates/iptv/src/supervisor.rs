@@ -301,14 +301,31 @@ impl<B: Backend> Supervisor<B> {
     /// Start playing `url` (user action). Cancels any pending retry, resets
     /// backoff and resume position, and loads under a new generation.
     pub fn play(&mut self, url: String, is_live: bool, now: Instant) {
+        self.play_from(url, is_live, None, now);
+    }
+
+    /// Like [`play`](Self::play), starting a VOD at `start_at` seconds (a
+    /// saved resume point; ignored for live). Retries before the first
+    /// position event resume there too.
+    pub fn play_from(&mut self, url: String, is_live: bool, start_at: Option<f64>, now: Instant) {
+        let start_at = start_at.filter(|s| !is_live && s.is_finite() && *s > 0.0);
         self.url = Some(url);
         self.is_live = is_live;
         self.attempt = 0;
         self.retry_at = None;
-        self.position = None;
+        self.position = start_at;
         self.duration = None;
         self.status = Status::Buffering;
-        self.load(None, now);
+        self.load(start_at, now);
+    }
+
+    /// Last known VOD position and duration in seconds (`None` for live or
+    /// before the first position event / explicit start).
+    pub fn position(&self) -> Option<(f64, Option<f64>)> {
+        if self.is_live || self.url.is_none() {
+            return None;
+        }
+        self.position.map(|p| (p, self.duration))
     }
 
     /// Feed a player event tagged with the generation of the load it came from.
@@ -854,6 +871,29 @@ mod tests {
         s.on_event(g, PlayerEvent::Position(1300.0), now);
         fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Network));
         assert_eq!(loads(&s).last().unwrap().1, Some(1300.0));
+    }
+
+    #[test]
+    fn play_from_starts_at_saved_position_and_exposes_it() {
+        let mut s = sup();
+        let mut now = Instant::now();
+        s.play_from(URL_A.to_string(), false, Some(597.0), now);
+        assert_eq!(loads(&s).last().unwrap(), &(URL_A.to_string(), Some(597.0), s.generation()));
+        assert_eq!(s.position(), Some((597.0, None)));
+        // A retry before any position event resumes at the same spot.
+        fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Network));
+        assert_eq!(loads(&s).last().unwrap().1, Some(597.0));
+        let g = s.generation();
+        s.on_event(g, PlayerEvent::Started, now);
+        s.on_event(g, PlayerEvent::Duration(3600.0), now);
+        s.on_event(g, PlayerEvent::Position(640.0), now);
+        assert_eq!(s.position(), Some((640.0, Some(3600.0))));
+        // Live ignores a start position and reports none.
+        s.play_from(URL_A.to_string(), true, Some(50.0), now);
+        assert_eq!(loads(&s).last().unwrap().1, None);
+        assert_eq!(s.position(), None);
+        s.stop();
+        assert_eq!(s.position(), None);
     }
 
     #[test]
