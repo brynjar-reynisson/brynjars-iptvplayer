@@ -34,10 +34,7 @@ pub fn stream_id(url: &str) -> Option<String> {
     let mut path = &url[..end];
     if let Some(p) = path.find("://") {
         let rest = &path[p + 3..];
-        path = match rest.find('/') {
-            Some(i) => &rest[i..],
-            None => return None,
-        };
+        path = &rest[rest.find('/')?..];
     }
     let seg = path.rsplit('/').next()?;
     let seg = match seg.rfind('.') {

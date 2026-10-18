@@ -138,7 +138,7 @@ mod tests {
             }
         });
         let c = load(d.path()).expect("cache loads cleanly");
-        assert!(sets.iter().any(|s| *s == c.entries));
+        assert!(sets.contains(&c.entries));
         assert_no_tmp(d.path());
     }
 
@@ -206,7 +206,7 @@ mod tests {
         save(d.path(), &old).unwrap();
         let r = save_with_writer(d.path(), &fake(20), |w, bytes| {
             w.write_all(&bytes[..bytes.len() / 2])?;
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk full"))
+            Err(std::io::Error::other("disk full"))
         });
         assert!(r.is_err());
         assert_eq!(load(d.path()).unwrap().entries, old);

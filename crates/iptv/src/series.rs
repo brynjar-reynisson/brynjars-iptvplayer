@@ -91,14 +91,14 @@ fn marker_at(b: &[u8], i: usize) -> Option<(usize, u32, u32)> {
     } else if b[i].is_ascii_digit() {
         let (j, sv) = digits(b, i);
         // NxM style: reject resolutions like 1920x1080 (season <= 99, episode <= 999)
-        if sv.map_or(true, |v| v > 99) {
+        if sv.is_none_or(|v| v > 99) {
             return None;
         }
         if j >= b.len() || !(b[j] == b'x' || b[j] == b'X') {
             return None;
         }
         let (k, ev) = digits(b, j + 1);
-        if ev.map_or(true, |v| v > 999) {
+        if ev.is_none_or(|v| v > 999) {
             return None;
         }
         end = k;
@@ -156,10 +156,13 @@ fn key_of(show: &str) -> String {
     show.to_lowercase()
 }
 
+/// Season number -> [(episode, entry idx)].
+type Seasons = std::collections::BTreeMap<u32, Vec<(u32, usize)>>;
+
 pub(crate) struct Builder {
     pos: std::collections::HashMap<String, usize>,
-    // per show: name, season -> [(episode, entry idx)]
-    shows: Vec<(String, std::collections::BTreeMap<u32, Vec<(u32, usize)>>)>,
+    // per show: name, seasons
+    shows: Vec<(String, Seasons)>,
     unsorted: Vec<usize>,
 }
 
