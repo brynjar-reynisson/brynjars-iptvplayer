@@ -8,8 +8,8 @@
 //!   `playlist_url`; the result is still cached under the data dir.
 //!
 //! Release builds use the Windows GUI subsystem (no console window when
-//! started from Explorer). When started from a terminal, the process attaches
-//! to that terminal's console so status/timing lines on stderr still show.
+//! started from Explorer). With `--console`, the process attaches to the
+//! terminal that started it so status/timing lines on stderr show there.
 
 // Release: no console window. Debug builds keep the console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use iptv_player::ui::{run, Options};
 
-const USAGE: &str = "usage: iptv-player [--data-dir <path>] [--playlist-file <path.m3u>]";
+const USAGE: &str = "usage: iptv-player [--console] [--data-dir <path>] [--playlist-file <path.m3u>]";
 
 /// GUI-subsystem builds start without a console: borrow the parent's (the
 /// terminal that started us), if any, so stdout/stderr reach it. Redirected
@@ -43,7 +43,11 @@ fn attach_parent_console() {}
 
 fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
-    attach_parent_console();
+    // Opt-in: attached output lands after the shell has printed its prompt,
+    // which looks like a hung command prompt until Ctrl+C.
+    if std::env::args().any(|a| a == "--console") {
+        attach_parent_console();
+    }
     let mut data_dir = None;
     let mut playlist_file = None;
     let mut args = std::env::args().skip(1);
@@ -53,6 +57,7 @@ fn main() -> anyhow::Result<()> {
             "--playlist-file" => {
                 playlist_file = Some(PathBuf::from(args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?))
             }
+            "--console" => {}
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());

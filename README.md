@@ -53,8 +53,9 @@ groups) live in the data directory. The app looks for it in this order:
   playing row opens the full player view. Double-clicking the video toggles it.
 - **Up/Down** move the selection. While live TV plays, they also switch channel after a
   short pause (300 ms), so holding the key opens only one stream.
-- **F** toggles a favorite. **Space** pauses. **F11** (or **Alt+Enter**) toggles
-  full screen and **Esc** leaves it. Otherwise **Esc** leaves the filter box, or stops
+- **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's
+  bottom right (or **F11** / **Alt+Enter**) makes the player fill the whole screen, without
+  the channel list. **Esc** goes back to how it was before. Otherwise **Esc** leaves the filter box, or stops
   playback and leaves the player view. **F5** refreshes the playlist.
 - **Ctrl+F** or **/** focuses the channel filter (on Movies/Series, the search box).
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups

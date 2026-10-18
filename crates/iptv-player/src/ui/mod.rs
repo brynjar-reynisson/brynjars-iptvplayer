@@ -111,6 +111,8 @@ struct App {
     user_agent: String,
     /// Live country listed first (`top_country` in config.toml).
     top_country: Option<String>,
+    /// View to return to when leaving fullscreen.
+    fs_return_view: Option<View>,
     data: DataState,
     cache_rx: Option<Receiver<CacheResult>>,
     refresher: Option<Refresher>,
@@ -177,6 +179,7 @@ impl App {
             source,
             user_agent,
             top_country,
+            fs_return_view: None,
             data,
             cache_rx: None,
             refresher: None,
@@ -419,6 +422,20 @@ impl App {
     fn play_from(&mut self, list: Vec<usize>, entry: usize, tab: Tab) {
         if let Some(lib) = self.shown_lib.clone() {
             self.start(Playback::new(lib, list, entry, tab));
+        }
+    }
+
+    /// Fullscreen = the OS window fills the screen and the player fills the
+    /// window (no channel selector). Leaving restores the view from before.
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if on {
+            self.fs_return_view = Some(self.view);
+            if self.playback.is_some() {
+                self.view = View::Player;
+            }
+        } else if let Some(v) = self.fs_return_view.take() {
+            self.view = v;
         }
     }
 
@@ -675,7 +692,7 @@ impl App {
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if toggle_fs || (esc && fullscreen) {
             // Esc only leaves fullscreen; it does nothing else this press.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+            self.set_fullscreen(ctx, !fullscreen);
         }
         let esc = esc && !fullscreen;
         let typing = ctx.egui_wants_keyboard_input();
@@ -916,6 +933,22 @@ impl App {
                         self.view = if self.view == View::Player { View::Browse } else { View::Player };
                     }
                     r.on_hover_text("Double-click: full view");
+                    // Fullscreen button: a square outline (no symbol fonts), bottom right.
+                    let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
+                    let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
+                    let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    let alpha = if b.hovered() { 230 } else { 140 };
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(btn, 4.0, egui::Color32::from_black_alpha(alpha / 2));
+                    painter.rect_stroke(
+                        btn.shrink2(egui::vec2(8.0, 6.0)),
+                        1.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_white_alpha(alpha)),
+                        egui::StrokeKind::Inside,
+                    );
+                    if b.on_hover_text(if fs { "Leave full screen (Esc)" } else { "Full screen (F11)" }).clicked() {
+                        self.set_fullscreen(ui.ctx(), !fs);
+                    }
                 }
                 _ => {
                     ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -1121,6 +1154,14 @@ impl eframe::App for App {
             if p.status() == Status::Finished {
                 self.on_finished();
             }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Safety net: if teardown after the window closes ever blocks,
+            // end the process instead of leaving it lingering.
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(0);
+            });
         }
         self.handle_keys(&ctx);
         self.fire_zap();
