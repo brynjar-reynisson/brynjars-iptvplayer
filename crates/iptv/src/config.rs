@@ -14,9 +14,9 @@ pub struct Config {
     /// Optional `top_country` key, trimmed; blank/missing = none. That live
     /// country is listed first, the rest alphabetically.
     pub top_country: Option<String>,
-    /// Optional `hwdec` key (mpv hardware decoding mode, e.g. `no`,
-    /// `d3d11va`); blank/missing = none (the player uses `auto-safe`).
-    pub hwdec: Option<String>,
+    /// Optional `hardware_decode` key (`true`/`false`); missing = `false`
+    /// (software decoding; hardware decoding showed corrupt video on some GPUs).
+    pub hardware_decode: bool,
 }
 
 /// Never prints the URL (it carries the account credentials).
@@ -26,7 +26,7 @@ impl std::fmt::Debug for Config {
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
             .field("top_country", &self.top_country)
-            .field("hwdec", &self.hwdec)
+            .field("hardware_decode", &self.hardware_decode)
             .finish()
     }
 }
@@ -87,20 +87,13 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
             (!s.is_empty()).then(|| s.to_string())
         }
     };
-    let hwdec = match value.get("hwdec") {
-        None => None,
-        Some(v) => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("{}: `hwdec` must be a string", path.display()))?
-                .trim();
-            if s.chars().any(|c| c.is_control() || c.is_whitespace()) {
-                anyhow::bail!("{}: `hwdec` must be a single mpv value such as `no`", path.display());
-            }
-            (!s.is_empty()).then(|| s.to_string())
-        }
+    let hardware_decode = match value.get("hardware_decode") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("{}: `hardware_decode` must be true or false", path.display()))?,
     };
-    Ok(Config { playlist_url, user_agent, top_country, hwdec })
+    Ok(Config { playlist_url, user_agent, top_country, hardware_decode })
 }
 
 #[cfg(test)]
@@ -138,12 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn hwdec_is_optional_trimmed_and_validated() {
-        assert_eq!(load_with("").unwrap().hwdec, None);
-        assert_eq!(load_with("hwdec = \" no \"\n").unwrap().hwdec.as_deref(), Some("no"));
-        assert_eq!(load_with("hwdec = \"\"\n").unwrap().hwdec, None);
-        assert!(format!("{:#}", load_with("hwdec = \"a b\"\n").unwrap_err()).contains("hwdec"));
-        assert!(format!("{:#}", load_with("hwdec = 1\n").unwrap_err()).contains("hwdec"));
+    fn hardware_decode_defaults_to_false_and_must_be_a_bool() {
+        assert!(!load_with("").unwrap().hardware_decode);
+        assert!(load_with("hardware_decode = true\n").unwrap().hardware_decode);
+        assert!(!load_with("hardware_decode = false\n").unwrap().hardware_decode);
+        assert!(format!("{:#}", load_with("hardware_decode = \"no\"\n").unwrap_err()).contains("hardware_decode"));
+        assert!(format!("{:#}", load_with("hardware_decode = 1\n").unwrap_err()).contains("hardware_decode"));
     }
 
     #[test]
@@ -161,7 +154,7 @@ mod tests {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
             top_country: None,
-            hwdec: None,
+            hardware_decode: false,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");

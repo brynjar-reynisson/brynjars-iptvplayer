@@ -94,12 +94,13 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
-/// `(user_agent, top_country, hwdec)` from `config.toml` if it loads, else
-/// the default UA and no top country / hwdec (also with `--playlist-file`).
-fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>, Option<String>) {
+/// `(user_agent, top_country, hardware_decode)` from `config.toml` if it
+/// loads, else the default UA, no top country and software decoding (also
+/// with `--playlist-file`).
+fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>, bool) {
     iptv::config::load(data_dir).map_or_else(
-        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None, None),
-        |c| (c.user_agent, c.top_country, c.hwdec),
+        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None, false),
+        |c| (c.user_agent, c.top_country, c.hardware_decode),
     )
 }
 
@@ -181,9 +182,9 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
-        let (user_agent, top_country, hwdec) = configured_prefs(&opts.data_dir);
+        let (user_agent, top_country, hardware_decode) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
-        let player = Player::new(cc, &user_agent, hwdec.as_deref()).map_err(|e| safe_text(&format!("{e:#}")));
+        let player = Player::new(cc, &user_agent, hardware_decode).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
             eprintln!("player unavailable: {e}");
         }

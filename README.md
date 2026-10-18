@@ -26,8 +26,9 @@ until you pick something else.
      check user_agent in config.toml)", try another value.
    - Optional: `top_country = "Iceland"` lists that live country first. The rest are
      alphabetical, with "Other" last. Applies after the next refresh (F5) or restart.
-   - Optional: `hwdec = "no"` turns off hardware video decoding (mpv's default here is
-     `auto-safe`). Try it if video shows black dashes or blocky corruption. Needs a restart.
+   - Optional: `hardware_decode = true` turns on hardware video decoding. It is off by
+     default (software decoding), because hardware decoding showed black dashes and blocky
+     corruption on some graphics cards. Needs a restart.
    - The first download can take a long time while the provider generates the file.
    - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
      a restart.
@@ -108,7 +109,7 @@ groups) live in the data directory. The app looks for it in this order:
   options do nothing. The app's retry supervisor does the reconnecting.
 - After a quick channel switch, the first retry of the new channel can come sooner than
   the backoff says. Log lines that arrive within 500 ms of the switch are ignored.
-- Hardware decoding (`hwdec=auto-safe`) has been tested with the bundled test streams
-  only.
+- Hardware decoding (`hardware_decode = true`) showed corrupt video (black dashes) on the
+  developer's graphics card, so it is off by default.
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.
