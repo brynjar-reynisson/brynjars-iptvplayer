@@ -17,6 +17,13 @@ fn main() {
     let repo = manifest.parent().and_then(Path::parent).expect("repo root");
     let libdir = repo.join("libmpv");
     println!("cargo:rerun-if-changed=build.rs");
+    // Exe icon (Explorer, taskbar pin); the window icon is set in `ui::run`.
+    println!("cargo:rerun-if-changed=icon.rc");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+    #[cfg(windows)]
+    embed_resource::compile_for("icon.rc", ["iptv-player"], embed_resource::NONE)
+        .manifest_optional()
+        .expect("embedding the exe icon");
     println!("cargo:rerun-if-changed={}", libdir.join("mpv.lib").display());
     println!("cargo:rerun-if-changed={}", libdir.join(DLL).display());
 

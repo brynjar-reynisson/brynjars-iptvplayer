@@ -50,7 +50,14 @@ pub struct Options {
 pub fn run(opts: Options) -> anyhow::Result<()> {
     let native = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 760.0]).with_title("IPTV Player"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 760.0])
+            .with_title("IPTV Player")
+            .with_icon(egui::IconData {
+                rgba: include_bytes!("../../assets/icon_64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     eframe::run_native("IPTV Player", native, Box::new(move |cc| Ok(Box::new(App::new(cc, opts)))))
