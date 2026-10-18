@@ -18,7 +18,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub kind: Kind,
     pub id: String,
@@ -26,6 +26,18 @@ pub struct Entry {
     pub group: String,
     pub logo: String,
     pub url: String,
+}
+
+/// Never prints `url` (credentials) or `logo` (provider host).
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("kind", &self.kind)
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("group", &self.group)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Numeric stream id: the last URL path segment without extension (query/

@@ -1,8 +1,15 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct Config {
     pub playlist_url: String,
+}
+
+/// Never prints the URL (it carries the account credentials).
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config").field("playlist_url", &"<redacted>").finish()
+    }
 }
 
 /// Data directory: CLI `--data-dir`, then env `IPTV_DATA_DIR`, then the exe's directory.
@@ -37,6 +44,13 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_hides_playlist_url() {
+        let c = Config { playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into() };
+        let d = format!("{c:?}");
+        assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");
+    }
 
     #[test]
     fn cli_overrides_env_overrides_exe_dir() {

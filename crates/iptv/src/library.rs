@@ -8,7 +8,6 @@ pub struct Country {
     pub channels: Vec<usize>,
 }
 
-#[derive(Debug)]
 pub struct Library {
     entries: Vec<Entry>,
     countries: Vec<Country>,
@@ -18,6 +17,18 @@ pub struct Library {
     live_idx: NameIndex,
     movie_idx: NameIndex,
     show_idx: NameIndex,
+}
+
+/// Counts only: entries carry credentialed URLs.
+impl std::fmt::Debug for Library {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Library")
+            .field("entries", &self.entries.len())
+            .field("countries", &self.countries.len())
+            .field("movies", &self.movies.len())
+            .field("shows", &self.shows.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Precomputed normalised names, parallel to `ids` (entry index or show index).
@@ -257,6 +268,18 @@ mod tests {
         assert_eq!(names, vec!["Sweden", "A", "Other"]);
         assert_eq!(lib.countries()[2].channels, vec![0, 1, 3]);
         assert_eq!(lib.countries()[1].channels, vec![4]);
+    }
+
+    #[test]
+    fn debug_hides_urls() {
+        let lib = Library::build(vec![
+            e(Kind::Live, "1", "A", "Sweden - X"),
+            Entry { logo: "http://logo.invalid/x.png".into(), ..e(Kind::Movie, "2", "M", "Action") },
+        ]);
+        for d in [format!("{lib:?}"), format!("{:?}", lib.entry(0)), format!("{:?}", lib.entry(1))] {
+            assert!(!d.contains("host.invalid") && !d.contains("logo.invalid"), "{d}");
+            assert!(!d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");
+        }
     }
 
     #[test]

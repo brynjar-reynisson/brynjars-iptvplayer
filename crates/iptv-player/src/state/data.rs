@@ -53,7 +53,6 @@ pub enum Action {
     StartRefresh { force: bool },
 }
 
-#[derive(Debug)]
 pub struct DataState {
     source: SourceStatus,
     phase: Phase,
@@ -63,6 +62,35 @@ pub struct DataState {
     /// A refresh was started this session (user or automatic): the
     /// stale-cache refresh must not start a second one.
     refresh_requested: bool,
+}
+
+/// Kinds and counts only: messages and the library never reach Debug output.
+impl std::fmt::Debug for DataState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self.source {
+            SourceStatus::Available => "Available",
+            SourceStatus::Missing { .. } => "Missing",
+        };
+        let phase = match self.phase {
+            Phase::Loading => "Loading",
+            Phase::Ready => "Ready",
+            Phase::NoConfig { .. } => "NoConfig",
+            Phase::RefreshFailed { .. } => "RefreshFailed",
+        };
+        let refresh = match self.refresh {
+            RefreshState::Idle => "Idle",
+            RefreshState::Running { .. } => "Running",
+            RefreshState::Failed { .. } => "Failed",
+        };
+        f.debug_struct("DataState")
+            .field("source", &source)
+            .field("phase", &phase)
+            .field("refresh", &refresh)
+            .field("library_entries", &self.library.as_ref().map(|l| l.entry_count()))
+            .field("warning", &self.warning.is_some())
+            .field("refresh_requested", &self.refresh_requested)
+            .finish()
+    }
 }
 
 impl DataState {
@@ -190,6 +218,19 @@ impl DataState {
 mod tests {
     use super::*;
     use crate::state::live::tests::sample_lib;
+
+    #[test]
+    fn debug_hides_urls() {
+        let (mut s, _) = avail();
+        s.on_cache_loaded(Some((Arc::new(sample_lib()), SystemTime::now())), SystemTime::now());
+        s.set_source(SourceStatus::Missing {
+            config_path: "C:/x/config.toml".into(),
+            detail: "bad http://host.invalid/USER/PASS/1".into(),
+        });
+        let d = format!("{s:?}");
+        assert!(s.library().is_some());
+        assert!(!d.contains("://") && !d.contains(".invalid") && !d.contains("USER") && !d.contains("PASS"), "{d}");
+    }
 
     fn avail() -> (DataState, Vec<Action>) {
         DataState::new(SourceStatus::Available)

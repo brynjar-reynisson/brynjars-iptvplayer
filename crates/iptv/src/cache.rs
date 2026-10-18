@@ -9,10 +9,20 @@ const MAGIC: &[u8; 8] = b"IPTVCACH";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CacheData {
     pub entries: Vec<Entry>,
     pub saved_at: SystemTime,
+}
+
+/// Counts only: entries carry credentialed URLs.
+impl std::fmt::Debug for CacheData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheData")
+            .field("entries", &self.entries.len())
+            .field("saved_at", &self.saved_at)
+            .finish()
+    }
 }
 
 impl CacheData {
@@ -95,6 +105,14 @@ pub fn load(dir: &Path) -> Option<CacheData> {
 mod tests {
     use super::*;
     use crate::playlist::Kind;
+
+    #[test]
+    fn debug_hides_urls() {
+        let c = CacheData { entries: fake(3), saved_at: SystemTime::now() };
+        let d = format!("{c:?}");
+        assert!(!d.contains("example.invalid") && !d.contains("://"), "{d}");
+        assert!(d.contains('3'), "{d}");
+    }
 
     fn fake(n: usize) -> Vec<Entry> {
         (0..n)
