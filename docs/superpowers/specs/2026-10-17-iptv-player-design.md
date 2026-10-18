@@ -1,14 +1,10 @@
 # IPTV Player for Windows — Design
 
 ## Intent and why
-The user has a paid IPTV subscription with an IPTV provider. The reference app is an Android app (licensed separately) that works as a subscription manager: on startup it lets you select a subscription, then browses and plays it well. The user has only one subscription, so a subscription-selection step is unnecessary here. On Windows the alternatives split the job: a selector app that launches VLC, and VLC gives up on streams that stall or glitch. The goal is a single Windows desktop app, written in Rust, that browses the subscription's playlist and plays it in the same window, and that **keeps retrying a broken stream until the user changes channel**.
-
-## What was learned from the Android APK (recon, 2026-10-17)
-- The APK is a thin Android TV shell: WebView + ExoPlayer 2 (HLS/DASH/SmoothStreaming/RTSP, plus FFmpeg audio decoder extension). The browsing UI is remote JavaScript downloaded from the app's server at launch, so **there is nothing to port from the APK**; the UI is designed fresh. the Android app's subscription selection, login, SignalR and native secrets are out of scope.
-- The Android "spinner, then big '!' and no retry until reselect" behaviour is something we deliberately do better.
+An IPTV player for Windows that handles content selection (live channels, movies, series, favorites) and playback in the same app. The previous Windows setup split the job: a separate selector app launched VLC, and VLC gives up on streams that stall or glitch. The goal is a single Windows desktop app, written in Rust, that browses the IPTV provider's playlist and plays it in the same window, and that **keeps retrying a broken stream until the user changes channel**. The user supplies the playlist URL (an Xtream-style M3U) in a local gitignored config; acquiring that URL is out of scope.
 
 ## The input: a single Xtream-style M3U playlist
-- User supplies one M3U file URL (credentials embedded) in a local config. Sample (77 MB, ~282,000 entries, 605 groups) is at `<samples dir>\` (the `*_plus.m3u` file; its name contains a credential segment, never quote it) (outside this repo; contains credentials; never commit it).
+- User supplies one M3U file URL (credentials embedded) in a local config. A sample playlist (77 MB, ~282,000 entries, 605 groups) lives in a samples folder outside this repo (`<samples dir>\<playlist>.m3u`; it contains credentials and its file name contains a credential segment: never commit it or quote its name).
 - Each entry: `#EXTINF:-1 tvg-ID="" tvg-name="..." tvg-logo="..." group-title="...",Display name` then the stream URL line.
 - Kind is determined by URL path: `http://host:port/<user>/<pass>/<id>` = live (~31k); `/movie/<user>/<pass>/<id>.<ext>` = movie (~57k); `/series/<user>/<pass>/<id>.<ext>` = series episode (~195k, one flat entry per episode). Extensions seen: mkv, mp4, ts, avi. A few live entries use other hosts (Pluto TV, Amagi); treat any URL without /movie/ or /series/ as live.
 - Group titles: live like `Sweden - Nationella` (country prefix before " - "); `Movies: <lang>`; `Series: <lang>`. Group-less header entries like `===== Sweden ======` exist and are separators to ignore or skip.
@@ -23,7 +19,7 @@ The user has a paid IPTV subscription with an IPTV provider. The reference app i
 7. Fast startup: parse the playlist once, store a compact local cache, load from cache on launch; refresh on demand (button/key) and optionally when stale.
 
 ## Non-goals
-- the Android app's subscription management/login; obtaining the the provider playlist URL (the user supplies it).
+- Obtaining the playlist URL (the user supplies it).
 - EPG/TV guide, recording, casting, Android/TV/remote-control UI, mobile.
 - Xtream `player_api.php` integration (playlist file only).
 - Cross-platform polish (Windows 11 is the target; don't gratuitously break Linux/macOS).
