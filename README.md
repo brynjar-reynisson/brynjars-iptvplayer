@@ -24,6 +24,8 @@ until you pick something else.
      `VLC/3.0.20 LibVLC/3.0.20`. Some providers block requests that have no known
      player User-Agent. If a refresh fails with "server returned HTTP 454 (blocked?
      check user_agent in config.toml)", try another value.
+   - Optional: `top_country = "Iceland"` lists that live country first. The rest are
+     alphabetical, with "Other" last. Applies after the next refresh (F5) or restart.
    - The first download can take a long time while the provider generates the file.
    - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
      a restart.
@@ -45,13 +47,14 @@ groups) live in the data directory. The app looks for it in this order:
 
 ## Using it
 
-- Tabs: **Live** (countries, then channels), **Favorites**, **Movies**, **Series**
+- Tabs: **Live** (countries A-Z, then channels), **Favorites**, **Movies**, **Series**
   (show, then seasons, then episodes).
 - Click or press **Enter** to play the selected entry. **Enter** or double-click on the
   playing row opens the full player view. Double-clicking the video toggles it.
 - **Up/Down** move the selection. While live TV plays, they also switch channel after a
   short pause (300 ms), so holding the key opens only one stream.
-- **F** toggles a favorite. **Space** pauses. **Esc** leaves the filter box, or stops
+- **F** toggles a favorite. **Space** pauses. **F11** (or **Alt+Enter**) toggles
+  full screen and **Esc** leaves it. Otherwise **Esc** leaves the filter box, or stops
   playback and leaves the player view. **F5** refreshes the playlist.
 - **Ctrl+F** or **/** focuses the channel filter (on Movies/Series, the search box).
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups

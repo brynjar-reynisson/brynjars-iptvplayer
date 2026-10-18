@@ -163,9 +163,9 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, user_agent: &str, progress
 }
 
 /// Load the on-disk cache and build the library. Safe to call from a background thread.
-pub fn load_cached(dir: &Path) -> Option<(Arc<Library>, SystemTime)> {
+pub fn load_cached(dir: &Path, top_country: Option<&str>) -> Option<(Arc<Library>, SystemTime)> {
     let c = cache::load(dir)?;
-    Some((Arc::new(Library::build(c.entries)), c.saved_at))
+    Some((Arc::new(Library::build_with_top(c.entries, top_country)), c.saved_at))
 }
 
 /// Where a refresh reads the playlist from.
@@ -196,11 +196,14 @@ pub struct RefreshOptions {
     /// User-Agent for the download (blank = [`DEFAULT_USER_AGENT`]); unused
     /// for [`Source::File`].
     pub user_agent: String,
+    /// Live country listed first in the resulting library (see
+    /// [`Library::build_with_top`]).
+    pub top_country: Option<String>,
 }
 
 impl Default for RefreshOptions {
     fn default() -> Self {
-        RefreshOptions { force: false, user_agent: DEFAULT_USER_AGENT.to_string() }
+        RefreshOptions { force: false, user_agent: DEFAULT_USER_AGENT.to_string(), top_country: None }
     }
 }
 
@@ -238,17 +241,17 @@ pub struct Refresher {
 impl Refresher {
     /// Download `url` (sending `user_agent`; blank = default) into `dir`'s cache.
     pub fn spawn(url: String, dir: PathBuf, user_agent: &str) -> Refresher {
-        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into() })
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into(), ..Default::default() })
     }
 
     /// Like [`Refresher::spawn`] but replaces the cache even when the new
     /// playlist is much smaller than the cached one.
     pub fn spawn_forced(url: String, dir: PathBuf, user_agent: &str) -> Refresher {
-        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: true, user_agent: user_agent.into() })
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: true, user_agent: user_agent.into(), ..Default::default() })
     }
 
     pub fn try_spawn(url: String, dir: PathBuf, user_agent: &str) -> Option<Refresher> {
-        Self::try_spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into() })
+        Self::try_spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into(), ..Default::default() })
     }
 
     /// General form: any [`Source`], with [`RefreshOptions`].
@@ -390,7 +393,7 @@ fn run(
                 url,
             )));
         }
-        Ok(RefreshEvent::Done(Arc::new(Library::build(entries))))
+        Ok(RefreshEvent::Done(Arc::new(Library::build_with_top(entries, opts.top_country.as_deref()))))
     })();
     let _ = std::fs::remove_file(&m3u);
     match res {
@@ -468,7 +471,7 @@ mod tests {
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
         assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
         no_leftovers(d.path());
-        assert!(load_cached(d.path()).is_some());
+        assert!(load_cached(d.path(), None).is_some());
     }
 
     #[test]

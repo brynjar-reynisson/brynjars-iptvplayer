@@ -11,6 +11,9 @@ pub struct Config {
     pub playlist_url: String,
     /// Optional `user_agent` key, trimmed; blank/missing = [`DEFAULT_USER_AGENT`].
     pub user_agent: String,
+    /// Optional `top_country` key, trimmed; blank/missing = none. That live
+    /// country is listed first, the rest alphabetically.
+    pub top_country: Option<String>,
 }
 
 /// Never prints the URL (it carries the account credentials).
@@ -19,6 +22,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
+            .field("top_country", &self.top_country)
             .finish()
     }
 }
@@ -69,7 +73,17 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
         _ => anyhow::bail!("{} is missing the required field `playlist_url`", path.display()),
     };
     let user_agent = parse_user_agent(value.get("user_agent"), &path)?;
-    Ok(Config { playlist_url, user_agent })
+    let top_country = match value.get("top_country") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("{}: `top_country` must be a string", path.display()))?
+                .trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+    };
+    Ok(Config { playlist_url, user_agent, top_country })
 }
 
 #[cfg(test)]
@@ -99,6 +113,14 @@ mod tests {
     }
 
     #[test]
+    fn top_country_is_optional_and_trimmed() {
+        assert_eq!(load_with("").unwrap().top_country, None);
+        assert_eq!(load_with("top_country = \"  Iceland \"\n").unwrap().top_country.as_deref(), Some("Iceland"));
+        assert_eq!(load_with("top_country = \"  \"\n").unwrap().top_country, None);
+        assert!(format!("{:#}", load_with("top_country = 5\n").unwrap_err()).contains("top_country"));
+    }
+
+    #[test]
     fn invalid_user_agent_is_rejected_without_url() {
         for extra in ["user_agent = \"bad\\nagent\"\n", "user_agent = \"tab\\there\"\n", "user_agent = 5\n"] {
             let err = format!("{:#}", load_with(extra).unwrap_err());
@@ -112,6 +134,7 @@ mod tests {
         let c = Config {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
+            top_country: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");

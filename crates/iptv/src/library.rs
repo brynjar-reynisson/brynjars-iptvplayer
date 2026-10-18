@@ -112,6 +112,12 @@ const OTHER: &str = "Other";
 
 impl Library {
     pub fn build(entries: Vec<Entry>) -> Library {
+        Self::build_with_top(entries, None)
+    }
+
+    /// Countries are listed alphabetically (case/diacritic-insensitive),
+    /// "Other" last; `top_country` (matched the same way) goes first.
+    pub fn build_with_top(entries: Vec<Entry>, top_country: Option<&str>) -> Library {
         let mut countries: Vec<Country> = Vec::new();
         let mut pos: HashMap<String, usize> = HashMap::new();
         let mut other: Vec<usize> = Vec::new();
@@ -143,6 +149,12 @@ impl Library {
                     movie_idx.push(i, &e.name);
                 }
                 Kind::Series => series.add(i, &e.name),
+            }
+        }
+        countries.sort_by_cached_key(|c| normalize(&c.name));
+        if let Some(top) = top_country.map(|t| normalize(t.trim())).filter(|t| !t.is_empty()) {
+            if let Some(p) = countries.iter().position(|c| normalize(&c.name) == top) {
+                countries[..=p].rotate_right(1);
             }
         }
         if !other.is_empty() {
@@ -234,10 +246,33 @@ mod tests {
         ]);
         let c = lib.countries();
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0].name, "Sweden");
-        assert_eq!(c[0].channels, vec![0, 2]);
-        assert_eq!(c[1].name, "Norway");
-        assert_eq!(c[1].channels, vec![1]);
+        assert_eq!(c[0].name, "Norway");
+        assert_eq!(c[0].channels, vec![1]);
+        assert_eq!(c[1].name, "Sweden");
+        assert_eq!(c[1].channels, vec![0, 2]);
+    }
+
+    #[test]
+    fn countries_alphabetical_with_configurable_top_other_last() {
+        let es = || {
+            vec![
+                e(Kind::Live, "1", "A", "Sweden - X"),
+                e(Kind::Live, "2", "B", "Iceland - X"),
+                e(Kind::Live, "3", "C", "österreich - X"),
+                e(Kind::Live, "4", "D", "Misc"),
+                e(Kind::Live, "5", "E", "Norway - X"),
+            ]
+        };
+        let names = |l: &Library| l.countries().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&Library::build(es())), ["Iceland", "Norway", "österreich", "Sweden", "Other"]);
+        let top = Library::build_with_top(es(), Some(" sweden "));
+        assert_eq!(names(&top), ["Sweden", "Iceland", "Norway", "österreich", "Other"]);
+        assert_eq!(top.countries()[0].channels, vec![0]);
+        // Unknown or blank top country changes nothing.
+        assert_eq!(names(&Library::build_with_top(es(), Some("Atlantis"))), names(&Library::build(es())));
+        assert_eq!(names(&Library::build_with_top(es(), Some(""))), names(&Library::build(es())));
+        // "Other" stays last even if named as top.
+        assert_eq!(names(&Library::build_with_top(es(), Some("Other"))).last().unwrap(), "Other");
     }
 
     #[test]
@@ -265,9 +300,9 @@ mod tests {
             e(Kind::Live, "5", "E", "A - B - C"),
         ]);
         let names: Vec<&str> = lib.countries().iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["Sweden", "A", "Other"]);
+        assert_eq!(names, vec!["A", "Sweden", "Other"]);
         assert_eq!(lib.countries()[2].channels, vec![0, 1, 3]);
-        assert_eq!(lib.countries()[1].channels, vec![4]);
+        assert_eq!(lib.countries()[0].channels, vec![4]);
     }
 
     #[test]

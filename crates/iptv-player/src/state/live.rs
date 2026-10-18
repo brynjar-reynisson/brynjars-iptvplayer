@@ -118,14 +118,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn sample_lib() -> Library {
-        Library::build(vec![
-            live("1", "SVT1 HD", "Sweden - Nationella"),
-            live("2", "SVT2 HD", "Sweden - Nationella"),
-            live("3", "NRK1", "Norway - Main"),
-            live("4", "TV4 Sport", "Sweden - Sport"),
-            live("5", "\u{c5}rets Sport", "Sweden - Sport"),
-            live("6", "Kanal 5", "Sweden - Other"),
-        ])
+        // Sweden pinned first (countries are otherwise alphabetical).
+        Library::build_with_top(
+            vec![
+                live("1", "SVT1 HD", "Sweden - Nationella"),
+                live("2", "SVT2 HD", "Sweden - Nationella"),
+                live("3", "NRK1", "Norway - Main"),
+                live("4", "TV4 Sport", "Sweden - Sport"),
+                live("5", "\u{c5}rets Sport", "Sweden - Sport"),
+                live("6", "Kanal 5", "Sweden - Other"),
+            ],
+            Some("Sweden"),
+        )
     }
 
     #[test]

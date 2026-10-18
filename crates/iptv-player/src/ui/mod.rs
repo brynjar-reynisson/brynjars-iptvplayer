@@ -73,10 +73,11 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
-/// User-Agent for playlist and stream requests: `user_agent` from
-/// `config.toml` if it loads, else the default (also with `--playlist-file`).
-fn configured_user_agent(data_dir: &std::path::Path) -> String {
-    iptv::config::load(data_dir).map_or_else(|_| iptv::config::DEFAULT_USER_AGENT.to_string(), |c| c.user_agent)
+/// `(user_agent, top_country)` from `config.toml` if it loads, else the
+/// default UA and no top country (also with `--playlist-file`).
+fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>) {
+    iptv::config::load(data_dir)
+        .map_or_else(|_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None), |c| (c.user_agent, c.top_country))
 }
 
 /// Where the playlist comes from: `--playlist-file`, else `config.toml`.
@@ -101,6 +102,8 @@ struct App {
     source: Option<Source>,
     /// User-Agent for playlist downloads (the player got it at startup).
     user_agent: String,
+    /// Live country listed first (`top_country` in config.toml).
+    top_country: Option<String>,
     data: DataState,
     cache_rx: Option<Receiver<CacheResult>>,
     refresher: Option<Refresher>,
@@ -149,7 +152,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
-        let user_agent = configured_user_agent(&opts.data_dir);
+        let (user_agent, top_country) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
         let player = Player::new(cc, &user_agent).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
@@ -166,6 +169,7 @@ impl App {
             playlist_file: opts.playlist_file,
             source,
             user_agent,
+            top_country,
             data,
             cache_rx: None,
             refresher: None,
@@ -216,8 +220,9 @@ impl App {
                     let (tx, rx) = channel();
                     let dir = self.data_dir.clone();
                     let ctx = self.ctx.clone();
+                    let top = self.top_country.clone();
                     std::thread::spawn(move || {
-                        let r = fetch::load_cached(&dir);
+                        let r = fetch::load_cached(&dir, top.as_deref());
                         let _ = tx.send(r);
                         ctx.request_repaint();
                     });
@@ -229,6 +234,7 @@ impl App {
                             Some(Refresher::spawn_source(src.clone(), self.data_dir.clone(), RefreshOptions {
                                 force,
                                 user_agent: self.user_agent.clone(),
+                                top_country: self.top_country.clone(),
                             }));
                     }
                 }
@@ -243,9 +249,9 @@ impl App {
             self.source = source;
             self.data.set_source(status);
         }
-        // Picks up a `user_agent` edited in config.toml since startup
-        // (streams keep the startup value until restart).
-        self.user_agent = configured_user_agent(&self.data_dir);
+        // Picks up a `user_agent` / `top_country` edited in config.toml since
+        // startup (streams keep the startup user agent until restart).
+        (self.user_agent, self.top_country) = configured_prefs(&self.data_dir);
         let a = self.data.request_refresh(force);
         self.run_actions(a);
     }
@@ -647,6 +653,8 @@ impl App {
         let focused = [filter_id(), vod::movie_search_id(), vod::series_search_id()]
             .into_iter()
             .find(|id| ctx.memory(|m| m.has_focus(*id)));
+        // F11 / Alt+Enter: before plain Enter is consumed below.
+        let toggle_fs = ctx.input_mut(|i| i.consume_key(M::NONE, Key::F11) | i.consume_key(M::ALT, Key::Enter));
         let (up, down, enter, esc, f5, ctrl_f) = ctx.input_mut(|i| {
             (
                 i.consume_key(M::NONE, Key::ArrowUp),
@@ -657,6 +665,12 @@ impl App {
                 i.consume_key(M::COMMAND, Key::F),
             )
         });
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if toggle_fs || (esc && fullscreen) {
+            // Esc only leaves fullscreen; it does nothing else this press.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
+        let esc = esc && !fullscreen;
         let typing = ctx.egui_wants_keyboard_input();
         let (fav, space, slash, back) = if typing {
             (false, false, false, false)
@@ -1146,8 +1160,18 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         // Stop playback first, then free the render context (GL current).
+        // The process has been seen to linger after the window closed
+        // (a terminal waiting until Ctrl+C): if shutdown or teardown blocks,
+        // a watchdog ends the process.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
+        });
         if let Ok(p) = &mut self.player {
             p.shutdown(gl);
         }
+        // Nothing left to save (favorites/settings are written on change);
+        // skip the remaining teardown (mpv core destroy, worker threads).
+        std::process::exit(0);
     }
 }
