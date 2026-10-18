@@ -1,7 +1,8 @@
 //! IPTV Player: browse the playlist and play it in one window.
 //!
 //! Usage: `iptv-player [--data-dir <path>] [--playlist-file <path.m3u>]`
-//! - `--data-dir`: where `config.toml`, `cache/` and `favorites.json` live
+//! - `--data-dir`: where `config.toml`, `cache/`, `favorites.json` and
+//!   `settings.json` live
 //!   (default: `IPTV_DATA_DIR`, then the exe's directory).
 //! - `--playlist-file` (dev): parse a local `.m3u` instead of downloading
 //!   `playlist_url`; the result is still cached under the data dir.

@@ -113,20 +113,17 @@ fn marker_at(b: &[u8], i: usize) -> Option<(usize, u32, u32)> {
     Some((end, s, e))
 }
 
+/// First valid marker in `name`: (start, end, season, episode).
+fn find_marker(name: &str) -> Option<(usize, usize, u32, u32)> {
+    let b = name.as_bytes();
+    (0..b.len())
+        .filter(|&i| name.is_char_boundary(i))
+        .find_map(|i| marker_at(b, i).map(|(end, s, e)| (i, end, s, e)))
+}
+
 pub fn parse_episode(name: &str) -> Option<EpisodeRef> {
     let name = strip_prefix(name);
-    let b = name.as_bytes();
-    let mut found = None;
-    for i in 0..b.len() {
-        if !name.is_char_boundary(i) {
-            continue;
-        }
-        if let Some((_, s, e)) = marker_at(b, i) {
-            found = Some((i, s, e)); // first valid marker wins
-            break;
-        }
-    }
-    let (i, season, episode) = found?;
+    let (i, _, season, episode) = find_marker(name)?;
     let show = name[..i].trim().trim_end_matches([':', '-']).trim();
     if show.is_empty() {
         return None;
@@ -137,6 +134,22 @@ pub fn parse_episode(name: &str) -> Option<EpisodeRef> {
         show.push_str(" (show)");
     }
     Some(EpisodeRef { show, season, episode })
+}
+
+/// Short label for an episode row inside its show: `S01E02`, plus whatever
+/// follows the marker (an episode title), e.g. `S01E02 - The Visit`. `None`
+/// if the name does not parse (callers show the full name).
+pub fn episode_label(name: &str) -> Option<String> {
+    parse_episode(name)?;
+    let name = strip_prefix(name);
+    let (_, end, season, episode) = find_marker(name)?;
+    let rest = name[end..].trim_start_matches(|c: char| c.is_whitespace() || c == '-' || c == ':' || c == '.').trim_end();
+    let mut label = format!("S{season:02}E{episode:02}");
+    if !rest.is_empty() {
+        label.push_str(" - ");
+        label.push_str(rest);
+    }
+    Some(label)
 }
 
 fn key_of(show: &str) -> String {
@@ -260,6 +273,15 @@ mod tests {
         assert_eq!(sh[0].name, "(Unsorted) (show)");
         assert_eq!(sh[1].name, UNSORTED);
         assert_eq!(sh[1].seasons[0].episodes, vec![1]);
+    }
+
+    #[test]
+    fn episode_labels() {
+        assert_eq!(episode_label("Fake Show S01E02").as_deref(), Some("S01E02"));
+        assert_eq!(episode_label("SE: Fake Show S1 E2 - The Visit").as_deref(), Some("S01E02 - The Visit"));
+        assert_eq!(episode_label("Fake Show 2x10: Finale").as_deref(), Some("S02E10 - Finale"));
+        assert_eq!(episode_label("Fake Show (2019) S03E104 Part B").as_deref(), Some("S03E104 - Part B"));
+        assert_eq!(episode_label("Weird Name"), None);
     }
 
     #[test]

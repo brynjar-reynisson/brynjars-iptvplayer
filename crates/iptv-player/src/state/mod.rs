@@ -6,6 +6,7 @@ pub mod favs;
 pub mod live;
 pub mod nav;
 pub mod playback;
+pub mod vod;
 pub mod zap;
 
 use std::time::Duration;

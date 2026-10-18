@@ -43,15 +43,15 @@ impl ListView {
     }
 }
 
-struct RowLook<'a> {
-    text: &'a str,
-    selected: bool,
-    playing: bool,
-    star: bool,
-    greyed: bool,
+pub(crate) struct RowLook<'a> {
+    pub text: &'a str,
+    pub selected: bool,
+    pub playing: bool,
+    pub star: bool,
+    pub greyed: bool,
 }
 
-fn row(ui: &mut egui::Ui, look: RowLook<'_>) -> egui::Response {
+pub(crate) fn row(ui: &mut egui::Ui, look: RowLook<'_>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
@@ -116,7 +116,7 @@ fn star(c: egui::Pos2, r: f32, color: egui::Color32) -> egui::Shape {
 }
 
 /// Virtualised list scaffold: `n` rows, keeps `scroll_to` visible.
-fn list<F>(ui: &mut egui::Ui, id: &str, n: usize, view: &mut ListView, scroll_to: Option<usize>, mut draw: F) -> Option<RowAction>
+pub(crate) fn list<F>(ui: &mut egui::Ui, id: &str, n: usize, view: &mut ListView, scroll_to: Option<usize>, mut draw: F) -> Option<RowAction>
 where
     F: FnMut(&mut egui::Ui, usize) -> egui::Response,
 {

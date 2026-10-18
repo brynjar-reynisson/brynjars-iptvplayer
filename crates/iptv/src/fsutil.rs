@@ -37,6 +37,17 @@ pub fn rename_with_retry(from: &Path, to: &Path, attempts: u32, delay: Duration)
     Err(last.unwrap())
 }
 
+/// First unused of `<path>.bad`, `<path>.bad.1`, `<path>.bad.2`, ... beside
+/// `path` (never an existing backup), for moving an unreadable file aside.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let first = path.with_file_name(format!("{name}.bad"));
+    if !first.exists() {
+        return first;
+    }
+    (1u64..).map(|n| path.with_file_name(format!("{name}.bad.{n}"))).find(|p| !p.exists()).unwrap()
+}
+
 /// Atomically replace `path` with `bytes`: unique tmp in the same dir, write, fsync, rename
 /// (3 tries). Creates the parent directory. On failure only this call's own tmp is removed.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -71,6 +82,17 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.parent(), p.parent());
         assert!(a.to_string_lossy().ends_with(".tmp"));
+    }
+
+    #[test]
+    fn backup_path_never_reuses_an_existing_backup() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.json");
+        assert_eq!(backup_path(&p), d.path().join("s.json.bad"));
+        std::fs::write(d.path().join("s.json.bad"), b"1").unwrap();
+        assert_eq!(backup_path(&p), d.path().join("s.json.bad.1"));
+        std::fs::write(d.path().join("s.json.bad.1"), b"2").unwrap();
+        assert_eq!(backup_path(&p), d.path().join("s.json.bad.2"));
     }
 
     #[test]

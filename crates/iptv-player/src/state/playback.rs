@@ -8,11 +8,13 @@
 //! index any more: it is "not in playlist".
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use iptv::library::Library;
 use iptv::playlist::{favorite_key, Kind};
 
 use super::nav::ChannelList;
+use super::zap::Debounce;
 use super::Tab;
 
 #[derive(Clone)]
@@ -44,7 +46,12 @@ impl std::fmt::Debug for Playback {
 impl Playback {
     /// Play `entry`, with `list` as the Up/Down list (the entry is selected
     /// in it; if not listed, the list is just `[entry]`).
-    pub fn new(lib: Arc<Library>, list: Vec<usize>, entry: usize, tab: Tab) -> Playback {
+    pub fn new(lib: Arc<Library>, mut list: Vec<usize>, entry: usize, tab: Tab) -> Playback {
+        if lib.entry(entry).kind == Kind::Live {
+            // Up/Down while watching live only switches between live channels
+            // (a Favorites list can mix in movies/episodes).
+            list.retain(|&e| lib.entry(e).kind == Kind::Live);
+        }
         let mut l = ChannelList::new(list);
         if !l.select_entry(entry) {
             l = ChannelList::new(vec![entry]);
@@ -137,10 +144,54 @@ impl Playback {
     }
 }
 
+/// Queue `target` as the debounced channel switch while `loaded` plays.
+/// Navigating back to the loaded stream (Down then Up within the window)
+/// drops the pending switch instead of reloading what already plays, and a
+/// movie/episode target is never auto-played (the cursor just moves; any
+/// pending switch is dropped since the selection left it).
+pub fn queue_zap(z: &mut Debounce<Playback>, loaded: Option<&Playback>, target: Playback, now: Instant) {
+    if !target.is_live() || loaded.is_some_and(|l| l.key() == target.key()) {
+        z.cancel();
+    } else {
+        z.push(target, now);
+    }
+}
+
+/// After a library swap: re-point the pending zap target; drop it if its
+/// channel left the playlist (never start a stream that is no longer listed).
+pub fn rebase_pending(z: &mut Debounce<Playback>, new: Arc<Library>) {
+    if let Some(p) = z.pending_mut() {
+        p.rebase(new);
+    }
+    if z.pending().is_some_and(|p| !p.in_playlist()) {
+        z.cancel();
+    }
+}
+
+/// What Enter does with the selected entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterAction {
+    /// The selection is what is loaded: open the full player view.
+    OpenPlayer,
+    Play(usize),
+    Nothing,
+}
+
+/// Enter on the loaded entry opens the player (the caller cancels any
+/// pending zap) without reloading; on any other entry it plays it.
+pub fn enter_action(selected: Option<usize>, loaded: Option<usize>) -> EnterAction {
+    match selected {
+        Some(e) if loaded == Some(e) => EnterAction::OpenPlayer,
+        Some(e) => EnterAction::Play(e),
+        None => EnterAction::Nothing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::live::tests::{live, sample_lib};
+    use crate::state::zap::ZAP_DELAY;
 
     #[test]
     fn steps_through_snapshot_and_wraps() {
@@ -188,6 +239,87 @@ mod tests {
         // Snapshot list remapped (vanished entry dropped): [SVT1 HD, SVT2 HD].
         assert_eq!(p.step(1), Some(2));
         assert_eq!(p.step(1), Some(1));
+    }
+
+    fn mixed_lib() -> Library {
+        use crate::state::vod::tests::vod;
+        Library::build(vec![
+            live("1", "SVT1 HD", "Sweden - Nationella"),
+            vod(Kind::Movie, "7", "Invented Movie", "Movies: Testland"),
+            live("2", "SVT2 HD", "Sweden - Nationella"),
+            vod(Kind::Series, "8", "Invented Show S01E01", "Series: Testland"),
+        ])
+    }
+
+    #[test]
+    fn vod_entries_play_as_vod_and_live_lists_skip_them() {
+        let lib = Arc::new(mixed_lib());
+        // A movie favorite resumes as VOD (is_live derived from Entry.kind).
+        let m = Playback::new(lib.clone(), vec![0, 1, 2, 3], 1, Tab::Favorites);
+        assert!(!m.is_live());
+        assert_eq!(m.key(), "movie:7");
+        assert!(!Playback::new(lib.clone(), vec![3], 3, Tab::Series).is_live());
+        // Live playback from a mixed favorites list: Up/Down only walks live entries.
+        let mut l = Playback::new(lib, vec![0, 1, 2, 3], 0, Tab::Favorites);
+        assert_eq!(l.step(1), Some(2));
+        assert_eq!(l.step(1), Some(0));
+    }
+
+    #[test]
+    fn zap_back_to_the_loaded_channel_drops_the_pending_zap() {
+        let lib = Arc::new(sample_lib());
+        let loaded = Playback::new(lib.clone(), vec![0, 1, 3], 1, Tab::Live);
+        let mut z = Debounce::new(ZAP_DELAY);
+        let t0 = Instant::now();
+        // Down: pending zap to entry 3.
+        queue_zap(&mut z, Some(&loaded), Playback::new(lib.clone(), vec![0, 1, 3], 3, Tab::Live), t0);
+        assert_eq!(z.pending().and_then(Playback::entry_index), Some(3));
+        // Up (back to the loaded channel) within the window: nothing to reload.
+        queue_zap(&mut z, Some(&loaded), Playback::new(lib.clone(), vec![0, 1, 3], 1, Tab::Live), t0);
+        assert!(z.pending().is_none());
+        assert!(z.due(t0 + ZAP_DELAY * 2).is_none());
+        // Nothing loaded: always queued.
+        queue_zap(&mut z, None, Playback::new(lib, vec![0, 1, 3], 1, Tab::Live), t0);
+        assert!(z.pending().is_some());
+    }
+
+    #[test]
+    fn vod_targets_never_auto_play() {
+        let lib = Arc::new(mixed_lib());
+        let loaded = Playback::new(lib.clone(), vec![0, 2], 0, Tab::Favorites);
+        let mut z = Debounce::new(ZAP_DELAY);
+        let t0 = Instant::now();
+        queue_zap(&mut z, Some(&loaded), Playback::new(lib.clone(), vec![0, 1, 2], 2, Tab::Favorites), t0);
+        assert!(z.pending().is_some());
+        // The cursor moved on to a movie: the stale live target is dropped too.
+        queue_zap(&mut z, Some(&loaded), Playback::new(lib, vec![0, 1, 2], 1, Tab::Favorites), t0);
+        assert!(z.pending().is_none());
+    }
+
+    #[test]
+    fn enter_on_the_loaded_entry_opens_the_player_without_reloading() {
+        assert_eq!(enter_action(Some(4), Some(4)), EnterAction::OpenPlayer);
+        assert_eq!(enter_action(Some(4), Some(3)), EnterAction::Play(4));
+        assert_eq!(enter_action(Some(4), None), EnterAction::Play(4));
+        assert_eq!(enter_action(None, Some(3)), EnterAction::Nothing);
+    }
+
+    #[test]
+    fn rebase_drops_a_pending_zap_that_left_the_playlist() {
+        let lib = Arc::new(sample_lib());
+        let mut z = Debounce::new(ZAP_DELAY);
+        let t0 = Instant::now();
+        z.push(Playback::new(lib.clone(), vec![0, 3], 3, Tab::Live), t0); // TV4 Sport
+        let keep = Arc::new(Library::build(vec![
+            live("9", "New", "Sweden - Nationella"),
+            live("4", "TV4 Sport", "Sweden - Sport"),
+        ]));
+        rebase_pending(&mut z, keep.clone());
+        assert_eq!(z.pending().and_then(Playback::entry_index), Some(1), "re-pointed");
+        let gone = Arc::new(Library::build(vec![live("1", "SVT1 HD", "Sweden - Nationella")]));
+        rebase_pending(&mut z, gone);
+        assert!(z.pending().is_none(), "target vanished: no zap to a stream that left the playlist");
+        assert_eq!(Arc::strong_count(&keep), 1);
     }
 
     #[test]
