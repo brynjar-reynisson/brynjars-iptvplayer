@@ -6,6 +6,13 @@
 //!   (default: `IPTV_DATA_DIR`, then the exe's directory).
 //! - `--playlist-file` (dev): parse a local `.m3u` instead of downloading
 //!   `playlist_url`; the result is still cached under the data dir.
+//!
+//! Release builds use the Windows GUI subsystem (no console window when
+//! started from Explorer). When started from a terminal, the process attaches
+//! to that terminal's console so status/timing lines on stderr still show.
+
+// Release: no console window. Debug builds keep the console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -14,8 +21,29 @@ use iptv_player::ui::{run, Options};
 
 const USAGE: &str = "usage: iptv-player [--data-dir <path>] [--playlist-file <path.m3u>]";
 
+/// GUI-subsystem builds start without a console: borrow the parent's (the
+/// terminal that started us), if any, so stdout/stderr reach it. Redirected
+/// handles (pipes/files) are inherited as usual and keep working.
+#[cfg(windows)]
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX; // (DWORD)-1
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // SAFETY: plain Win32 call with a constant argument; failure (no parent
+    // console, or already attached) is harmless and ignored.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
+    attach_parent_console();
     let mut data_dir = None;
     let mut playlist_file = None;
     let mut args = std::env::args().skip(1);

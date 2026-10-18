@@ -63,9 +63,15 @@ groups) live in the data directory. The app looks for it in this order:
 
 ## Developer flags
 
+- The release build is a windowed app and does not open a console window. If you start
+  it from a terminal, its status and timing lines still go to that terminal. The prompt
+  comes back right away and the lines appear after it. Debug builds keep a console.
 - `--playlist-file <path.m3u>` parses a local M3U file instead of downloading
   `playlist_url` (no `config.toml` needed). F5 reads the file again.
 - Startup timings and slow frames (> 25 ms) are printed to stderr.
+- Favorites are keyed by the provider's numeric stream id. Channels without one (for
+  example third-party `.../master.m3u8` links) are keyed by name and group instead, so
+  renaming such a channel in the playlist drops its favorite.
 - `cargo test --workspace` runs the unit tests. With `IPTV_SAMPLE=<path to a real
   .m3u>`, `cargo test --release --workspace -- --ignored --nocapture` runs the parse,
   library-build, cache and search performance tests.
