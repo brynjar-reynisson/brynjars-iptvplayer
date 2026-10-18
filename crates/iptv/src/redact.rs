@@ -91,9 +91,12 @@ fn redact_path(base: &str) -> String {
         None if n >= 3 => Some(0),
         None => None,
     };
+    // Fail closed: every segment from `start` up to (not including) the last
+    // one (the id) is redacted, so longer paths (`/auth/U/P/9`) leak nothing.
     if let Some(st) = start {
-        segs[st] = "***".into();
-        segs[st + 1] = "***".into();
+        for s in &mut segs[st..n - 1] {
+            *s = "***".into();
+        }
     }
     format!("{}{}/{}", &base[..scheme_end], authority, segs.join("/"))
 }
@@ -161,6 +164,19 @@ mod tests {
             redact_url("https://example.com/path/to/file.m3u"),
             "https://example.com/***/***/file.m3u"
         );
+    }
+
+    #[test]
+    fn redacts_all_but_last_segment_of_long_paths() {
+        // Unprefixed paths with more than 3 segments: everything but the id.
+        assert_eq!(redact_url("http://h/auth/U/P/9"), "http://h/***/***/***/9");
+        assert_eq!(redact_url("http://h/proxy/U/P/9.ts/"), "http://h/***/***/***/9.ts/");
+        // After a kind segment: everything between it and the id.
+        assert_eq!(redact_url("http://h/live/U/P/extra/9"), "http://h/live/***/***/***/9");
+        // Spec shapes stay exactly as before.
+        assert_eq!(redact_url("http://h:8080/U/P/123"), "http://h:8080/***/***/123");
+        assert_eq!(redact_url("http://h:8080/movie/U/P/9.mkv"), "http://h:8080/movie/***/***/9.mkv");
+        assert_eq!(redact_url("http://h/proxy/movie/U/P/9.mkv"), "http://h/proxy/movie/***/***/9.mkv");
     }
 
     #[test]
