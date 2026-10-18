@@ -20,8 +20,9 @@ pub struct Player {
 }
 
 impl Player {
-    /// `user_agent`: sent on every stream request (blank = default).
-    pub fn new(cc: &eframe::CreationContext<'_>, user_agent: &str) -> anyhow::Result<Player> {
+    /// `user_agent`: sent on every stream request (blank = default). `hwdec`:
+    /// mpv hardware decoding mode (`None` = `auto-safe`; `"no"` = software).
+    pub fn new(cc: &eframe::CreationContext<'_>, user_agent: &str, hwdec: Option<&str>) -> anyhow::Result<Player> {
         let get_proc_address = cc
             .get_proc_address
             .clone()
@@ -29,6 +30,7 @@ impl Player {
         let (c1, c2) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
         let backend = MpvBackend::new(MpvOptions {
             user_agent: user_agent.to_string(),
+            hwdec: hwdec.map(str::to_string),
             gl: Some(GlInit { get_proc_address, on_frame: Box::new(move || c1.request_repaint()) }),
             on_wakeup: Some(Box::new(move || c2.request_repaint())),
         })?;

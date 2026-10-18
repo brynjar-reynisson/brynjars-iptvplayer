@@ -14,6 +14,9 @@ pub struct Config {
     /// Optional `top_country` key, trimmed; blank/missing = none. That live
     /// country is listed first, the rest alphabetically.
     pub top_country: Option<String>,
+    /// Optional `hwdec` key (mpv hardware decoding mode, e.g. `no`,
+    /// `d3d11va`); blank/missing = none (the player uses `auto-safe`).
+    pub hwdec: Option<String>,
 }
 
 /// Never prints the URL (it carries the account credentials).
@@ -23,6 +26,7 @@ impl std::fmt::Debug for Config {
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
             .field("top_country", &self.top_country)
+            .field("hwdec", &self.hwdec)
             .finish()
     }
 }
@@ -83,7 +87,20 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
             (!s.is_empty()).then(|| s.to_string())
         }
     };
-    Ok(Config { playlist_url, user_agent, top_country })
+    let hwdec = match value.get("hwdec") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("{}: `hwdec` must be a string", path.display()))?
+                .trim();
+            if s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                anyhow::bail!("{}: `hwdec` must be a single mpv value such as `no`", path.display());
+            }
+            (!s.is_empty()).then(|| s.to_string())
+        }
+    };
+    Ok(Config { playlist_url, user_agent, top_country, hwdec })
 }
 
 #[cfg(test)]
@@ -121,6 +138,15 @@ mod tests {
     }
 
     #[test]
+    fn hwdec_is_optional_trimmed_and_validated() {
+        assert_eq!(load_with("").unwrap().hwdec, None);
+        assert_eq!(load_with("hwdec = \" no \"\n").unwrap().hwdec.as_deref(), Some("no"));
+        assert_eq!(load_with("hwdec = \"\"\n").unwrap().hwdec, None);
+        assert!(format!("{:#}", load_with("hwdec = \"a b\"\n").unwrap_err()).contains("hwdec"));
+        assert!(format!("{:#}", load_with("hwdec = 1\n").unwrap_err()).contains("hwdec"));
+    }
+
+    #[test]
     fn invalid_user_agent_is_rejected_without_url() {
         for extra in ["user_agent = \"bad\\nagent\"\n", "user_agent = \"tab\\there\"\n", "user_agent = 5\n"] {
             let err = format!("{:#}", load_with(extra).unwrap_err());
@@ -135,6 +161,7 @@ mod tests {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
             top_country: None,
+            hwdec: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");

@@ -26,6 +26,8 @@ until you pick something else.
      check user_agent in config.toml)", try another value.
    - Optional: `top_country = "Iceland"` lists that live country first. The rest are
      alphabetical, with "Other" last. Applies after the next refresh (F5) or restart.
+   - Optional: `hwdec = "no"` turns off hardware video decoding (mpv's default here is
+     `auto-safe`). Try it if video shows black dashes or blocky corruption. Needs a restart.
    - The first download can take a long time while the provider generates the file.
    - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
      a restart.

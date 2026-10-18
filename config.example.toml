@@ -8,3 +8,8 @@ playlist_url = "http://example.invalid/get.php?username=USER&password=PASS&type=
 # Optional: live country to list first (e.g. "Iceland"). The other countries are
 # alphabetical, with "Other" last. Applies after the next refresh (F5) or restart.
 # top_country = "Iceland"
+
+# Optional: mpv hardware decoding mode (default "auto-safe"). If video shows thin
+# black horizontal dashes or blocky corruption, try "no" (software decoding).
+# Needs a restart.
+# hwdec = "no"

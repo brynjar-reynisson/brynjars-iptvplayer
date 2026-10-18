@@ -766,6 +766,8 @@ pub struct MpvOptions {
     /// HTTP User-Agent for stream requests (blank = the default, see
     /// [`init_options`]). Same value as the playlist download uses.
     pub user_agent: String,
+    /// mpv `hwdec` override (`config.toml` `hwdec`); `None` = `auto-safe`.
+    pub hwdec: Option<String>,
     /// `Some` = render in-app via the OpenGL render API (`vo=libmpv`);
     /// `None` = headless (`vo=null`, `ao=null`; tests and demos).
     pub gl: Option<GlInit>,
@@ -814,7 +816,12 @@ impl MpvBackend {
         }
         let core = Arc::new(Core { handle, wakeup: Mutex::new(ptr::null_mut()) });
         let headless = opts.gl.is_none();
-        for (k, v) in init_options(headless, &opts.user_agent) {
+        let mut init = init_options(headless, &opts.user_agent);
+        if let Some(h) = &opts.hwdec {
+            init.retain(|(k, _)| k != "hwdec");
+            init.push(("hwdec".into(), h.clone()));
+        }
+        for (k, v) in init {
             let (ck, cv) = (cstr(&k)?, cstr(&v)?);
             let r = unsafe { sys::mpv_set_option_string(handle, ck.as_ptr(), cv.as_ptr()) };
             if r < 0 {

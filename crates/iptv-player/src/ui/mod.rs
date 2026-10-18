@@ -94,11 +94,13 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
-/// `(user_agent, top_country)` from `config.toml` if it loads, else the
-/// default UA and no top country (also with `--playlist-file`).
-fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>) {
-    iptv::config::load(data_dir)
-        .map_or_else(|_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None), |c| (c.user_agent, c.top_country))
+/// `(user_agent, top_country, hwdec)` from `config.toml` if it loads, else
+/// the default UA and no top country / hwdec (also with `--playlist-file`).
+fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>, Option<String>) {
+    iptv::config::load(data_dir).map_or_else(
+        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None, None),
+        |c| (c.user_agent, c.top_country, c.hwdec),
+    )
 }
 
 /// Where the playlist comes from: `--playlist-file`, else `config.toml`.
@@ -179,9 +181,9 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
-        let (user_agent, top_country) = configured_prefs(&opts.data_dir);
+        let (user_agent, top_country, hwdec) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
-        let player = Player::new(cc, &user_agent).map_err(|e| safe_text(&format!("{e:#}")));
+        let player = Player::new(cc, &user_agent, hwdec.as_deref()).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
             eprintln!("player unavailable: {e}");
         }
@@ -282,7 +284,7 @@ impl App {
         }
         // Picks up a `user_agent` / `top_country` edited in config.toml since
         // startup (streams keep the startup user agent until restart).
-        (self.user_agent, self.top_country) = configured_prefs(&self.data_dir);
+        (self.user_agent, self.top_country, _) = configured_prefs(&self.data_dir);
         let a = self.data.request_refresh(force);
         self.run_actions(a);
     }
@@ -439,9 +441,8 @@ impl App {
             Ok(p) => p.play_from(pb.url(), pb.is_live(), resume),
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
-        if let Some(t) = resume {
-            self.message = Some(format!("Resuming at {}", clock(t)));
-        }
+        // Replaces any older message (e.g. "Resuming at ..." of the last video).
+        self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
     }
 
