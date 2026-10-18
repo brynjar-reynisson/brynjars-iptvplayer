@@ -1,0 +1,7 @@
+# Line endings: new and LF files stay LF in the repository and working tree.
+# Files already committed with CRLF are not converted (git leaves CRLF blobs
+# alone under text=auto), so this adds no mass renormalisation.
+* text=auto eol=lf
+*.dll binary
+*.lib binary
+*.7z binary

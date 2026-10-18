@@ -114,7 +114,9 @@ impl Library {
             match e.kind {
                 Kind::Live => {
                     live_idx.push(i, &e.name);
-                    match e.group.split_once(" - ") {
+                    // An empty country (" - X") and a real "Other - X" join
+                    // the catch-all "Other" (always last, never duplicated).
+                    match e.group.split_once(" - ").filter(|(c, _)| !c.trim().is_empty() && *c != OTHER) {
                         Some((c, _)) => {
                             let p = *pos.entry(c.to_string()).or_insert_with(|| {
                                 countries.push(Country { name: c.to_string(), channels: Vec::new() });
@@ -240,6 +242,21 @@ mod tests {
         assert_eq!(c[1].name, "Other");
         assert_eq!(c[1].channels, vec![0]);
         assert_eq!(lib.movies(), &[2]);
+    }
+
+    #[test]
+    fn other_country_and_empty_country_merge_into_one_other() {
+        let lib = Library::build(vec![
+            e(Kind::Live, "1", "A", "Other - Sports"),
+            e(Kind::Live, "2", "B", "Misc"),
+            e(Kind::Live, "3", "C", "Sweden - X"),
+            e(Kind::Live, "4", "D", " - Loose"),
+            e(Kind::Live, "5", "E", "A - B - C"),
+        ]);
+        let names: Vec<&str> = lib.countries().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Sweden", "A", "Other"]);
+        assert_eq!(lib.countries()[2].channels, vec![0, 1, 3]);
+        assert_eq!(lib.countries()[1].channels, vec![4]);
     }
 
     #[test]

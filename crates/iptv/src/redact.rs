@@ -26,12 +26,19 @@ pub fn redact_url(s: &str) -> String {
                         format!("{k}=***")
                     }
                 }
-                None => kv.to_string(),
+                // A bare token (`?TOKEN`) may itself be a credential.
+                None if kv.is_empty() => String::new(),
+                None => "***".to_string(),
             })
             .collect();
         out.push_str(&parts.join("&"));
     }
-    out.push_str(frag);
+    // Fragments can carry tokens too; never keep their content.
+    if frag.len() > 1 {
+        out.push_str("#***");
+    } else {
+        out.push_str(frag);
+    }
     out
 }
 
@@ -154,6 +161,15 @@ mod tests {
             redact_url("https://example.com/path/to/file.m3u"),
             "https://example.com/***/***/file.m3u"
         );
+    }
+
+    #[test]
+    fn redacts_fragment_and_bare_query_tokens() {
+        assert_eq!(redact_url("http://h/a/b#secret"), "http://h/a/b#***");
+        assert_eq!(redact_url("http://h/a/b?type=m3u#u=x&p=y"), "http://h/a/b?type=m3u#***");
+        assert_eq!(redact_url("http://h/a/b#"), "http://h/a/b#");
+        assert_eq!(redact_url("http://h/x?SECRETTOKEN"), "http://h/x?***");
+        assert_eq!(redact_url("http://h/x?type=m3u&SECRETTOKEN&"), "http://h/x?type=m3u&***&");
     }
 
     #[test]
