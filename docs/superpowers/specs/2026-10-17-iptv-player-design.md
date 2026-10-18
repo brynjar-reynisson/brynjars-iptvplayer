@@ -8,7 +8,7 @@ The user has a paid IPTV subscription with an IPTV provider. The reference app i
 - The Android "spinner, then big '!' and no retry until reselect" behaviour is something we deliberately do better.
 
 ## The input: a single Xtream-style M3U playlist
-- User supplies one M3U file URL (credentials embedded) in a local config. Sample (77 MB, ~282,000 entries, 605 groups) is at `<samples dir>\<playlist>.m3u` (outside this repo; contains credentials; never commit it).
+- User supplies one M3U file URL (credentials embedded) in a local config. Sample (77 MB, ~282,000 entries, 605 groups) is at `<samples dir>\` (the `*_plus.m3u` file; its name contains a credential segment, never quote it) (outside this repo; contains credentials; never commit it).
 - Each entry: `#EXTINF:-1 tvg-ID="" tvg-name="..." tvg-logo="..." group-title="...",Display name` then the stream URL line.
 - Kind is determined by URL path: `http://host:port/<user>/<pass>/<id>` = live (~31k); `/movie/<user>/<pass>/<id>.<ext>` = movie (~57k); `/series/<user>/<pass>/<id>.<ext>` = series episode (~195k, one flat entry per episode). Extensions seen: mkv, mp4, ts, avi. A few live entries use other hosts (Pluto TV, Amagi); treat any URL without /movie/ or /series/ as live.
 - Group titles: live like `Sweden - Nationella` (country prefix before " - "); `Movies: <lang>`; `Series: <lang>`. Group-less header entries like `===== Sweden ======` exist and are separators to ignore or skip.

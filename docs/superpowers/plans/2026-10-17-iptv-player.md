@@ -22,7 +22,7 @@
 - Performance (this machine): usable UI from cache < ~1 s, search < ~50 ms per keystroke, memory < ~500 MB with the full sample (282k entries).
 - Config, `cache/`, `favorites.json` live beside the exe; overridable via `--data-dir <path>` or env `IPTV_DATA_DIR`.
 - Repo conventions: `AGENTS.md` (not CLAUDE.md); `git -C <path>`; `git add` new files; branches `feature/…`; update `AGENTS.md` + docs when committing a feature branch.
-- Sample playlist for tests/perf (outside repo, never copy into it): `<samples dir>\<playlist>.m3u`. Unit tests use small inline fixtures with fake hosts/credentials.
+- Sample playlist for tests/perf (outside repo, never copy into it): `<samples dir>\` (the `*_plus.m3u` file; its name contains a credential segment, never quote it). Unit tests use small inline fixtures with fake hosts/credentials.
 
 ## Review Focus
 
