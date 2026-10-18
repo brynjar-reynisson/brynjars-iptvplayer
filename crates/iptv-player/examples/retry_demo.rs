@@ -180,6 +180,12 @@ impl Demo {
     }
 }
 
+/// User-Agent header of every request the reject server received (None = absent).
+fn seen_user_agents() -> &'static std::sync::Mutex<Vec<Option<String>>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Vec<Option<String>>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
 /// Tiny HTTP server that rejects every request with `code` (switchable).
 fn auth_server(code: Arc<AtomicU16>) {
     let l = TcpListener::bind(("127.0.0.1", AUTH_PORT)).expect("bind auth port");
@@ -188,7 +194,13 @@ fn auth_server(code: Arc<AtomicU16>) {
             let mut s = s;
             let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = [0u8; 2048];
-            let _ = s.read(&mut buf);
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let ua = req
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
+                .map(|(_, v)| v.trim().to_string());
+            seen_user_agents().lock().unwrap().push(ua);
             let c = code.load(Ordering::SeqCst);
             let (reason, ctype, body) = match c {
                 401 => ("Unauthorized", "text/plain", "denied"),
@@ -352,6 +364,15 @@ fn main() -> anyhow::Result<()> {
     d.sup.play(format!("http://127.0.0.1:{AUTH_PORT}/live/demo_user/demo_pass/3.ts"), true, Instant::now());
     d.run_for(8.0);
     ok &= d.expect(t, "Reconnecting{kind: Auth} on 401", |s| matches!(s, Status::Reconnecting { kind: RetryKind::Auth, .. }));
+
+    {
+        let seen = seen_user_agents().lock().unwrap();
+        let want = iptv::config::DEFAULT_USER_AGENT;
+        let ua_ok = !seen.is_empty() && seen.iter().all(|u| u.as_deref() == Some(want));
+        println!("  stream requests: {}, User-Agent seen: {:?}", seen.len(), seen.first());
+        println!("CHECK stream requests send User-Agent {want:?}: {}", if ua_ok { "OK" } else { "FAILED" });
+        ok &= ua_ok;
+    }
 
     d.note("5b. HTTP 458");
     code.store(458, Ordering::SeqCst);

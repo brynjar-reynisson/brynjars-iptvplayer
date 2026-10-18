@@ -19,6 +19,14 @@ until you pick something else.
 4. **Config**: copy `config.example.toml` to `config.toml` beside the exe (or in the data
    dir, see below) and set `playlist_url` to your provider's M3U URL. `config.toml` holds
    your credentials. It is gitignored, so never commit it.
+   - Optional: `user_agent = "..."` sets the User-Agent sent with the playlist download
+     and every stream request. If it is missing or empty, the app sends
+     `VLC/3.0.20 LibVLC/3.0.20`. Some providers block requests that have no known
+     player User-Agent. If a refresh fails with "server returned HTTP 454 (blocked?
+     check user_agent in config.toml)", try another value.
+   - The first download can take a long time while the provider generates the file.
+   - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
+     a restart.
 5. **Run**: `target\release\iptv-player.exe`, or `cargo run --release -p iptv-player`.
 
 ### Release folder

@@ -1,1 +1,6 @@
 playlist_url = "http://example.invalid/get.php?username=USER&password=PASS&type=m3u_plus"
+
+# Optional: User-Agent sent on the playlist download and on every stream
+# request. Some providers reject requests without a known player User-Agent
+# (e.g. "server returned HTTP 454"). Empty or missing = "VLC/3.0.20 LibVLC/3.0.20".
+# user_agent = "VLC/3.0.20 LibVLC/3.0.20"

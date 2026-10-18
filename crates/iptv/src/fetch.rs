@@ -3,6 +3,7 @@
 //! Credentials safety: every error string produced here is scrubbed (the raw URL is
 //! replaced by its `redact_url` form and reqwest's own URL echo is stripped).
 
+use crate::config::DEFAULT_USER_AGENT;
 use crate::{cache, library::Library, playlist, redact::redact_url};
 use anyhow::{anyhow, Result};
 use std::collections::HashSet;
@@ -59,21 +60,47 @@ fn unique_tmp(dest: &Path) -> PathBuf {
     crate::fsutil::unique_tmp_path(dest, "part")
 }
 
-/// Download `url` to `dest` (atomically: temp file + rename, only if complete).
-pub fn download(url: &str, dest: &Path) -> Result<()> {
-    download_with_progress(url, dest, &mut |_| {})
+/// `ua` trimmed, or [`DEFAULT_USER_AGENT`] when blank.
+fn effective_user_agent(ua: &str) -> &str {
+    let t = ua.trim();
+    if t.is_empty() {
+        DEFAULT_USER_AGENT
+    } else {
+        t
+    }
 }
 
-pub(crate) fn download_with_progress(url: &str, dest: &Path, progress: &mut dyn FnMut(u64)) -> Result<()> {
+/// Download `url` to `dest` (atomically: temp file + rename, only if complete),
+/// sending [`DEFAULT_USER_AGENT`].
+pub fn download(url: &str, dest: &Path) -> Result<()> {
+    download_with_progress(url, dest, DEFAULT_USER_AGENT, &mut |_| {})
+}
+
+pub(crate) fn download_with_progress(
+    url: &str,
+    dest: &Path,
+    user_agent: &str,
+    progress: &mut dyn FnMut(u64),
+) -> Result<()> {
     let tmp = unique_tmp(dest);
-    let r = download_inner(url, dest, &tmp, progress);
+    let r = download_inner(url, dest, &tmp, effective_user_agent(user_agent), progress);
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     r.map_err(|e| anyhow!("{}", scrub(&format!("{e:#}"), url)))
 }
 
-fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u64)) -> Result<()> {
+/// Text for a non-success playlist status. A status without a standard
+/// reason (e.g. 454) is how some providers block unknown clients, so hint at
+/// the User-Agent.
+fn status_error(status: reqwest::StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(reason) => format!("server returned HTTP {} {reason}", status.as_u16()),
+        None => format!("server returned HTTP {} (blocked? check user_agent in config.toml)", status.as_u16()),
+    }
+}
+
+fn download_inner(url: &str, dest: &Path, tmp: &Path, user_agent: &str, progress: &mut dyn FnMut(u64)) -> Result<()> {
     // reqwest errors embed the URL; strip it, the caller scrubs whatever remains.
     let net = |e: reqwest::Error| anyhow!("{}", e.without_url());
     if let Some(p) = dest.parent() {
@@ -90,7 +117,9 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u
             a.error("blocked redirect to a different host")
         }
     });
+    // Client-level User-Agent: also sent on followed (same-host) redirects.
     let client = reqwest::blocking::Client::builder()
+        .user_agent(user_agent)
         .connect_timeout(Duration::from_secs(15))
         // Blocking reqwest has no per-read timeout, only an overall one. A stalled
         // connection can therefore hold the worker for up to this long (the UI stays
@@ -101,7 +130,7 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, progress: &mut dyn FnMut(u
         .map_err(net)?;
     let mut resp = client.get(url).send().map_err(net)?;
     if !resp.status().is_success() {
-        return Err(anyhow!("server returned HTTP {}", resp.status()));
+        return Err(anyhow!("{}", status_error(resp.status())));
     }
     let expected = resp.content_length();
     let mut f = std::fs::File::create(tmp).map_err(|e| anyhow!("creating temp file: {e}"))?;
@@ -159,11 +188,20 @@ impl std::fmt::Debug for Source {
 }
 
 /// Options for a refresh.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshOptions {
     /// Skip ONLY the "much smaller than the cached playlist" safety check
     /// (the user confirmed the shrink is real). Empty playlists still fail.
     pub force: bool,
+    /// User-Agent for the download (blank = [`DEFAULT_USER_AGENT`]); unused
+    /// for [`Source::File`].
+    pub user_agent: String,
+}
+
+impl Default for RefreshOptions {
+    fn default() -> Self {
+        RefreshOptions { force: false, user_agent: DEFAULT_USER_AGENT.to_string() }
+    }
 }
 
 const SHRINK_MARKER: &str = "much smaller than the cached one";
@@ -198,18 +236,19 @@ pub struct Refresher {
 }
 
 impl Refresher {
-    pub fn spawn(url: String, dir: PathBuf) -> Refresher {
-        Self::spawn_source(Source::Url(url), dir, RefreshOptions::default())
+    /// Download `url` (sending `user_agent`; blank = default) into `dir`'s cache.
+    pub fn spawn(url: String, dir: PathBuf, user_agent: &str) -> Refresher {
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into() })
     }
 
     /// Like [`Refresher::spawn`] but replaces the cache even when the new
     /// playlist is much smaller than the cached one.
-    pub fn spawn_forced(url: String, dir: PathBuf) -> Refresher {
-        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: true })
+    pub fn spawn_forced(url: String, dir: PathBuf, user_agent: &str) -> Refresher {
+        Self::spawn_source(Source::Url(url), dir, RefreshOptions { force: true, user_agent: user_agent.into() })
     }
 
-    pub fn try_spawn(url: String, dir: PathBuf) -> Option<Refresher> {
-        Self::try_spawn_source(Source::Url(url), dir, RefreshOptions::default())
+    pub fn try_spawn(url: String, dir: PathBuf, user_agent: &str) -> Option<Refresher> {
+        Self::try_spawn_source(Source::Url(url), dir, RefreshOptions { force: false, user_agent: user_agent.into() })
     }
 
     /// General form: any [`Source`], with [`RefreshOptions`].
@@ -248,7 +287,7 @@ impl Refresher {
         std::thread::spawn(move || {
             // Fixed message on panic: the payload could contain the URL.
             let ev = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&source, opts, &dir, &saver, retry_delay, &tx)
+                run(&source, &opts, &dir, &saver, retry_delay, &tx)
             }))
             .unwrap_or_else(|_| RefreshEvent::Failed("internal error".into()));
             // Release the single-run guard before the terminal event so a UI reacting
@@ -287,7 +326,7 @@ fn sweep_stale(cache_dir: &Path) {
 
 fn run(
     source: &Source,
-    opts: RefreshOptions,
+    opts: &RefreshOptions,
     dir: &Path,
     saver: &Saver,
     retry_delay: Duration,
@@ -303,7 +342,7 @@ fn run(
     let res = (|| -> Result<RefreshEvent> {
         let entries = match source {
             Source::Url(url) => {
-                download_with_progress(url, &m3u, &mut |n| {
+                download_with_progress(url, &m3u, &opts.user_agent, &mut |n| {
                     let _ = tx.send(RefreshEvent::Progress(n));
                 })?;
                 let f = std::fs::File::open(&m3u).map_err(|e| anyhow!("opening downloaded playlist: {e}"))?;
@@ -363,6 +402,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_USER_AGENT;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -423,7 +463,7 @@ mod tests {
     fn refresh_success_writes_cache_and_emits_done() {
         let base = ok_server(M3U);
         let d = tempfile::tempdir().unwrap();
-        let r = Refresher::spawn(format!("{base}/get.m3u"), d.path().to_path_buf());
+        let r = Refresher::spawn(format!("{base}/get.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
         let (_, ev) = wait(&r);
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
         assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
@@ -438,7 +478,7 @@ mod tests {
         });
         let d = tempfile::tempdir().unwrap();
         let old = old_cache(d.path());
-        let r = Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/get.m3u"), d.path().to_path_buf());
+        let r = Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/get.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
         let (_, ev) = wait(&r);
         let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
         assert!(!m.contains("SECRETUSER") && !m.contains("SECRETPASS"), "{m}");
@@ -467,7 +507,7 @@ mod tests {
                 format!("{base}/get.php?username=SECRETUSER&password=SECRETPASS"),
             ] {
                 let d = tempfile::tempdir().unwrap();
-                let r = Refresher::spawn(url.clone(), d.path().to_path_buf());
+                let r = Refresher::spawn(url.clone(), d.path().to_path_buf(), DEFAULT_USER_AGENT);
                 let (_, ev) = wait(&r);
                 let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
                 assert!(!m.contains("SECRETUSER") && !m.contains("SECRETPASS"), "{m}");
@@ -503,12 +543,12 @@ mod tests {
             let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", M3U.len(), M3U);
         });
         let d = tempfile::tempdir().unwrap();
-        let r = Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).unwrap();
-        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_none());
+        let r = Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT).unwrap();
+        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT).is_none());
         let (_, ev) = wait(&r);
         assert!(matches!(ev, RefreshEvent::Done(_)));
         // guard is released before the terminal event: immediate respawn works
-        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_some());
+        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT).is_some());
     }
 
     #[test]
@@ -518,8 +558,8 @@ mod tests {
             let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", M3U.len(), M3U);
         });
         let d = tempfile::tempdir().unwrap();
-        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
-        let r2 = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
+        let r2 = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
         let (_, ev) = wait(&r2);
         assert!(matches!(&ev, RefreshEvent::Failed(m) if m == "refresh already running"), "{ev:?}");
         assert!(matches!(wait(&r).1, RefreshEvent::Done(_)));
@@ -534,7 +574,7 @@ mod tests {
             .unwrap();
         let (_, ev) = wait(&r);
         assert!(matches!(&ev, RefreshEvent::Failed(m) if m == "internal error"), "{ev:?}");
-        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf()).is_some());
+        assert!(Refresher::try_spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT).is_some());
     }
 
     #[test]
@@ -548,7 +588,7 @@ mod tests {
         assert_eq!(e.len(), 10);
         cache::save(d.path(), &e).unwrap();
         let base = ok_server(M3U); // 2 entries < 50% of 10
-        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let r = Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
         let (_, ev) = wait(&r);
         let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
         assert!(m.contains("2 vs 10 entries"), "{m}");
@@ -571,7 +611,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         ten_entry_cache(d.path());
         let base = ok_server(M3U);
-        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
         assert!(is_shrink_refusal(&m), "{m}");
         assert!(!is_shrink_refusal("server returned HTTP 500"));
@@ -582,14 +622,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         ten_entry_cache(d.path());
         let base = ok_server(M3U); // 2 entries < 50% of 10
-        let r = Refresher::spawn_forced(format!("{base}/a.m3u"), d.path().to_path_buf());
+        let r = Refresher::spawn_forced(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT);
         let (_, ev) = wait(&r);
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
         assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
         no_leftovers(d.path());
         // Forced still fails on an empty playlist and keeps the cache.
         let empty = ok_server("#EXTM3U\n");
-        let (_, ev) = wait(&Refresher::spawn_forced(format!("{empty}/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn_forced(format!("{empty}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         assert!(matches!(ev, RefreshEvent::Failed(_)), "{ev:?}");
         assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
     }
@@ -623,7 +663,7 @@ mod tests {
     fn debug_of_done_does_not_dump_urls() {
         let d = tempfile::tempdir().unwrap();
         let base = ok_server(M3U);
-        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         let s = format!("{ev:?}");
         assert!(!s.contains("example.invalid") && s.contains("2 entries"), "{s}");
     }
@@ -641,7 +681,7 @@ mod tests {
             let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {target}/SECRETUSER/SECRETPASS/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
         let d = tempfile::tempdir().unwrap();
-        let (_, ev) = wait(&Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
         assert!(!m.contains("SECRETUSER") && !m.contains("SECRETPASS"), "{m}");
         assert!(!hit.load(Ordering::SeqCst), "redirect target was contacted");
@@ -654,8 +694,96 @@ mod tests {
             let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {ok}/b.m3u\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
         let d = tempfile::tempdir().unwrap();
-        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+    }
+
+    /// Like the real provider: HTTP 454 when the request has no User-Agent,
+    /// else 200 with the playlist. Records every User-Agent it sees.
+    fn ua_server(seen: Arc<Mutex<Vec<String>>>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).unwrap_or(0);
+                let req = String::from_utf8_lossy(&b[..n]).into_owned();
+                let ua = req
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
+                    .map(|(_, v)| v.trim().to_string());
+                match ua {
+                    Some(ua) => {
+                        seen.lock().unwrap().push(ua);
+                        let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", M3U.len(), M3U);
+                    }
+                    None => {
+                        let _ = s.write_all(b"HTTP/1.1 454 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn ua_server_rejects_requests_without_user_agent() {
+        // The old behaviour (no User-Agent header) is what the provider blocks.
+        let base = ua_server(Arc::new(Mutex::new(vec![])));
+        let addr = base.trim_start_matches("http://");
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET /a.m3u HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 454"), "{resp}");
+    }
+
+    #[test]
+    fn download_sends_default_user_agent() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let base = ua_server(seen.clone());
+        let d = tempfile::tempdir().unwrap();
+        download(&format!("{base}/USER/PASS/a.m3u"), &d.path().join("p.m3u")).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![DEFAULT_USER_AGENT.to_string()]);
+    }
+
+    #[test]
+    fn refresher_sends_configured_user_agent_also_after_redirect() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let target = ua_server(seen.clone());
+        let base = raw_server(move |s| {
+            let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {target}/b.m3u\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let d = tempfile::tempdir().unwrap();
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), "Custom/1.0"));
+        assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+        assert_eq!(*seen.lock().unwrap(), vec!["Custom/1.0".to_string()]);
+        // Blank falls back to the default.
+        let d = tempfile::tempdir().unwrap();
+        let (_, ev) = wait(&Refresher::spawn_forced(format!("{base}/a.m3u"), d.path().to_path_buf(), "  "));
+        assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
+        assert_eq!(seen.lock().unwrap().last().unwrap(), DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn unknown_status_hints_at_user_agent() {
+        let base = raw_server(|s| {
+            let _ = s.write_all(b"HTTP/1.1 454 \r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let d = tempfile::tempdir().unwrap();
+        let url = format!("{base}/SECRETUSER/SECRETPASS/a.m3u");
+        let (_, ev) = wait(&Refresher::spawn(url, d.path().to_path_buf(), DEFAULT_USER_AGENT));
+        let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
+        assert_eq!(m, "server returned HTTP 454 (blocked? check user_agent in config.toml)");
+        // Known statuses keep their reason and get no hint.
+        let base = raw_server(|s| {
+            let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let d = tempfile::tempdir().unwrap();
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/SECRETUSER/SECRETPASS/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
+        let RefreshEvent::Failed(m) = ev else { panic!("{ev:?}") };
+        assert_eq!(m, "server returned HTTP 404 Not Found");
     }
 
     #[test]
@@ -667,7 +795,7 @@ mod tests {
         std::fs::write(c.join("playlist.m3u.tmp.1.2.part"), b"x").unwrap();
         std::fs::write(c.join("keep.txt"), b"x").unwrap();
         let base = ok_server(M3U);
-        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf()));
+        let (_, ev) = wait(&Refresher::spawn(format!("{base}/a.m3u"), d.path().to_path_buf(), DEFAULT_USER_AGENT));
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
         assert!(!c.join("playlist.m3u.tmp").exists() && !c.join("playlist.m3u.tmp.1.2.part").exists());
         assert!(c.join("keep.txt").exists());

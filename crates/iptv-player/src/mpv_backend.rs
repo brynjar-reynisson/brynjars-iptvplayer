@@ -742,9 +742,30 @@ impl EventMapper {
     }
 }
 
+/// All options set before `mpv_initialize` (pure, unit-tested): the base
+/// set, the video/audio outputs and the HTTP `user-agent` (blank =
+/// `iptv::config::DEFAULT_USER_AGENT`), which mpv's libcurl and lavf http
+/// backends send on every stream request.
+pub fn init_options(headless: bool, user_agent: &str) -> Vec<(String, String)> {
+    let mut o: Vec<(String, String)> = BASE_OPTIONS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    if headless {
+        o.push(("vo".into(), "null".into()));
+        o.push(("ao".into(), "null".into()));
+    } else {
+        o.push(("vo".into(), "libmpv".into()));
+    }
+    let ua = user_agent.trim();
+    let ua = if ua.is_empty() { iptv::config::DEFAULT_USER_AGENT } else { ua };
+    o.push(("user-agent".into(), ua.into()));
+    o
+}
+
 /// Construction options.
 #[derive(Default)]
 pub struct MpvOptions {
+    /// HTTP User-Agent for stream requests (blank = the default, see
+    /// [`init_options`]). Same value as the playlist download uses.
+    pub user_agent: String,
     /// `Some` = render in-app via the OpenGL render API (`vo=libmpv`);
     /// `None` = headless (`vo=null`, `ao=null`; tests and demos).
     pub gl: Option<GlInit>,
@@ -793,14 +814,8 @@ impl MpvBackend {
         }
         let core = Arc::new(Core { handle, wakeup: Mutex::new(ptr::null_mut()) });
         let headless = opts.gl.is_none();
-        let mut options: Vec<(&str, &str)> = BASE_OPTIONS.to_vec();
-        if headless {
-            options.extend([("vo", "null"), ("ao", "null")]);
-        } else {
-            options.push(("vo", "libmpv"));
-        }
-        for (k, v) in options {
-            let (ck, cv) = (cstr(k)?, cstr(v)?);
+        for (k, v) in init_options(headless, &opts.user_agent) {
+            let (ck, cv) = (cstr(&k)?, cstr(&v)?);
             let r = unsafe { sys::mpv_set_option_string(handle, ck.as_ptr(), cv.as_ptr()) };
             if r < 0 {
                 bail!("mpv option {k}={v}: {}", mpv_err(r));
@@ -1542,6 +1557,18 @@ mod tests {
         ] {
             assert_eq!(map_end_file(EndReason::Error, text), Some(PlayerEvent::Error(Auth)), "{text}");
         }
+    }
+
+    #[test]
+    fn init_options_carry_user_agent() {
+        let get = |opts: &[(String, String)], k: &str| opts.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        let o = init_options(true, "");
+        assert_eq!(get(&o, "user-agent").as_deref(), Some(iptv::config::DEFAULT_USER_AGENT));
+        assert_eq!(get(&o, "vo").as_deref(), Some("null"));
+        let o = init_options(false, " Custom/1.0 ");
+        assert_eq!(get(&o, "user-agent").as_deref(), Some("Custom/1.0"));
+        assert_eq!(get(&o, "vo").as_deref(), Some("libmpv"));
+        assert_eq!(get(&o, "ytdl").as_deref(), Some("no"));
     }
 
     #[test]

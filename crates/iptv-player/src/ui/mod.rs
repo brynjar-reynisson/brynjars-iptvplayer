@@ -73,6 +73,12 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
+/// User-Agent for playlist and stream requests: `user_agent` from
+/// `config.toml` if it loads, else the default (also with `--playlist-file`).
+fn configured_user_agent(data_dir: &std::path::Path) -> String {
+    iptv::config::load(data_dir).map_or_else(|_| iptv::config::DEFAULT_USER_AGENT.to_string(), |c| c.user_agent)
+}
+
 /// Where the playlist comes from: `--playlist-file`, else `config.toml`.
 fn resolve_source(data_dir: &std::path::Path, file: &Option<PathBuf>) -> (Option<Source>, SourceStatus) {
     if let Some(f) = file {
@@ -93,6 +99,8 @@ struct App {
     data_dir: PathBuf,
     playlist_file: Option<PathBuf>,
     source: Option<Source>,
+    /// User-Agent for playlist downloads (the player got it at startup).
+    user_agent: String,
     data: DataState,
     cache_rx: Option<Receiver<CacheResult>>,
     refresher: Option<Refresher>,
@@ -141,8 +149,9 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
+        let user_agent = configured_user_agent(&opts.data_dir);
         let (data, actions) = DataState::new(status);
-        let player = Player::new(cc).map_err(|e| safe_text(&format!("{e:#}")));
+        let player = Player::new(cc, &user_agent).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
             eprintln!("player unavailable: {e}");
         }
@@ -156,6 +165,7 @@ impl App {
             data_dir: opts.data_dir,
             playlist_file: opts.playlist_file,
             source,
+            user_agent,
             data,
             cache_rx: None,
             refresher: None,
@@ -216,7 +226,10 @@ impl App {
                 Action::StartRefresh { force } => {
                     if let Some(src) = &self.source {
                         self.refresher =
-                            Some(Refresher::spawn_source(src.clone(), self.data_dir.clone(), RefreshOptions { force }));
+                            Some(Refresher::spawn_source(src.clone(), self.data_dir.clone(), RefreshOptions {
+                                force,
+                                user_agent: self.user_agent.clone(),
+                            }));
                     }
                 }
             }
@@ -230,6 +243,9 @@ impl App {
             self.source = source;
             self.data.set_source(status);
         }
+        // Picks up a `user_agent` edited in config.toml since startup
+        // (streams keep the startup value until restart).
+        self.user_agent = configured_user_agent(&self.data_dir);
         let a = self.data.request_refresh(force);
         self.run_actions(a);
     }
