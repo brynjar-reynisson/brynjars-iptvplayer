@@ -7,11 +7,11 @@
 //! overwrite a newer one (or one made against a swapped library).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use iptv::library::{Library, SearchScope};
+use iptv::library::{normalize, Library, SearchScope};
 use iptv::playlist::favorite_key;
 use iptv::series::UNSORTED;
 
@@ -44,22 +44,121 @@ fn show_visible(lib: &Library, show: usize, hidden: &HashSet<String>) -> bool {
 
 /// Shows matching `query` (indices into `Library::shows`) that have at least
 /// one episode in a visible group; at most `limit`.
+/// Also lists `(Unsorted)` when one of its episodes matches by its own name
+/// (those have no show name of their own); that hit is never cut by `limit`.
 pub fn search_shows(lib: &Library, query: &str, hidden: &HashSet<String>, limit: usize) -> Vec<usize> {
     let shows = lib.search(SearchScope::Series, query, if hidden.is_empty() { limit } else { usize::MAX });
-    shows.into_iter().filter_map(|h| h.show).filter(|&s| show_visible(lib, s, hidden)).take(limit).collect()
+    let mut v: Vec<usize> =
+        shows.into_iter().filter_map(|h| h.show).filter(|&s| show_visible(lib, s, hidden)).take(limit).collect();
+    if let Some(u) = unsorted_show(lib) {
+        if limit > 0 && !v.contains(&u) && unsorted_matching(lib, u, query, hidden).next().is_some() {
+            v.truncate(limit - 1);
+            v.push(u);
+        }
+    }
+    v
 }
 
-/// Movie and series group titles with their entry counts, sorted by title
-/// (the group filter's choices).
-pub fn vod_groups(lib: &Library) -> Vec<(String, usize)> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    let episodes = lib.shows().iter().flat_map(|s| &s.seasons).flat_map(|s| &s.episodes);
-    for &e in lib.movies().iter().chain(episodes) {
-        *counts.entry(lib.entry(e).group.as_str()).or_default() += 1;
+fn unsorted_show(lib: &Library) -> Option<usize> {
+    lib.shows().iter().rposition(|s| s.name == UNSORTED)
+}
+
+/// Visible episodes of show `u` whose normalised name contains every term.
+fn unsorted_matching<'a>(
+    lib: &'a Library,
+    u: usize,
+    query: &str,
+    hidden: &'a HashSet<String>,
+) -> impl Iterator<Item = usize> + 'a {
+    let q = normalize(query);
+    let terms: Vec<String> = q.split_whitespace().map(str::to_string).collect();
+    lib.shows()[u].seasons.iter().flat_map(|s| s.episodes.iter().copied()).filter(move |&e| {
+        let en = lib.entry(e);
+        !terms.is_empty() && !hidden.contains(&en.group) && {
+            let name = normalize(&en.name);
+            terms.iter().all(|t| name.contains(t.as_str()))
+        }
+    })
+}
+
+/// Episodes of the `(Unsorted)` show (unparsed names) whose own name matches
+/// every term of `query`, in visible groups.
+pub fn unsorted_matches(lib: &Library, query: &str, hidden: &HashSet<String>) -> Vec<usize> {
+    unsorted_show(lib).map(|u| unsorted_matching(lib, u, query, hidden).collect()).unwrap_or_default()
+}
+
+/// A movie/series group title with its movie and episode counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VodGroup {
+    pub name: String,
+    pub movies: usize,
+    pub episodes: usize,
+}
+
+/// Movie and series groups with their counts, sorted by title (the group
+/// filter's choices).
+pub fn vod_groups(lib: &Library) -> Vec<VodGroup> {
+    let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    for &e in lib.movies() {
+        counts.entry(lib.entry(e).group.as_str()).or_default().0 += 1;
     }
-    let mut v: Vec<(String, usize)> = counts.into_iter().map(|(g, n)| (g.to_string(), n)).collect();
-    v.sort();
+    for &e in lib.shows().iter().flat_map(|s| &s.seasons).flat_map(|s| &s.episodes) {
+        counts.entry(lib.entry(e).group.as_str()).or_default().1 += 1;
+    }
+    let mut v: Vec<VodGroup> =
+        counts.into_iter().map(|(g, (movies, episodes))| VodGroup { name: g.to_string(), movies, episodes }).collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+/// One line of the Groups menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupChoice {
+    pub name: String,
+    /// Movies + episodes in the current playlist.
+    pub count: usize,
+    /// False for a hidden group that is no longer in the playlist (still
+    /// listed so it can be unhidden).
+    pub present: bool,
+    pub hidden: bool,
+}
+
+/// The Groups menu lines: every playlist group plus hidden groups that left
+/// the playlist, sorted by title.
+pub fn group_choices(groups: &[VodGroup], hidden: &HashSet<String>) -> Vec<GroupChoice> {
+    let mut v: Vec<GroupChoice> = groups
+        .iter()
+        .map(|g| GroupChoice {
+            name: g.name.clone(),
+            count: g.movies + g.episodes,
+            present: true,
+            hidden: hidden.contains(&g.name),
+        })
+        .collect();
+    let present: HashSet<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+    for h in hidden.iter().filter(|h| !present.contains(h.as_str())) {
+        v.push(GroupChoice { name: h.clone(), count: 0, present: false, hidden: true });
+    }
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+/// Choices whose title contains every term of `filter` (same rules as search).
+pub fn filter_choices<'a>(choices: &'a [GroupChoice], filter: &str) -> Vec<&'a GroupChoice> {
+    let f = normalize(filter);
+    let terms: Vec<&str> = f.split_whitespace().collect();
+    choices
+        .iter()
+        .filter(|c| {
+            let n = normalize(&c.name);
+            terms.iter().all(|t| n.contains(t))
+        })
+        .collect()
+}
+
+/// (movies, episodes) in groups that are not hidden.
+pub fn visible_counts(groups: &[VodGroup], hidden: &HashSet<String>) -> (usize, usize) {
+    groups.iter().filter(|g| !hidden.contains(&g.name)).fold((0, 0), |(m, e), g| (m + g.movies, e + g.episodes))
 }
 
 /// One row of an opened show.
@@ -139,6 +238,15 @@ pub struct SearchWorker {
 impl SearchWorker {
     /// `wake` is called after each result (e.g. request an egui repaint).
     pub fn spawn(wake: impl Fn() + Send + 'static) -> SearchWorker {
+        Self::spawn_with(run_search, wake)
+    }
+
+    /// [`SearchWorker::spawn`] with an injectable search function (tests).
+    pub fn spawn_with(
+        run: impl Fn(&SearchRequest) -> SearchResult + Send + 'static,
+        wake: impl Fn() + Send + 'static,
+    ) -> SearchWorker {
+        let run_search = run;
         let (tx, req_rx) = channel::<SearchRequest>();
         let (res_tx, rx) = channel();
         std::thread::Builder::new()
@@ -163,15 +271,22 @@ impl SearchWorker {
         SearchWorker { tx: Some(tx), rx }
     }
 
-    pub fn submit(&self, req: SearchRequest) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(req);
-        }
+    /// Queue a search; false if the worker thread is gone (respawn it).
+    pub fn submit(&self, req: SearchRequest) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(req).is_ok())
     }
 
-    /// Results that arrived since the last poll.
-    pub fn poll(&self) -> Vec<SearchResult> {
-        self.rx.try_iter().collect()
+    /// Results that arrived since the last poll, and whether the worker
+    /// thread has died (it then never answers again: respawn it).
+    pub fn poll(&self) -> (Vec<SearchResult>, bool) {
+        let mut out = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(r) => out.push(r),
+                Err(TryRecvError::Empty) => return (out, false),
+                Err(TryRecvError::Disconnected) => return (out, true),
+            }
+        }
     }
 }
 
@@ -253,6 +368,13 @@ impl SearchList {
             query: self.query.clone(),
             hidden: hidden.clone(),
         })
+    }
+
+    /// The search can no longer be answered (worker died): stop showing
+    /// "Searching…" and ignore any late answer.
+    pub fn abort(&mut self) {
+        self.gen += 1;
+        self.searching = false;
     }
 
     /// Adopt a result if it answers the latest request. `lib` is the library
@@ -381,7 +503,14 @@ impl SeriesBrowser {
     pub fn open_selected(&mut self, lib: &Library, hidden: &HashSet<String>) -> bool {
         match self.search.list().current() {
             Some(s) if s < lib.shows().len() => {
-                self.open = Some(OpenShow::new(lib, s, hidden));
+                let mut o = OpenShow::new(lib, s, hidden);
+                if lib.shows()[s].name == UNSORTED {
+                    // Found by an episode's own title: start on that episode.
+                    if let Some(e) = unsorted_matching(lib, s, self.search.query(), hidden).next() {
+                        o.select_entry(e);
+                    }
+                }
+                self.open = Some(o);
                 true
             }
             _ => false,
@@ -492,15 +621,112 @@ pub(crate) mod tests {
     #[test]
     fn groups_list_counts_vod_only() {
         let lib = vod_lib();
+        let g = |name: &str, movies, episodes| VodGroup { name: name.into(), movies, episodes };
         assert_eq!(
             vod_groups(&lib),
             vec![
-                ("Movies: Faroe".to_string(), 1),
-                ("Movies: Testland".to_string(), 2),
-                ("Series: Faroe".to_string(), 2),
-                ("Series: Testland".to_string(), 3),
+                g("Movies: Faroe", 1, 0),
+                g("Movies: Testland", 2, 0),
+                g("Series: Faroe", 0, 2),
+                g("Series: Testland", 0, 3),
             ]
         );
+    }
+
+    #[test]
+    fn group_choices_keep_hidden_groups_that_left_the_playlist() {
+        let groups = vod_groups(&vod_lib());
+        let c = group_choices(&groups, &hide(&["Movies: Gone", "Movies: Faroe"]));
+        let names: Vec<&str> = c.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Movies: Faroe", "Movies: Gone", "Movies: Testland", "Series: Faroe", "Series: Testland"]);
+        assert_eq!(c[0], GroupChoice { name: "Movies: Faroe".into(), count: 1, present: true, hidden: true });
+        assert_eq!(c[1], GroupChoice { name: "Movies: Gone".into(), count: 0, present: false, hidden: true });
+        assert_eq!(c[4], GroupChoice { name: "Series: Testland".into(), count: 3, present: true, hidden: false });
+    }
+
+    #[test]
+    fn group_menu_filter_and_visible_counts() {
+        let groups = vod_groups(&vod_lib());
+        let c = group_choices(&groups, &none());
+        let names = |f: &str| filter_choices(&c, f).iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names("faroe"), ["Movies: Faroe", "Series: Faroe"]);
+        assert_eq!(names("SERIES test"), ["Series: Testland"]);
+        assert_eq!(names("").len(), 4);
+        assert!(names("zzz").is_empty());
+        assert_eq!(visible_counts(&groups, &none()), (3, 5));
+        assert_eq!(visible_counts(&groups, &hide(&["Movies: Testland", "Series: Faroe"])), (1, 3));
+        // Every movie group hidden: nothing left to search ("All groups hidden").
+        assert_eq!(visible_counts(&groups, &hide(&["Movies: Testland", "Movies: Faroe"])).0, 0);
+    }
+
+    /// Unparsed series entries (they land in `(Unsorted)`), invented titles.
+    fn unsorted_lib() -> Library {
+        use Kind::Series;
+        Library::build(vec![
+            vod(Series, "1", "Quiet Harbor S01E01", "Series: Testland"),     // 0
+            vod(Series, "2", "Odd Lantern Special", "Series: Testland"),     // 1 (Unsorted)
+            vod(Series, "3", "F\u{ea}te de la Lanterne", "Series: Faroe"),   // 2 (Unsorted)
+            vod(Series, "4", "Lantern Keepers S01E01", "Series: Faroe"),     // 3
+        ])
+    }
+
+    #[test]
+    fn unsorted_episodes_are_found_by_their_own_title() {
+        let lib = unsorted_lib();
+        assert_eq!(unsorted_matches(&lib, "odd lantern", &none()), vec![1]);
+        assert_eq!(unsorted_matches(&lib, "FETE", &none()), vec![2], "diacritic-insensitive");
+        assert!(unsorted_matches(&lib, "", &none()).is_empty());
+        assert_eq!(shown(&lib, &search_shows(&lib, "odd lantern", &none(), 500)), [UNSORTED]);
+        assert_eq!(shown(&lib, &search_shows(&lib, "f\u{ea}te", &none(), 500)), [UNSORTED]);
+        assert_eq!(shown(&lib, &search_shows(&lib, "lantern", &none(), 500)), ["Lantern Keepers", UNSORTED]);
+        assert_eq!(shown(&lib, &search_shows(&lib, "unsorted", &none(), 500)), [UNSORTED], "keyword still works");
+        // Hidden groups: the Testland one is gone, the Faroe one still matches.
+        let h = hide(&["Series: Testland"]);
+        assert!(search_shows(&lib, "odd lantern", &h, 500).is_empty());
+        assert_eq!(unsorted_matches(&lib, "lantern", &h), vec![2]);
+        assert_eq!(shown(&lib, &search_shows(&lib, "lantern", &h, 500)), ["Lantern Keepers", UNSORTED]);
+        // The limit never cuts the (Unsorted) hit.
+        assert_eq!(shown(&lib, &search_shows(&lib, "lantern", &none(), 1)), [UNSORTED]);
+    }
+
+    #[test]
+    fn opening_unsorted_from_a_query_selects_the_matching_episode() {
+        let lib = arc(unsorted_lib());
+        let h: Hidden = Arc::new(none());
+        let mut s = SeriesBrowser::default();
+        let r = s.search.set_query(&lib, &h, "fete").unwrap();
+        s.search.on_result(&lib, run_search(&r));
+        s.search.list_mut().set_cursor(0);
+        assert!(s.open_selected(&lib, &h));
+        assert_eq!(s.open().unwrap().name, UNSORTED);
+        assert_eq!(s.open().unwrap().current(), Some(2), "positioned on the matching episode");
+        s.back();
+        let r = s.search.set_query(&lib, &h, "unsorted").unwrap();
+        s.search.on_result(&lib, run_search(&r));
+        s.search.list_mut().set_cursor(0);
+        s.open_selected(&lib, &h);
+        assert_eq!(s.open().unwrap().current(), Some(1), "keyword: first episode");
+    }
+
+    #[test]
+    fn a_dead_worker_is_detected_and_the_search_stops() {
+        let w = SearchWorker::spawn_with(|_| panic!("search failed (test)"), || {});
+        let lib = arc(vod_lib());
+        let h: Hidden = Arc::new(none());
+        let mut m = SearchList::new(SearchScope::Movies);
+        assert!(w.submit(m.set_query(&lib, &h, "lantern").unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut dead = false;
+        while !dead && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            dead = w.poll().1;
+        }
+        assert!(dead, "a disconnected worker is reported");
+        assert!(!w.submit(m.set_query(&lib, &h, "lan").unwrap()), "submit fails once the thread is gone");
+        let late = run_search(&m.set_query(&lib, &h, "lantern").unwrap());
+        m.abort();
+        assert!(!m.searching(), "no endless 'Searching…'");
+        assert!(!m.on_result(&lib, late), "answers to aborted requests are ignored");
     }
 
     fn show_named(lib: &Library, name: &str) -> usize {
@@ -666,7 +892,7 @@ pub(crate) mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while m.searching() && Instant::now() < deadline {
             let _ = wrx.recv_timeout(Duration::from_millis(100));
-            for r in w.poll() {
+            for r in w.poll().0 {
                 adopted += m.on_result(&lib, r) as usize;
             }
         }
@@ -731,7 +957,7 @@ pub(crate) mod tests {
         let t = Instant::now();
         let groups = vod_groups(&lib);
         println!("vod_groups: {:?} ({} groups)", t.elapsed(), groups.len());
-        let hidden: HashSet<String> = groups.iter().step_by(3).map(|(g, _)| g.clone()).collect();
+        let hidden: HashSet<String> = groups.iter().step_by(3).map(|g| g.name.clone()).collect();
         let qs = [
             "a", "e", "l", "la", "lan", "lant", "lantern", "s", "st", "sto", "storm", "chateau", "f\u{e5}g", "fag",
             "mork", "quiet harbor", "silver night river", "zzz", "19", "ember salt", "o", "r", "i", "n",

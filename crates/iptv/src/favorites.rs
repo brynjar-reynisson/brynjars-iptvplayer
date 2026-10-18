@@ -38,18 +38,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// First unused of `favorites.json.bad`, `.bad.1`, `.bad.2`, ... (never overwrites a backup).
-fn backup_path(dir: &Path) -> PathBuf {
-    let first = dir.join("favorites.json.bad");
-    if !first.exists() {
-        return first;
-    }
-    (1u64..)
-        .map(|n| dir.join(format!("favorites.json.bad.{n}")))
-        .find(|p| !p.exists())
-        .unwrap()
-}
-
 enum Parsed {
     Items(Vec<FavoriteItem>),
     Unreadable,
@@ -106,7 +94,8 @@ impl Favorites {
             },
         };
         if unreadable {
-            let bad = backup_path(dir);
+            // First unused favorites.json.bad[.N] (never overwrites a backup).
+            let bad = crate::fsutil::backup_path(&path);
             if let Err(e) = mover(&path, &bad) {
                 fav.blocked = Some(format!(
                     "{} is unreadable and could not be moved aside ({e}); refusing to overwrite it",

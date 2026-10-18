@@ -30,7 +30,9 @@ use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
-use crate::state::vod::{vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser};
+use crate::state::vod::{
+    visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
+};
 use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::{format_bytes, safe_text, Tab};
 use live::{ListView, RowAction};
@@ -121,8 +123,10 @@ struct App {
     search: SearchWorker,
     /// Movie/series group titles + counts for the filter menu (computed off
     /// the UI thread per library: ~30 ms on 250k entries).
-    groups: Option<Vec<(String, usize)>>,
-    groups_rx: Option<Receiver<Vec<(String, usize)>>>,
+    groups: Option<Vec<VodGroup>>,
+    groups_rx: Option<Receiver<Vec<VodGroup>>>,
+    /// Filter text of the Groups menu.
+    group_filter: String,
     /// Focus the Movies/Series search box on the next frame.
     focus_search: bool,
     last_tab: Tab,
@@ -178,6 +182,7 @@ impl App {
             search,
             groups: None,
             groups_rx: None,
+            group_filter: String::new(),
             focus_search: false,
             last_tab: Tab::Live,
             movie_view: ListView::default(),
@@ -273,27 +278,47 @@ impl App {
         }
         // Search answers: only the latest request of each list is adopted,
         // and that request was made against the shown library.
-        let results = self.search.poll();
+        let (results, dead) = self.search.poll();
         if let Some(lib) = self.shown_lib.clone() {
             for r in results {
                 if r.took > Duration::from_millis(16) {
                     eprintln!("search took {} ms", r.took.as_millis());
                 }
+                // Only scroll the list that is on screen (the scroll target is shared).
+                let visible = match r.scope {
+                    SearchScope::Series => self.tab == Tab::Series && self.series.open().is_none(),
+                    _ => self.tab == Tab::Movies,
+                };
                 let adopted = match r.scope {
                     SearchScope::Series => self.series.search.on_result(&lib, r),
                     _ => self.movies.on_result(&lib, r),
                 };
-                if adopted {
+                if adopted && visible {
                     self.scroll_to = Some(self.vod_cursor().unwrap_or(0));
                 }
             }
         }
+        if dead {
+            self.restart_search();
+        }
     }
 
-    fn submit(&self, req: Option<SearchRequest>) {
+    fn submit(&mut self, req: Option<SearchRequest>) {
         if let Some(r) = req {
-            self.search.submit(r);
+            if !self.search.submit(r) {
+                self.restart_search();
+            }
         }
+    }
+
+    /// The search thread died: stop "Searching…", say so, start a new one.
+    fn restart_search(&mut self) {
+        eprintln!("search worker stopped; restarting it");
+        self.movies.abort();
+        self.series.search.abort();
+        let wake = self.ctx.clone();
+        self.search = SearchWorker::spawn(move || wake.request_repaint());
+        self.message = Some("Search stopped unexpectedly and was restarted: edit the query to search again.".into());
     }
 
     /// Cursor row of the visible Movies/Series list.
@@ -396,8 +421,8 @@ impl App {
         self.zap.pending().filter(|p| p.same_library(lib)).and_then(Playback::entry_index).or(self.playing_entry())
     }
 
-    /// VOD reached its natural end: stop (no autoplay) and return to the
-    /// list it was started from, with it selected.
+    /// VOD reached its natural end: stop (no autoplay) and leave the list it
+    /// was started from with it selected. The visible tab is not changed.
     fn on_finished(&mut self) {
         let Some(pb) = self.playback.take() else { return };
         if pb.is_live() {
@@ -406,7 +431,6 @@ impl App {
         }
         self.stop();
         self.message = Some(format!("Finished: {}", pb.name()));
-        self.tab = pb.tab;
         let e = pb.entry_index().filter(|_| self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)));
         if let Some(e) = e {
             match pb.tab {
@@ -421,8 +445,9 @@ impl App {
                 _ => {}
             }
         }
-        self.last_tab = self.tab; // keep the list focused, not the search box
-        self.scroll_to = self.vod_cursor();
+        if pb.tab == self.tab {
+            self.scroll_to = self.vod_cursor();
+        }
     }
 
     /// The Up/Down list of the visible tab.
@@ -551,11 +576,15 @@ impl App {
         }
     }
 
-    /// Group filter toggled: persist, then re-run both searches.
-    fn set_group_hidden(&mut self, group: &str, hidden: bool) {
-        self.settings.set_hidden(group, hidden);
+    /// Groups hidden/shown: persist (reverted on a save error), then re-run
+    /// both searches.
+    fn set_groups_hidden(&mut self, groups: &[String], hidden: bool) {
+        let before = self.settings.hidden_groups.clone();
+        for g in groups {
+            self.settings.set_hidden(g, hidden);
+        }
         if let Err(e) = self.settings.save() {
-            self.settings.set_hidden(group, !hidden);
+            self.settings.hidden_groups = before;
             self.message = Some(safe_text(&format!("Could not save settings: {e:#}")));
             return;
         }
@@ -877,6 +906,8 @@ impl App {
         let Some(lib) = self.shown_lib.clone() else { return };
         let playing = self.playing_entry();
         let scroll_to = self.scroll_to.take();
+        // Movies / episodes in groups that are not hidden (None while the group list is computed).
+        let vis = self.groups.as_deref().map(|g| visible_counts(g, &self.hidden));
         match self.tab {
             Tab::Live => {
                 egui::Panel::left("countries").resizable(true).default_size(190.0).show(ui, |ui| {
@@ -946,14 +977,16 @@ impl App {
                     let focus = std::mem::take(&mut self.focus_search);
                     let mut toggled = None;
                     vod::search_row(ui, |ui| {
-                        toggled = vod::group_menu(ui, self.groups.as_deref(), &self.hidden);
+                        toggled = vod::group_menu(ui, self.groups.as_deref(), &self.hidden, &mut self.group_filter);
                         let hint = "Search movies (Ctrl+F)";
                         if let Some(t) = vod::search_box(ui, vod::movie_search_id(), self.movies.query(), hint, focus) {
                             self.set_vod_query(Tab::Movies, t);
                         }
                     });
                     let n = self.movies.list().len();
-                    vod::result_note(ui, self.movies.query(), self.movies.searching(), n, "movies", lib.movies().len());
+                    let hint = format!("Type to search {} movies.", vis.map_or(lib.movies().len(), |v| v.0));
+                    let all_hidden = vis.is_some_and(|v| v.0 == 0) && !lib.movies().is_empty();
+                    vod::result_note(ui, self.movies.query(), self.movies.searching(), n, &hint, all_hidden);
                     let a = vod::movies(
                         ui,
                         &lib,
@@ -973,8 +1006,8 @@ impl App {
                             self.view = View::Player;
                         }
                     }
-                    if let Some((g, h)) = toggled {
-                        self.set_group_hidden(&g, h);
+                    if let Some(vod::GroupAction::Set(g, h)) = toggled {
+                        self.set_groups_hidden(&g, h);
                     }
                 });
             }
@@ -1005,7 +1038,7 @@ impl App {
                         let focus = std::mem::take(&mut self.focus_search);
                         let mut toggled = None;
                         vod::search_row(ui, |ui| {
-                            toggled = vod::group_menu(ui, self.groups.as_deref(), &self.hidden);
+                            toggled = vod::group_menu(ui, self.groups.as_deref(), &self.hidden, &mut self.group_filter);
                             let q = self.series.search.query().to_string();
                             let hint = "Search series (Ctrl+F)";
                             if let Some(t) = vod::search_box(ui, vod::series_search_id(), &q, hint, focus) {
@@ -1013,7 +1046,12 @@ impl App {
                             }
                         });
                         let s = &self.series.search;
-                        vod::result_note(ui, s.query(), s.searching(), s.list().len(), "shows", lib.shows().len());
+                        let hint = match vis {
+                            Some(v) => format!("Type to search series ({} episodes).", v.1),
+                            None => format!("Type to search {} shows.", lib.shows().len()),
+                        };
+                        let all_hidden = vis.is_some_and(|v| v.1 == 0) && !lib.shows().is_empty();
+                        vod::result_note(ui, s.query(), s.searching(), s.list().len(), &hint, all_hidden);
                         let a = vod::shows(ui, &lib, self.series.search.list(), &mut self.show_view, scroll_to);
                         if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
                             self.series.search.list_mut().set_cursor(i);
@@ -1021,8 +1059,8 @@ impl App {
                                 self.scroll_to = self.vod_cursor();
                             }
                         }
-                        if let Some((g, h)) = toggled {
-                            self.set_group_hidden(&g, h);
+                        if let Some(vod::GroupAction::Set(g, h)) = toggled {
+                            self.set_groups_hidden(&g, h);
                         }
                     }
                 });
