@@ -932,7 +932,9 @@ impl App {
                     if r.double_clicked() {
                         self.view = if self.view == View::Player { View::Browse } else { View::Player };
                     }
-                    r.on_hover_text("Double-click: full view");
+                    if self.view != View::Player {
+                        r.on_hover_text("Double-click: full view");
+                    }
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
                     let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
