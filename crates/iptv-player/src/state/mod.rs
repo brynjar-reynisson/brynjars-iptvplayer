@@ -11,7 +11,7 @@ pub mod zap;
 
 use std::time::Duration;
 
-use iptv::supervisor::Status;
+use iptv::supervisor::{RetryKind, Status};
 
 /// Top-level tabs. Movies/Series are filled in by Task 12.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +42,12 @@ pub fn status_text(s: Status, retry_in: Option<Duration>) -> String {
         Status::Idle => String::new(),
         Status::Playing => String::new(),
         Status::Buffering => "Buffering…".into(),
-        Status::Reconnecting { attempt, auth: false } => format!("Reconnecting… (attempt {attempt}){wait}"),
-        Status::Reconnecting { attempt, auth: true } => {
+        Status::Reconnecting { attempt, kind: RetryKind::Network } => format!("Reconnecting… (attempt {attempt}){wait}"),
+        Status::Reconnecting { attempt, kind: RetryKind::Auth } => {
             format!("Account rejected or too many connections — retrying (attempt {attempt}){wait}")
+        }
+        Status::Reconnecting { attempt, kind: RetryKind::Unavailable } => {
+            format!("Channel unavailable (off-air?) — retrying (attempt {attempt}){wait}")
         }
         Status::Finished => "Finished".into(),
     }
@@ -74,10 +77,14 @@ mod tests {
     fn status_texts() {
         assert_eq!(status_text(Status::Playing, None), "");
         assert_eq!(
-            status_text(Status::Reconnecting { attempt: 3, auth: false }, Some(Duration::from_millis(1500))),
+            status_text(Status::Reconnecting { attempt: 3, kind: RetryKind::Network }, Some(Duration::from_millis(1500))),
             "Reconnecting… (attempt 3) (next try in 1.5 s)"
         );
-        assert!(status_text(Status::Reconnecting { attempt: 1, auth: true }, None).starts_with("Account rejected"));
+        assert!(status_text(Status::Reconnecting { attempt: 1, kind: RetryKind::Auth }, None).starts_with("Account rejected"));
+        assert_eq!(
+            status_text(Status::Reconnecting { attempt: 2, kind: RetryKind::Unavailable }, Some(Duration::from_secs(6))),
+            "Channel unavailable (off-air?) — retrying (attempt 2) (next try in 6.0 s)"
+        );
     }
 
     #[test]

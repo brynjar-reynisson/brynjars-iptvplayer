@@ -22,9 +22,13 @@
 //! Network/other failures: 0.5 s, 1 s, 2 s, then 3 s forever.
 //! Auth failures (401/403/458/459, "too many connections", "unauthorized"):
 //! 3 s, 6 s, 12 s, then 15 s forever — never faster than the network cap.
+//! Unavailable channels (404/407/410, ffmpeg's generic "4XX Client Error";
+//! e.g. an off-air event channel answering 407): 3 s, 6 s, then 10 s
+//! forever, so the channel is picked up when it goes live without hammering
+//! the provider.
 //! The attempt counter (saturating) resets after `Started` followed by
 //! [`STABLE_RESET`] of uninterrupted playing (no buffering). One counter
-//! serves both tables, so network failures followed by an auth failure jump
+//! serves all tables, so network failures followed by an auth failure jump
 //! straight to the auth delay for that attempt number.
 //!
 //! # Watchdogs
@@ -55,37 +59,52 @@ pub trait Backend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     Network,
+    /// Account rejected or connection limit reached.
     Auth,
+    /// The server answered but has nothing to play right now (HTTP 404/407/
+    /// 410 or another unlisted 4xx): typically an off-air event channel.
+    Unavailable,
     Other,
 }
 
 impl ErrorClass {
     /// Classify a player/HTTP error message (case-insensitive).
     ///
-    /// Auth covers account rejection and connection-limit wordings, including
-    /// ffmpeg's catch-all "Server returned 4XX Client Error, but not one of
-    /// 40{0,1,3,4}" (how 458/459 connection-limit replies surface). Auth is
-    /// checked first; plain 404/"not found", timeouts, refused connections,
-    /// DNS and TLS failures are Network. Note "too many" is deliberately broad.
+    /// Auth (checked first) is only the whole-token statuses 401/403/458/459
+    /// and account / connection-limit wordings. Unavailable is 404/407/410,
+    /// "not found" (except host lookups) and ffmpeg's catch-all "Server
+    /// returned 4XX Client Error, but not one of 40{0,1,3,4}" (how lavf words
+    /// e.g. a 407; mpv's libcurl backend reports the code itself). Timeouts,
+    /// refused connections, DNS, TLS and 5xx failures are Network.
     pub fn from_message(msg: &str) -> ErrorClass {
         let m = msg.to_ascii_lowercase();
         const AUTH_CODES: [&str; 4] = ["401", "403", "458", "459"];
-        const AUTH_WORDS: [&str; 10] = [
-            "too many",
+        const AUTH_WORDS: [&str; 12] = [
+            "too many connections",
+            "too many open",
+            "too many streams",
             "max connections",
             "maximum connections",
             "connection limit",
             "simultaneous",
-            "4xx client error",
             "unauthorized",
             "unauthorised",
             "forbidden",
             "authorization failed",
+            "authorisation failed",
         ];
         if AUTH_CODES.iter().any(|c| contains_code(&m, c))
             || AUTH_WORDS.iter().any(|w| m.contains(w))
         {
             return ErrorClass::Auth;
+        }
+        const UNAVAILABLE_CODES: [&str; 3] = ["404", "407", "410"];
+        if UNAVAILABLE_CODES.iter().any(|c| contains_code(&m, c))
+            || m.contains("4xx client error")
+            || m.contains("proxy authentication required")
+            || (m.contains("not found") && !m.contains("host"))
+        {
+            return ErrorClass::Unavailable;
         }
         const NET_WORDS: [&str; 18] = [
             "http", "network", "connection", "connect", "timed out", "timeout", "refused",
@@ -96,6 +115,28 @@ impl ErrorClass {
             return ErrorClass::Network;
         }
         ErrorClass::Other
+    }
+}
+
+/// Why the supervisor is reconnecting (picks the backoff table and the
+/// message shown to the user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryKind {
+    /// Network/other errors, drops, stalls and start timeouts.
+    Network,
+    /// Account rejected or connection limit reached.
+    Auth,
+    /// Channel unavailable (off-air?).
+    Unavailable,
+}
+
+impl From<ErrorClass> for RetryKind {
+    fn from(c: ErrorClass) -> RetryKind {
+        match c {
+            ErrorClass::Auth => RetryKind::Auth,
+            ErrorClass::Unavailable => RetryKind::Unavailable,
+            ErrorClass::Network | ErrorClass::Other => RetryKind::Network,
+        }
     }
 }
 
@@ -127,9 +168,10 @@ pub enum Status {
     /// Loading (before `Started`) or buffering mid-play.
     Buffering,
     /// A failure happened; a retry is scheduled or in flight. `attempt` is the
-    /// number of consecutive failures; `auth` is true when the latest one
-    /// looked like an account/connection-limit rejection.
-    Reconnecting { attempt: u32, auth: bool },
+    /// number of consecutive failures; `kind` is what the latest one looked
+    /// like (network drop, account/connection-limit rejection, or an
+    /// unavailable/off-air channel).
+    Reconnecting { attempt: u32, kind: RetryKind },
     /// VOD reached its natural end. No autoplay, no retry.
     Finished,
 }
@@ -138,6 +180,8 @@ pub enum Status {
 pub const NETWORK_BACKOFF_MS: [u64; 4] = [500, 1_000, 2_000, 3_000];
 /// Auth backoff delays in ms; the last entry is the cap (15 s).
 pub const AUTH_BACKOFF_MS: [u64; 4] = [3_000, 6_000, 12_000, 15_000];
+/// Unavailable-channel backoff delays in ms; the last entry is the cap (10 s).
+pub const UNAVAILABLE_BACKOFF_MS: [u64; 3] = [3_000, 6_000, 10_000];
 /// Uninterrupted playing after `Started` needed to reset the backoff.
 pub const STABLE_RESET: Duration = Duration::from_secs(10);
 /// Stall watchdog: `Buffering(true)` *after* `Started` lasting longer than
@@ -171,11 +215,15 @@ fn start_timeout(attempt: u32, live: bool) -> Duration {
 /// VOD `Ended` within this many seconds of the duration is a natural finish.
 pub const VOD_END_TOLERANCE_SECS: f64 = 5.0;
 
-/// One attempt counter serves both tables: the delay comes from the table of
-/// the *latest* failure's class indexed by the shared count, so e.g. three
+/// One attempt counter serves all tables: the delay comes from the table of
+/// the *latest* failure's kind indexed by the shared count, so e.g. three
 /// network failures followed by an auth failure wait the 4th auth delay (15 s).
-fn backoff(attempt: u32, auth: bool) -> Duration {
-    let table = if auth { &AUTH_BACKOFF_MS } else { &NETWORK_BACKOFF_MS };
+fn backoff(attempt: u32, kind: RetryKind) -> Duration {
+    let table: &[u64] = match kind {
+        RetryKind::Network => &NETWORK_BACKOFF_MS,
+        RetryKind::Auth => &AUTH_BACKOFF_MS,
+        RetryKind::Unavailable => &UNAVAILABLE_BACKOFF_MS,
+    };
     let i = (attempt.saturating_sub(1) as usize).min(table.len() - 1);
     Duration::from_millis(table[i])
 }
@@ -329,10 +377,10 @@ impl<B: Backend> Supervisor<B> {
                     self.start_deadline = None;
                     self.stable_since = None;
                 } else {
-                    self.fail(false, now);
+                    self.fail(RetryKind::Network, now);
                 }
             }
-            PlayerEvent::Error(class) => self.fail(class == ErrorClass::Auth, now),
+            PlayerEvent::Error(class) => self.fail(class.into(), now),
         }
     }
 
@@ -353,13 +401,13 @@ impl<B: Backend> Supervisor<B> {
         if let Some(deadline) = self.start_deadline {
             let hard = self.load_started_at.map(|t| t + START_ABSOLUTE_MAX);
             if now > deadline || hard.is_some_and(|h| now > h) {
-                self.fail(false, now);
+                self.fail(RetryKind::Network, now);
                 return;
             }
         }
         if let Some(since) = self.stall_since {
             if now.saturating_duration_since(since) > STALL_TIMEOUT {
-                self.fail(false, now);
+                self.fail(RetryKind::Network, now);
                 return;
             }
         }
@@ -432,15 +480,15 @@ impl<B: Backend> Supervisor<B> {
     }
 
     /// The current generation failed: schedule exactly one retry.
-    fn fail(&mut self, auth: bool, now: Instant) {
+    fn fail(&mut self, kind: RetryKind, now: Instant) {
         self.dead = true;
         self.started = false;
         self.stall_since = None;
         self.start_deadline = None;
         self.stable_since = None;
         self.attempt = self.attempt.saturating_add(1);
-        self.retry_at = Some(now + backoff(self.attempt, auth));
-        self.status = Status::Reconnecting { attempt: self.attempt, auth };
+        self.retry_at = Some(now + backoff(self.attempt, kind));
+        self.status = Status::Reconnecting { attempt: self.attempt, kind };
     }
 
     fn check_stable(&mut self, now: Instant) {
@@ -535,7 +583,7 @@ mod tests {
         assert_eq!(ErrorClass::from_message("status 459"), ErrorClass::Auth);
         assert_eq!(ErrorClass::from_message("Too Many Connections"), ErrorClass::Auth);
         assert_eq!(ErrorClass::from_message("UNAUTHORIZED"), ErrorClass::Auth);
-        assert_eq!(ErrorClass::from_message("HTTP error 404 Not Found"), ErrorClass::Network);
+        assert_eq!(ErrorClass::from_message("HTTP error 404 Not Found"), ErrorClass::Unavailable);
         assert_eq!(ErrorClass::from_message("Connection refused"), ErrorClass::Network);
         assert_eq!(ErrorClass::from_message("network error"), ErrorClass::Network);
         assert_eq!(ErrorClass::from_message("operation timed out"), ErrorClass::Network);
@@ -553,8 +601,8 @@ mod tests {
         let cases = [
             ("HTTP error 401 Unauthorized", Auth),
             ("HTTP error 403 Forbidden", Auth),
-            ("Server returned 4XX Client Error, but not one of 40{0,1,3,4}", Auth),
-            ("server returned 4xx client error, but not one of 40{0,1,3,4}", Auth),
+            ("Server returned 4XX Client Error, but not one of 40{0,1,3,4}", Unavailable),
+            ("server returned 4xx client error, but not one of 40{0,1,3,4}", Unavailable),
             ("Max connections reached", Auth),
             ("Maximum connections exceeded", Auth),
             ("connection limit reached", Auth),
@@ -563,8 +611,8 @@ mod tests {
             ("Simultaneous streams limit", Auth),
             ("Server returned 401 Unauthorized (authorization failed)", Auth),
             ("Server returned 403 Forbidden (access denied)", Auth),
-            ("Server returned 404 Not Found", Network),
-            ("Not Found", Network),
+            ("Server returned 404 Not Found", Unavailable),
+            ("Not Found", Unavailable),
             ("Connection refused", Network),
             ("tls handshake failure", Network),
             ("Connection timed out", Network),
@@ -574,6 +622,92 @@ mod tests {
         for (msg, want) in cases {
             assert_eq!(ErrorClass::from_message(msg), want, "{msg}");
         }
+    }
+
+    #[test]
+    fn error_class_unavailable_channel() {
+        use ErrorClass::*;
+        // Off-air event channels answer HTTP 407 (or 404/410) instantly.
+        let cases = [
+            ("HTTP error 407", Unavailable),
+            ("HTTP error 407 Proxy Authentication Required", Unavailable),
+            ("http: HTTP error 407 | loading failed", Unavailable),
+            ("The requested URL returned error: 407", Unavailable),
+            ("Server returned 4XX Client Error, but not one of 40{0,1,3,4}", Unavailable),
+            ("HTTP error 404 Not Found", Unavailable),
+            ("HTTP error 410 Gone", Unavailable),
+            ("Server returned 404 Not Found", Unavailable),
+            // Real auth / connection-limit replies stay Auth.
+            ("HTTP error 401", Auth),
+            ("HTTP error 403", Auth),
+            ("HTTP error 458", Auth),
+            ("HTTP error 459", Auth),
+            ("max connections reached", Auth),
+            ("Maximum connections exceeded", Auth),
+            ("too many connections", Auth),
+            ("simultaneous streams", Auth),
+            ("connection limit", Auth),
+            ("unauthorized", Auth),
+            ("forbidden", Auth),
+            // Network stays network.
+            ("HTTP error 503 Service Unavailable", Network),
+            ("HTTP error 500", Network),
+            ("Could not resolve host: Host not found", Network),
+            ("Connection refused", Network),
+            // Not a connection limit (was Auth via the old broad "too many").
+            ("Too many redirects", Other),
+            // Codes inside longer numbers are not statuses.
+            ("id 14070", Other),
+            ("port 4070 refused", Network),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(ErrorClass::from_message(msg), want, "{msg}");
+        }
+    }
+
+    #[test]
+    fn unavailable_backoff_is_endless_and_capped_at_10s() {
+        let mut s = sup();
+        let mut now = Instant::now();
+        s.play(URL_A.to_string(), true, now);
+        let mut d = vec![];
+        for _ in 0..50 {
+            d.push(fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Unavailable)));
+        }
+        assert_eq!(&d[..5], &[ms(3000), ms(6000), ms(10000), ms(10000), ms(10000)]);
+        assert!(d.iter().all(|x| *x >= ms(3000) && *x <= ms(10000)));
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 50, kind: RetryKind::Unavailable });
+        assert_eq!(load_count(&s), 51, "never gives up");
+    }
+
+    #[test]
+    fn unavailable_resets_after_stable_play_and_on_play() {
+        let mut s = sup();
+        let mut now = Instant::now();
+        s.play(URL_A.to_string(), true, now);
+        for _ in 0..4 {
+            fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Unavailable));
+        }
+        // The channel comes on air and plays stably: counter resets.
+        s.on_event(s.generation(), PlayerEvent::Started, now);
+        now += STABLE_RESET;
+        s.tick(now);
+        assert_eq!(s.attempt(), 0);
+        let d = fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Unavailable));
+        assert_eq!(d, ms(3000));
+        // A user play() resets too.
+        fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Unavailable));
+        s.play(URL_B.to_string(), true, now);
+        let d = fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Unavailable));
+        assert_eq!(d, ms(3000));
+    }
+
+    #[test]
+    fn retry_kind_from_error_class() {
+        assert_eq!(RetryKind::from(ErrorClass::Auth), RetryKind::Auth);
+        assert_eq!(RetryKind::from(ErrorClass::Unavailable), RetryKind::Unavailable);
+        assert_eq!(RetryKind::from(ErrorClass::Network), RetryKind::Network);
+        assert_eq!(RetryKind::from(ErrorClass::Other), RetryKind::Network);
     }
 
     // ---------- required tests ----------
@@ -632,12 +766,17 @@ mod tests {
         let now = Instant::now();
         s.play(URL_A.to_string(), true, now);
         s.on_event(s.generation(), PlayerEvent::Error(ErrorClass::Auth), now);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: true });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Auth });
 
         let mut s = sup();
         s.play(URL_A.to_string(), true, now);
         s.on_event(s.generation(), PlayerEvent::Error(ErrorClass::Network), now);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
+
+        let mut s = sup();
+        s.play(URL_A.to_string(), true, now);
+        s.on_event(s.generation(), PlayerEvent::Error(ErrorClass::Unavailable), now);
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Unavailable });
     }
 
     #[test]
@@ -671,7 +810,7 @@ mod tests {
         let d = fail_and_measure(&mut s, &mut now, PlayerEvent::Ended);
         assert_eq!(d, ms(500));
         assert_eq!(loads(&s).last().unwrap(), &(URL_A.to_string(), None, s.generation()));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
     }
 
     #[test]
@@ -790,7 +929,7 @@ mod tests {
         s.play(URL_A.to_string(), true, now);
         for i in 1..=1000u32 {
             fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Network));
-            assert_eq!(s.status(), Status::Reconnecting { attempt: i, auth: false });
+            assert_eq!(s.status(), Status::Reconnecting { attempt: i, kind: RetryKind::Network });
         }
         assert_eq!(load_count(&s), 1001);
         assert!(matches!(s.status(), Status::Reconnecting { .. }));
@@ -829,7 +968,7 @@ mod tests {
         s.on_event(g, PlayerEvent::Error(ErrorClass::Network), now);
         s.on_event(g, PlayerEvent::Error(ErrorClass::Network), now + ms(100));
         s.on_event(g, PlayerEvent::Error(ErrorClass::Auth), now + ms(200));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         assert_eq!(s.next_retry_in(now), Some(ms(500)), "deadline not pushed back");
         s.tick(now + Duration::from_secs(30));
         assert_eq!(load_count(&s), 2);
@@ -848,7 +987,7 @@ mod tests {
         s.on_event(g, PlayerEvent::Error(ErrorClass::Network), now);
         // The Ended that follows an Error must not be read as a natural finish.
         s.on_event(g, PlayerEvent::Ended, now);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         s.tick(now + Duration::from_secs(30));
         assert_eq!(load_count(&s), 2);
     }
@@ -866,12 +1005,12 @@ mod tests {
         s.on_event(g1, PlayerEvent::Ended, now);
         s.on_event(g1, PlayerEvent::Error(ErrorClass::Auth), now);
         assert_eq!(s.next_retry_in(now), None);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         s.tick(now + Duration::from_secs(5));
         assert_eq!(load_count(&s), 2);
         // Late Started from attempt 1 must not mark attempt 2 as playing.
         s.on_event(g1, PlayerEvent::Started, now);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
     }
 
     #[test]
@@ -881,7 +1020,7 @@ mod tests {
         s.play(URL_A.to_string(), true, now);
         assert_eq!(s.status(), Status::Buffering);
         fail_and_measure(&mut s, &mut now, PlayerEvent::Error(ErrorClass::Network));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         assert_eq!(s.next_retry_in(now), None, "retry in flight, nothing scheduled");
         s.on_event(s.generation(), PlayerEvent::Started, now);
         assert_eq!(s.status(), Status::Playing);
@@ -910,7 +1049,7 @@ mod tests {
         // New channel fails: fresh network backoff, old auth state gone.
         s.on_event(s.generation(), PlayerEvent::Error(ErrorClass::Network), now);
         assert_eq!(s.next_retry_in(now), Some(ms(500)));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
     }
 
     #[test]
@@ -937,7 +1076,7 @@ mod tests {
         s.tick(now + STALL_TIMEOUT);
         assert_eq!(s.status(), Status::Buffering);
         s.tick(now + STALL_TIMEOUT + ms(1));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         s.tick(now + STALL_TIMEOUT + ms(501));
         assert_eq!(load_count(&s), 2);
     }
@@ -964,7 +1103,7 @@ mod tests {
         s.tick(now + START_TIMEOUT_BASE_LIVE);
         assert_eq!(s.status(), Status::Buffering);
         s.tick(now + START_TIMEOUT_BASE_LIVE + ms(1));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         // And a retry that hangs is also caught (with the grown timeout).
         let t = now + Duration::from_secs(16);
         s.tick(t);
@@ -972,7 +1111,7 @@ mod tests {
         s.tick(t + Duration::from_secs(30));
         assert!(matches!(s.status(), Status::Reconnecting { attempt: 1, .. }));
         s.tick(t + Duration::from_secs(30) + ms(1));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 2, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 2, kind: RetryKind::Network });
     }
 
     #[test]
@@ -994,7 +1133,7 @@ mod tests {
         s.play(URL_A.to_string(), false, now);
         now += START_TIMEOUT_BASE + ms(1);
         s.tick(now);
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         now += ms(500);
         s.tick(now);
         assert_eq!(load_count(&s), 2);
@@ -1019,7 +1158,7 @@ mod tests {
             s.tick(now + Duration::from_secs(50));
             assert_eq!(s.status(), Status::Buffering, "{ev:?} should extend the deadline");
             s.tick(now + Duration::from_secs(55) + ms(1));
-            assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false }, "{ev:?}");
+            assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network }, "{ev:?}");
         }
     }
 
@@ -1066,7 +1205,7 @@ mod tests {
         s.tick(now + Duration::from_secs(2) + STALL_TIMEOUT);
         assert!(!matches!(s.status(), Status::Reconnecting { .. }));
         s.tick(now + Duration::from_secs(2) + STALL_TIMEOUT + ms(1));
-        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, auth: false });
+        assert_eq!(s.status(), Status::Reconnecting { attempt: 1, kind: RetryKind::Network });
         s.tick(now + Duration::from_secs(20));
         assert_eq!(load_count(&s), 2);
     }

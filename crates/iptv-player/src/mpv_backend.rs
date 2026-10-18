@@ -20,8 +20,9 @@
 //! - `Position`/`Duration`: observed `time-pos`/`duration`.
 //! - `Buffering(b)`: `paused-for-cache && !pause && !seeking`, emitted on
 //!   change only: a user pause or user seek is never reported as buffering.
-//! - END_FILE: [`map_end_file`]: eof -> `Ended` (or `Error(Auth)` if the
-//!   stream logged an auth/connection-limit error), error -> one
+//! - END_FILE: [`map_end_file`]: eof -> `Ended` (or `Error(Auth)` /
+//!   `Error(Unavailable)` if the stream logged an auth/connection-limit or
+//!   404/407/410 error), error -> one
 //!   `Error(class)` classified from the scraped ffmpeg/stream log lines,
 //!   stop/quit/redirect -> nothing.
 //!
@@ -117,12 +118,13 @@ pub fn map_end_file(reason: EndReason, error_text: &str) -> Option<PlayerEvent> 
     match reason {
         EndReason::Error => Some(PlayerEvent::Error(ErrorClass::from_message(&text))),
         // A reconnect that gives up ends with EOF; if the server rejected the
-        // account meanwhile, back off like an auth failure.
+        // account or took the channel off air meanwhile, back off (and
+        // report) like that failure.
         EndReason::Eof | EndReason::Unknown(_) => {
-            if !text.trim().is_empty() && ErrorClass::from_message(&text) == ErrorClass::Auth {
-                Some(PlayerEvent::Error(ErrorClass::Auth))
-            } else {
-                Some(PlayerEvent::Ended)
+            let class = if text.trim().is_empty() { ErrorClass::Other } else { ErrorClass::from_message(&text) };
+            match class {
+                ErrorClass::Auth | ErrorClass::Unavailable => Some(PlayerEvent::Error(class)),
+                ErrorClass::Network | ErrorClass::Other => Some(PlayerEvent::Ended),
             }
         }
         EndReason::Stop | EndReason::Quit | EndReason::Redirect => None,
@@ -566,7 +568,7 @@ struct Current {
     started: bool,
     buffering: bool,
     /// Stream log lines of this entry (cleared at PLAYBACK_RESTART, so an
-    /// EOF->Auth upgrade only uses lines logged while playing).
+    /// EOF->Auth/Unavailable upgrade only uses lines logged while playing).
     errors: Vec<String>,
     /// Latest duration seen before PLAYBACK_RESTART, emitted at restart.
     pending_duration: Option<f64>,
@@ -1053,7 +1055,7 @@ mod tests {
         assert_eq!(e(EndReason::Error, "http: HTTP error 401 Unauthorized | loading failed"), Some(PlayerEvent::Error(Auth)));
         assert_eq!(
             e(EndReason::Error, "Server returned 4XX Client Error, but not one of 40{0,1,3,4}"),
-            Some(PlayerEvent::Error(Auth))
+            Some(PlayerEvent::Error(Unavailable))
         );
         assert_eq!(e(EndReason::Error, "Max connections reached"), Some(PlayerEvent::Error(Auth)));
         assert_eq!(
@@ -1504,6 +1506,30 @@ mod tests {
             (2_010, RawEvent::PlaybackRestart),
         ]);
         assert_eq!(out, vec![(2, PlayerEvent::Started)]);
+    }
+
+    #[test]
+    fn unavailable_channel_through_map_end_file() {
+        use ErrorClass::*;
+        // 407 from an off-air channel, as the libcurl backend and lavf word it.
+        for text in [
+            // Exact lines the libcurl backend logged for a local 407 server.
+            "error: HTTP error 407 | error: transfer failed: Failed writing received data to disk/application | error: Failed to open http://127.0.0.1:8097/live/***/***/5.ts. | loading failed",
+            "HTTP error 407 | loading failed",
+            "curl: HTTP error 407 | Failed to open http://h/live/***/***/12345.ts. | loading failed",
+            "Server returned 4XX Client Error, but not one of 40{0,1,3,4} | loading failed",
+            "HTTP error 404 | loading failed",
+            "HTTP error 410 | loading failed",
+        ] {
+            assert_eq!(map_end_file(EndReason::Error, text), Some(PlayerEvent::Error(Unavailable)), "{text}");
+        }
+        // A stream id 407/404 in the (redacted) URL is not a status.
+        assert_eq!(
+            map_end_file(EndReason::Error, "Could not connect to server | Failed to open http://h/live/***/***/407.ts. | loading failed"),
+            Some(PlayerEvent::Error(Network))
+        );
+        // A reconnect that gave up on a 407 is reported as unavailable too.
+        assert_eq!(map_end_file(EndReason::Eof, "HTTP error 407"), Some(PlayerEvent::Error(Unavailable)));
     }
 
     #[test]
