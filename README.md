@@ -53,7 +53,8 @@ groups) live in the data directory. The app looks for it in this order:
 - Tabs: **Live** (countries A-Z, then channels), **Favorites**, **Movies**, **Series**
   (show, then seasons, then episodes).
 - Click or press **Enter** to play the selected entry. **Enter** or double-click on the
-  playing row opens the full player view. Double-clicking the video toggles it.
+  playing row goes full screen. **Enter** or double-clicking the video toggles full screen
+  (back to the previous window layout).
 - **Up/Down** move the selection. While live TV plays, they also switch channel after a
   short pause (300 ms), so holding the key opens only one stream.
 - **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's

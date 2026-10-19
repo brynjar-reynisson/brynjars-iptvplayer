@@ -479,7 +479,8 @@ impl App {
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
         if on {
-            self.fs_return_view = Some(self.view);
+            // Already fullscreen: keep the view to return to.
+            self.fs_return_view.get_or_insert(self.view);
             if self.playback.is_some() {
                 self.view = View::Player;
             }
@@ -623,7 +624,7 @@ impl App {
     /// full player view (cancelling a pending zap, no reload). Series show
     /// list: open the show. Movies/shows with nothing selected: select the
     /// first result.
-    fn activate(&mut self) {
+    fn activate(&mut self, ctx: &egui::Context) {
         match self.tab {
             Tab::Movies if self.movies.list().cursor().is_none() => {
                 self.movies.list_mut().step(1);
@@ -646,7 +647,7 @@ impl App {
         match enter_action(self.selected_entry(), self.playing_entry()) {
             EnterAction::OpenPlayer => {
                 self.zap.cancel();
-                self.view = View::Player;
+                self.set_fullscreen(ctx, true);
             }
             EnterAction::Play(e) => self.play_from(self.tab_list(), e, self.tab),
             EnterAction::Nothing if self.tab == Tab::Favorites && self.fav.cursor().is_some() => {
@@ -776,7 +777,12 @@ impl App {
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
-            self.activate();
+            if fullscreen && self.playback.is_some() {
+                // Enter in fullscreen leaves it again.
+                self.set_fullscreen(ctx, false);
+            } else {
+                self.activate(ctx);
+            }
         }
         if esc {
             if let Some(id) = focused {
@@ -971,6 +977,7 @@ impl App {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
             let mut toggle_pause = false;
+            let mut toggle_fs = false;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
@@ -982,10 +989,10 @@ impl App {
                     p.show(ui, rect, &title);
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
-                        self.view = if self.view == View::Player { View::Browse } else { View::Player };
+                        toggle_fs = true;
                     }
                     if self.view != View::Player {
-                        r.on_hover_text("Double-click: full view");
+                        r.on_hover_text("Double-click: full screen");
                     }
                     // Played/total time at the bottom centre for a few seconds after the mouse moves over the video.
                     if ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO) && ui.rect_contains_pointer(rect) {
@@ -1069,6 +1076,10 @@ impl App {
                     );
                 }
             }
+            if toggle_fs {
+                let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+                self.set_fullscreen(&ui.ctx().clone(), !fs);
+            }
             if toggle_pause {
                 if let Ok(p) = &mut self.player {
                     p.toggle_pause();
@@ -1113,7 +1124,7 @@ impl App {
                             _ => drop(self.zap.cancel()),
                         }
                         if matches!(a, Some(RowAction::DoubleClick(_))) {
-                            self.view = View::Player;
+                            self.set_fullscreen(&ui.ctx().clone(), true);
                         }
                     }
                 });
@@ -1142,7 +1153,7 @@ impl App {
                             }
                         }
                         if matches!(a, Some(RowAction::DoubleClick(_))) && self.playback.is_some() {
-                            self.view = View::Player;
+                            self.set_fullscreen(&ui.ctx().clone(), true);
                         }
                     }
                 });
@@ -1178,7 +1189,7 @@ impl App {
                             _ => drop(self.zap.cancel()),
                         }
                         if matches!(a, Some(RowAction::DoubleClick(_))) {
-                            self.view = View::Player;
+                            self.set_fullscreen(&ui.ctx().clone(), true);
                         }
                     }
                     if let Some(vod::GroupAction::Set(g, h)) = toggled {
@@ -1204,7 +1215,7 @@ impl App {
                                     self.zap.cancel();
                                 }
                                 if matches!(a, Some(RowAction::DoubleClick(_))) {
-                                    self.view = View::Player;
+                                    self.set_fullscreen(&ui.ctx().clone(), true);
                                 }
                             }
                         }
