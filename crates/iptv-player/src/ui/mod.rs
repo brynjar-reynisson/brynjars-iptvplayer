@@ -465,6 +465,15 @@ impl App {
         self.playback = Some(pb);
     }
 
+    /// Open the subtitle menu on the row in use, or close it.
+    fn toggle_sub_menu(&mut self) {
+        self.sub_menu = !self.sub_menu;
+        if self.sub_menu {
+            let current = self.player.as_ref().ok().and_then(Player::current_sub);
+            self.sub_cursor = self.sub_rows().iter().position(|r| *r == current).unwrap_or(0);
+        }
+    }
+
     /// Menu rows: Off, then the tracks of the playing video.
     fn sub_rows(&self) -> Vec<Option<i64>> {
         let tracks = self.player.as_ref().map(Player::sub_tracks).unwrap_or_default();
@@ -821,8 +830,10 @@ impl App {
             (up, down, enter)
         };
         let typing = ctx.egui_wants_keyboard_input();
-        let (fav, space, slash, back) = if typing {
-            (false, false, false, false)
+        // C opens/closes the subtitle menu (movies and episodes only).
+        let vod_playing = self.playback.as_ref().is_some_and(|p| !p.is_live());
+        let (fav, space, slash, back, sub_key) = if typing {
+            (false, false, false, false, false)
         } else {
             ctx.input_mut(|i| {
                 (
@@ -834,11 +845,15 @@ impl App {
                         && self.view == View::Browse
                         && self.series.open().is_some()
                         && (i.consume_key(M::NONE, Key::Backspace) | i.consume_key(M::NONE, Key::ArrowLeft)),
+                    vod_playing && i.consume_key(M::NONE, Key::C),
                 )
             })
         };
         if back {
             self.series_back();
+        }
+        if sub_key {
+            self.toggle_sub_menu();
         }
         if up {
             self.step(-1);
@@ -1051,6 +1066,7 @@ impl App {
             let rect = ui.max_rect();
             let mut toggle_pause = false;
             let mut toggle_fs = false;
+            let mut toggle_sub = false;
             let mut pick_sub: Option<Option<i64>> = None;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
@@ -1118,9 +1134,7 @@ impl App {
                             );
                         }
                         if s_resp.on_hover_text("Subtitles").clicked() {
-                            self.sub_menu = !self.sub_menu;
-                            // Start on the row in use.
-                            self.sub_cursor = tracks.iter().position(|t| Some(t.id) == current).map_or(0, |i| i + 1);
+                            toggle_sub = true;
                         }
                         if self.sub_menu {
                             let area = egui::Area::new(egui::Id::unique("sub_menu"))
@@ -1238,6 +1252,9 @@ impl App {
                         ui.visuals().weak_text_color(),
                     );
                 }
+            }
+            if toggle_sub {
+                self.toggle_sub_menu();
             }
             if toggle_fs {
                 let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
