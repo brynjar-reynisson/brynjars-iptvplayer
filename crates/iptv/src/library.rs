@@ -112,12 +112,13 @@ const OTHER: &str = "Other";
 
 impl Library {
     pub fn build(entries: Vec<Entry>) -> Library {
-        Self::build_with_top(entries, None)
+        Self::build_with_top(entries, &[])
     }
 
     /// Countries are listed alphabetically (case/diacritic-insensitive),
-    /// "Other" last; `top_country` (matched the same way) goes first.
-    pub fn build_with_top(entries: Vec<Entry>, top_country: Option<&str>) -> Library {
+    /// "Other" last; the `top` countries (matched the same way) go first, in
+    /// the given order.
+    pub fn build_with_top(entries: Vec<Entry>, top: &[String]) -> Library {
         let mut countries: Vec<Country> = Vec::new();
         let mut pos: HashMap<String, usize> = HashMap::new();
         let mut other: Vec<usize> = Vec::new();
@@ -152,8 +153,8 @@ impl Library {
             }
         }
         countries.sort_by_cached_key(|c| normalize(&c.name));
-        if let Some(top) = top_country.map(|t| normalize(t.trim())).filter(|t| !t.is_empty()) {
-            if let Some(p) = countries.iter().position(|c| normalize(&c.name) == top) {
+        for t in top.iter().rev().map(|t| normalize(t.trim())).filter(|t| !t.is_empty()) {
+            if let Some(p) = countries.iter().position(|c| normalize(&c.name) == t) {
                 countries[..=p].rotate_right(1);
             }
         }
@@ -265,14 +266,17 @@ mod tests {
         };
         let names = |l: &Library| l.countries().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(&Library::build(es())), ["Iceland", "Norway", "österreich", "Sweden", "Other"]);
-        let top = Library::build_with_top(es(), Some(" sweden "));
+        let top = Library::build_with_top(es(), &[" sweden ".into()]);
         assert_eq!(names(&top), ["Sweden", "Iceland", "Norway", "österreich", "Other"]);
+        // Several: listed first in the given order.
+        let two = Library::build_with_top(es(), &["Sweden".into(), "norway".into()]);
+        assert_eq!(names(&two), ["Sweden", "Norway", "Iceland", "österreich", "Other"]);
         assert_eq!(top.countries()[0].channels, vec![0]);
         // Unknown or blank top country changes nothing.
-        assert_eq!(names(&Library::build_with_top(es(), Some("Atlantis"))), names(&Library::build(es())));
-        assert_eq!(names(&Library::build_with_top(es(), Some(""))), names(&Library::build(es())));
+        assert_eq!(names(&Library::build_with_top(es(), &["Atlantis".into()])), names(&Library::build(es())));
+        assert_eq!(names(&Library::build_with_top(es(), &["".into()])), names(&Library::build(es())));
         // "Other" stays last even if named as top.
-        assert_eq!(names(&Library::build_with_top(es(), Some("Other"))).last().unwrap(), "Other");
+        assert_eq!(names(&Library::build_with_top(es(), &["Other".into()])).last().unwrap(), "Other");
     }
 
     #[test]

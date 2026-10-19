@@ -11,6 +11,14 @@ use iptv::supervisor::{Status, Supervisor};
 use crate::mpv_backend::{GlInit, MpvBackend, MpvOptions, MpvRenderer};
 use crate::state::status_text;
 
+/// Hardware decoding is only used for video taller than this (1080p).
+pub const HW_MIN_HEIGHT: i64 = 1080;
+
+/// Whether a video of `height` pixels should be hardware decoded.
+pub fn wants_hwdec(hardware_decode: bool, height: i64) -> bool {
+    hardware_decode && height > HW_MIN_HEIGHT
+}
+
 pub struct Player {
     sup: Supervisor<MpvBackend>,
     renderer: Arc<MpvRenderer>,
@@ -20,13 +28,21 @@ pub struct Player {
     want_sub: Option<SubChoice>,
     /// Supervisor generation `want_sub` was last applied for.
     sub_gen: u32,
+    /// `hardware_decode` from `config.toml`: use hardware decoding, but only
+    /// for streams taller than [`HW_MIN_HEIGHT`] (software is clean for HD).
+    hardware_decode: bool,
+    /// Supervisor generation whose video size was checked for hwdec.
+    hw_gen: u32,
+    /// Hardware decoding is switched on for the current stream.
+    hw_active: bool,
     /// For log timestamps.
     t0: Instant,
 }
 
 impl Player {
     /// `user_agent`: sent on every stream request (blank = default). `hardware_decode`:
-    /// mpv `auto-safe` hardware decoding if true, else software (`hwdec=no`).
+    /// mpv `auto-safe` hardware decoding for streams above 1080p; everything
+    /// else (and everything if false) is decoded in software (`hwdec=no`).
     pub fn new(cc: &eframe::CreationContext<'_>, user_agent: &str, hardware_decode: bool) -> anyhow::Result<Player> {
         let get_proc_address = cc
             .get_proc_address
@@ -35,13 +51,13 @@ impl Player {
         let (c1, c2) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
         let backend = MpvBackend::new(MpvOptions {
             user_agent: user_agent.to_string(),
-            hwdec: Some(if hardware_decode { "auto-safe" } else { "no" }.to_string()),
+            hwdec: Some("no".to_string()),
             gl: Some(GlInit { get_proc_address, on_frame: Box::new(move || c1.request_repaint()) }),
             on_wakeup: Some(Box::new(move || c2.request_repaint())),
         })?;
         eprintln!("libmpv: {}", backend.mpv_version());
         let renderer = backend.renderer().ok_or_else(|| anyhow::anyhow!("libmpv render context missing"))?;
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, t0: Instant::now() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, t0: Instant::now() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -56,6 +72,11 @@ impl Player {
             self.paused = false;
         }
         self.want_sub = None;
+        if self.hw_active {
+            // A new stream starts in software again; it is upgraded when its size is known.
+            self.sup.backend_mut().set_hwdec("no");
+            self.hw_active = false;
+        }
         eprintln!("{:>9.3}s play (generation {})", self.t0.elapsed().as_secs_f64(), self.sup.generation() + 1);
         self.sup.play_from(url.to_string(), live, start_at, Instant::now());
     }
@@ -142,6 +163,22 @@ impl Player {
                 }
             }
         }
+        // Switch to hardware decoding once a tall enough video plays. A
+        // reconnect (new generation, same stream) keeps it.
+        if self.hardware_decode
+            && !self.hw_active
+            && self.sup.status() == Status::Playing
+            && self.hw_gen != self.sup.generation()
+        {
+            if let Some(h) = self.sup.backend().video_height() {
+                self.hw_gen = self.sup.generation();
+                if wants_hwdec(self.hardware_decode, h) {
+                    self.sup.backend_mut().set_hwdec("auto-safe");
+                    self.hw_active = true;
+                    eprintln!("hwdec: {h}p video, hardware decoding on");
+                }
+            }
+        }
         let s = self.sup.status();
         if s != self.last_status {
             eprintln!("{:>9.3}s status: {s:?}", self.t0.elapsed().as_secs_f64());
@@ -189,5 +226,19 @@ impl Player {
     pub fn shutdown(&mut self, gl: Option<&eframe::glow::Context>) {
         self.sup.stop();
         self.renderer.destroy(gl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardware_decoding_only_above_1080p_and_only_if_enabled() {
+        assert!(!wants_hwdec(true, 1080));
+        assert!(!wants_hwdec(true, 720));
+        assert!(wants_hwdec(true, 1440));
+        assert!(wants_hwdec(true, 2160));
+        assert!(!wants_hwdec(false, 2160));
     }
 }

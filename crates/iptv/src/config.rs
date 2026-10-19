@@ -11,9 +11,11 @@ pub struct Config {
     pub playlist_url: String,
     /// Optional `user_agent` key, trimmed; blank/missing = [`DEFAULT_USER_AGENT`].
     pub user_agent: String,
-    /// Optional `top_country` key, trimmed; blank/missing = none. That live
-    /// country is listed first, the rest alphabetically.
-    pub top_country: Option<String>,
+    /// Optional `top_countries` key, a comma-separated list (`"Iceland, UK"`);
+    /// blank/missing = none. Those live countries are listed first, in this
+    /// order, the rest alphabetically. The old single `top_country` key is
+    /// still read when `top_countries` is absent.
+    pub top_countries: Vec<String>,
     /// Optional `hardware_decode` key (`true`/`false`); missing = `false`
     /// (software decoding; hardware decoding showed corrupt video on some GPUs).
     pub hardware_decode: bool,
@@ -25,7 +27,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
-            .field("top_country", &self.top_country)
+            .field("top_countries", &self.top_countries)
             .field("hardware_decode", &self.hardware_decode)
             .finish()
     }
@@ -77,14 +79,18 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
         _ => anyhow::bail!("{} is missing the required field `playlist_url`", path.display()),
     };
     let user_agent = parse_user_agent(value.get("user_agent"), &path)?;
-    let top_country = match value.get("top_country") {
-        None => None,
-        Some(v) => {
-            let s = v
+    let top_countries = {
+        let key = if value.get("top_countries").is_some() { "top_countries" } else { "top_country" };
+        match value.get(key) {
+            None => Vec::new(),
+            Some(v) => v
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("{}: `top_country` must be a string", path.display()))?
-                .trim();
-            (!s.is_empty()).then(|| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("{}: `{key}` must be a string", path.display()))?
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
         }
     };
     let hardware_decode = match value.get("hardware_decode") {
@@ -93,7 +99,7 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
             .as_bool()
             .ok_or_else(|| anyhow::anyhow!("{}: `hardware_decode` must be true or false", path.display()))?,
     };
-    Ok(Config { playlist_url, user_agent, top_country, hardware_decode })
+    Ok(Config { playlist_url, user_agent, top_countries, hardware_decode })
 }
 
 #[cfg(test)]
@@ -123,10 +129,15 @@ mod tests {
     }
 
     #[test]
-    fn top_country_is_optional_and_trimmed() {
-        assert_eq!(load_with("").unwrap().top_country, None);
-        assert_eq!(load_with("top_country = \"  Iceland \"\n").unwrap().top_country.as_deref(), Some("Iceland"));
-        assert_eq!(load_with("top_country = \"  \"\n").unwrap().top_country, None);
+    fn top_countries_is_an_optional_trimmed_comma_list() {
+        assert!(load_with("").unwrap().top_countries.is_empty());
+        assert_eq!(load_with("top_countries = \"  Iceland \"\n").unwrap().top_countries, ["Iceland"]);
+        assert_eq!(load_with("top_countries = \"Iceland, UK ,, \"\n").unwrap().top_countries, ["Iceland", "UK"]);
+        assert!(load_with("top_countries = \"  \"\n").unwrap().top_countries.is_empty());
+        assert!(format!("{:#}", load_with("top_countries = 5\n").unwrap_err()).contains("top_countries"));
+        // Old single-country key still works; the new key wins when both are set.
+        assert_eq!(load_with("top_country = \"Iceland\"\n").unwrap().top_countries, ["Iceland"]);
+        assert_eq!(load_with("top_country = \"X\"\ntop_countries = \"Y\"\n").unwrap().top_countries, ["Y"]);
         assert!(format!("{:#}", load_with("top_country = 5\n").unwrap_err()).contains("top_country"));
     }
 
@@ -153,7 +164,7 @@ mod tests {
         let c = Config {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
-            top_country: None,
+            top_countries: Vec::new(),
             hardware_decode: false,
         };
         let d = format!("{c:?}");

@@ -7,7 +7,7 @@ Known gaps and ideas that were found during implementation and review but not do
 - **Minimised window during playback.** Minimise the window for more than 30 s while a stream plays, then restore it. The supervisor ticks and mpv rendering are driven by egui frames; if eframe stops producing frames while minimised, retries and the render loop may pause. Check that playback continues or reconnects after restore.
 - **Pause while reconnecting.** Press Space (pause) while the overlay says "Reconnecting…". The retry reloads the stream paused; confirm mpv's `PLAYBACK_RESTART` still arrives, otherwise the start watchdog could loop.
 - **Typing in the search and filter boxes with a real keyboard.** Automated runs sometimes lost a key press in text boxes; this is believed to be a test-harness artefact.
-- **Hardware decoding** (`hwdec=auto-safe`) on a wider range of real streams, and resizing / HiDPI with a non-origin video rectangle on other displays.
+- **Hardware decoding above 1080p** (`hardware_decode = true`): play a real 4K stream; it should start in software, switch to hardware decoding (stderr: `hwdec: 2160p video, hardware decoding on`) with at most a brief hiccup, play smoothly and show no corruption, also after zapping between a 4K and an HD stream. If the mid-stream switch glitches, try `d3d11va-copy` / `nvdec-copy` instead of `auto-safe`, or a bigger cache (`cache-secs`). Also hardware decoding on a wider range of real streams, and resizing / HiDPI with a non-origin video rectangle on other displays.
 
 - **Episode titles, real show.** Open a real show: titles should appear within ~2 s and reopening it should be instant (cached). Also check how well Icelandic/Nordic shows are covered by TVmaze.
 

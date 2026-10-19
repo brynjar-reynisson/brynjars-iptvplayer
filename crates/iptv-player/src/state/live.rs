@@ -161,7 +161,7 @@ pub(crate) mod tests {
                 live("5", "\u{c5}rets Sport", "Sweden - Sport"),
                 live("6", "Kanal 5", "Sweden - Other"),
             ],
-            Some("Sweden"),
+            &["Sweden".into()],
         )
     }
 

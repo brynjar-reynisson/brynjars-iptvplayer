@@ -163,9 +163,9 @@ fn download_inner(url: &str, dest: &Path, tmp: &Path, user_agent: &str, progress
 }
 
 /// Load the on-disk cache and build the library. Safe to call from a background thread.
-pub fn load_cached(dir: &Path, top_country: Option<&str>) -> Option<(Arc<Library>, SystemTime)> {
+pub fn load_cached(dir: &Path, top: &[String]) -> Option<(Arc<Library>, SystemTime)> {
     let c = cache::load(dir)?;
-    Some((Arc::new(Library::build_with_top(c.entries, top_country)), c.saved_at))
+    Some((Arc::new(Library::build_with_top(c.entries, top)), c.saved_at))
 }
 
 /// Where a refresh reads the playlist from.
@@ -196,14 +196,14 @@ pub struct RefreshOptions {
     /// User-Agent for the download (blank = [`DEFAULT_USER_AGENT`]); unused
     /// for [`Source::File`].
     pub user_agent: String,
-    /// Live country listed first in the resulting library (see
+    /// Live countries listed first in the resulting library (see
     /// [`Library::build_with_top`]).
-    pub top_country: Option<String>,
+    pub top_countries: Vec<String>,
 }
 
 impl Default for RefreshOptions {
     fn default() -> Self {
-        RefreshOptions { force: false, user_agent: DEFAULT_USER_AGENT.to_string(), top_country: None }
+        RefreshOptions { force: false, user_agent: DEFAULT_USER_AGENT.to_string(), top_countries: Vec::new() }
     }
 }
 
@@ -393,7 +393,7 @@ fn run(
                 url,
             )));
         }
-        Ok(RefreshEvent::Done(Arc::new(Library::build_with_top(entries, opts.top_country.as_deref()))))
+        Ok(RefreshEvent::Done(Arc::new(Library::build_with_top(entries, &opts.top_countries))))
     })();
     let _ = std::fs::remove_file(&m3u);
     match res {
@@ -471,7 +471,7 @@ mod tests {
         assert!(matches!(ev, RefreshEvent::Done(_)), "{ev:?}");
         assert_eq!(cache::load(d.path()).unwrap().entries.len(), 2);
         no_leftovers(d.path());
-        assert!(load_cached(d.path(), None).is_some());
+        assert!(load_cached(d.path(), &[]).is_some());
     }
 
     #[test]

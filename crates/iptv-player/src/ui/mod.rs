@@ -99,13 +99,13 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
-/// `(user_agent, top_country, hardware_decode)` from `config.toml` if it
-/// loads, else the default UA, no top country and software decoding (also
+/// `(user_agent, top_countries, hardware_decode)` from `config.toml` if it
+/// loads, else the default UA, no top countries and software decoding (also
 /// with `--playlist-file`).
-fn configured_prefs(data_dir: &std::path::Path) -> (String, Option<String>, bool) {
+fn configured_prefs(data_dir: &std::path::Path) -> (String, Vec<String>, bool) {
     iptv::config::load(data_dir).map_or_else(
-        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), None, false),
-        |c| (c.user_agent, c.top_country, c.hardware_decode),
+        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), Vec::new(), false),
+        |c| (c.user_agent, c.top_countries, c.hardware_decode),
     )
 }
 
@@ -131,8 +131,8 @@ struct App {
     source: Option<Source>,
     /// User-Agent for playlist downloads (the player got it at startup).
     user_agent: String,
-    /// Live country listed first (`top_country` in config.toml).
-    top_country: Option<String>,
+    /// Live countries listed first (`top_countries` in config.toml).
+    top_countries: Vec<String>,
     /// View to return to when leaving fullscreen.
     fs_return_view: Option<View>,
     /// Last time the mouse moved over the video (shows the time overlay for `TIME_SHOW`).
@@ -200,7 +200,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
-        let (user_agent, top_country, hardware_decode) = configured_prefs(&opts.data_dir);
+        let (user_agent, top_countries, hardware_decode) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
         let player = Player::new(cc, &user_agent, hardware_decode).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
@@ -220,7 +220,7 @@ impl App {
             playlist_file: opts.playlist_file,
             source,
             user_agent,
-            top_country,
+            top_countries,
             fs_return_view: None,
             mouse_moved: None,
             sub_menu: false,
@@ -281,9 +281,9 @@ impl App {
                     let (tx, rx) = channel();
                     let dir = self.data_dir.clone();
                     let ctx = self.ctx.clone();
-                    let top = self.top_country.clone();
+                    let top = self.top_countries.clone();
                     std::thread::spawn(move || {
-                        let r = fetch::load_cached(&dir, top.as_deref());
+                        let r = fetch::load_cached(&dir, &top);
                         let _ = tx.send(r);
                         ctx.request_repaint();
                     });
@@ -295,7 +295,7 @@ impl App {
                             Some(Refresher::spawn_source(src.clone(), self.data_dir.clone(), RefreshOptions {
                                 force,
                                 user_agent: self.user_agent.clone(),
-                                top_country: self.top_country.clone(),
+                                top_countries: self.top_countries.clone(),
                             }));
                     }
                 }
@@ -310,9 +310,9 @@ impl App {
             self.source = source;
             self.data.set_source(status);
         }
-        // Picks up a `user_agent` / `top_country` edited in config.toml since
+        // Picks up a `user_agent` / `top_countries` edited in config.toml since
         // startup (streams keep the startup user agent until restart).
-        (self.user_agent, self.top_country, _) = configured_prefs(&self.data_dir);
+        (self.user_agent, self.top_countries, _) = configured_prefs(&self.data_dir);
         // Refresh also retries episode-title lookups that found nothing.
         self.titles.retry_failed();
         let a = self.data.request_refresh(force);

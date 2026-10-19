@@ -5,11 +5,13 @@ playlist_url = "http://example.invalid/get.php?username=USER&password=PASS&type=
 # (e.g. "server returned HTTP 454"). Empty or missing = "VLC/3.0.20 LibVLC/3.0.20".
 # user_agent = "VLC/3.0.20 LibVLC/3.0.20"
 
-# Optional: live country to list first (e.g. "Iceland"). The other countries are
-# alphabetical, with "Other" last. Applies after the next refresh (F5) or restart.
-# top_country = "Iceland"
+# Optional: live countries to list first, comma-separated, in this order
+# (e.g. "Iceland, UK"). The other countries are alphabetical, with "Other" last.
+# Applies after the next refresh (F5) or restart.
+# top_countries = "Iceland, UK"
 
-# Optional: use hardware video decoding (default false = software decoding).
+# Optional: use hardware video decoding for streams taller than 1080p (4K) only;
+# everything else stays in software (default false = software for all).
 # Hardware decoding showed black horizontal dashes / blocky corruption on some
 # graphics cards. Needs a restart.
 # hardware_decode = true

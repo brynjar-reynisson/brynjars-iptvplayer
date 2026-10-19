@@ -933,6 +933,23 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Height in pixels of the decoded video (`None` until known).
+    pub fn video_height(&self) -> Option<i64> {
+        get_opt_string(self.core.handle, "height").and_then(|v| v.parse().ok()).filter(|h| *h > 0)
+    }
+
+    /// Change the hardware decoding mode (`no`, `auto-safe`, ...) of the
+    /// running player; mpv re-creates the video decoder, playback continues.
+    pub fn set_hwdec(&mut self, mode: &str) {
+        let (n, v) = (CString::new("hwdec").unwrap(), CString::new(mode).unwrap());
+        unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
+    }
+
+    /// Hardware decoder in use (`no` = software).
+    pub fn hwdec_current(&self) -> String {
+        get_string(self.core.handle, "hwdec-current")
+    }
+
     /// Drain scrubbed warn/error log lines.
     pub fn take_log(&mut self) -> Vec<String> {
         self.log.drain(..).collect()
