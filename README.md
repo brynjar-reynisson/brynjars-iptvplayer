@@ -24,7 +24,7 @@ until you pick something else.
      `VLC/3.0.20 LibVLC/3.0.20`. Some providers block requests that have no known
      player User-Agent. If a refresh fails with "server returned HTTP 454 (blocked?
      check user_agent in config.toml)", try another value.
-   - Optional: `top_countries = "Iceland, UK"` lists those live countries first, in that
+   - Optional: `top_countries = "Iceland, United Kingdom"` lists those live countries first, in that
      order (comma-separated). The rest are alphabetical, with "Other" last. Applies after
      the next refresh (F5) or restart. The old single `top_country` key still works.
    - Optional: `hardware_decode = true` turns on hardware video decoding, but only for
