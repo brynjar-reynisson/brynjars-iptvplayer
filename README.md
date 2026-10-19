@@ -44,7 +44,7 @@ only files needed at runtime.
 
 ### Data directory
 
-`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points) and `settings.json` (hidden
+`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `episode-titles.json` (cached episode titles) and `settings.json` (hidden
 groups) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 
@@ -69,6 +69,10 @@ groups) live in the data directory. The app looks for it in this order:
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.
+- Episode titles: when you open a show, titles (`S01E02 - Title`) are looked up on TVmaze
+  (needs internet; only the show name is sent) and cached in `episode-titles.json` beside the
+  other data files (kept 30 days; not-found results 1 day). Obscure or Nordic shows may not be
+  found; those rows just show `S01E02`.
 - Movies and episodes resume where you stopped (closing the app, stopping, or picking
   something else). Positions are saved every 15 s in `positions.json`. Anything watched to
   within the last minute (or 95 %) counts as finished and starts over, as does anything

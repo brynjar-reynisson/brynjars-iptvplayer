@@ -9,6 +9,8 @@ Known gaps and ideas that were found during implementation and review but not do
 - **Typing in the search and filter boxes with a real keyboard.** Automated runs sometimes lost a key press in text boxes; this is believed to be a test-harness artefact.
 - **Hardware decoding** (`hwdec=auto-safe`) on a wider range of real streams, and resizing / HiDPI with a non-origin video rectangle on other displays.
 
+- **Episode titles, real show.** Open a real show: titles should appear within ~2 s and reopening it should be instant (cached). Also check how well Icelandic/Nordic shows are covered by TVmaze.
+
 ## Behaviour
 
 - **Credential rotation while playing.** `Playback::rebase` updates the playback's URL after a refresh, but the `Supervisor` keeps retrying the URL it was started with. If the provider rotates credentials while something plays, retries keep failing until the channel is selected again. Fix: give the supervisor an `update_url` used on the next (re)load.
@@ -21,6 +23,12 @@ Known gaps and ideas that were found during implementation and review but not do
 - **Pending channel switch after a tab switch** still fires 300 ms later for the old tab's list.
 - **Groups menu** draws ~600 checkboxes unvirtualised when open; fine in practice but a candidate for virtualisation.
 - **Show rows' episode counts** ignore hidden groups, so the count can differ from what opening the show lists.
+- **No setting to turn the episode title lookup off** (it contacts TVmaze whenever a show is opened and not cached).
+- **Second title source (TMDB)** if TVmaze coverage of the playlist's shows turns out to be poor.
+- **Episode numbering differences** between the provider and TVmaze (specials, absolute numbering) can show a wrong or missing title.
+- **Regional tags** `(UK)`/`(US)` are stripped from the show name, so `The Office (UK)` can match the US show (both share one cache key).
+- **Title lookups are serial with a 10 s timeout**, so browsing offline queues delays (errors are retried after 1 h).
+- **Loader tests** use 200 ms sleeps for negative assertions (slightly slow, could be flaky under load).
 
 ## Robustness
 
