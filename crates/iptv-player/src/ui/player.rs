@@ -18,6 +18,17 @@ pub const HW_MIN_HEIGHT: i64 = 1080;
 /// `auto-safe` choice gave corrupt video with the OpenGL render API).
 pub const HW_MODES: &str = "d3d11va-copy,nvdec-copy,dxva2-copy";
 
+/// Decoder tuning for streams above 1080p (software decoding must keep up
+/// with 4K): all cores for frame and slice threading, and cheaper deblocking
+/// of non-reference frames. Reset to `TALL_DEFAULTS` for the next stream.
+pub const TALL_TUNING: [(&str, &str); 3] =
+    [("vd-lavc-threads", "0"), ("vd-lavc-skiploopfilter", "nonref"), ("vd-lavc-fast", "yes")];
+pub const TALL_DEFAULTS: [(&str, &str); 3] =
+    [("vd-lavc-threads", "0"), ("vd-lavc-skiploopfilter", "default"), ("vd-lavc-fast", "no")];
+
+/// How often the playback stats of a tall stream are logged.
+const STATS_EVERY: Duration = Duration::from_secs(5);
+
 /// Whether a video of `height` pixels should be hardware decoded.
 pub fn wants_hwdec(hardware_decode: bool, height: i64) -> bool {
     hardware_decode && height > HW_MIN_HEIGHT
@@ -39,6 +50,10 @@ pub struct Player {
     hw_gen: u32,
     /// Hardware decoding is switched on for the current stream.
     hw_active: bool,
+    /// Tall-stream tuning is applied to the current stream.
+    tuned: bool,
+    /// When the stats were last logged.
+    stats_at: Instant,
     /// For log timestamps.
     t0: Instant,
 }
@@ -61,7 +76,7 @@ impl Player {
         })?;
         eprintln!("libmpv: {}", backend.mpv_version());
         let renderer = backend.renderer().ok_or_else(|| anyhow::anyhow!("libmpv render context missing"))?;
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, t0: Instant::now() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, tuned: false, stats_at: Instant::now(), t0: Instant::now() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -76,10 +91,15 @@ impl Player {
             self.paused = false;
         }
         self.want_sub = None;
-        if self.hw_active {
-            // A new stream starts in software again; it is upgraded when its size is known.
-            self.sup.backend_mut().set_hwdec("no");
+        if self.hw_active || self.tuned {
+            // A new stream starts in plain software again; it is upgraded when its size is known.
+            let b = self.sup.backend_mut();
+            b.set_hwdec("no");
+            for (k, v) in TALL_DEFAULTS {
+                b.set_property(k, v);
+            }
             self.hw_active = false;
+            self.tuned = false;
         }
         eprintln!("{:>9.3}s play (generation {})", self.t0.elapsed().as_secs_f64(), self.sup.generation() + 1);
         self.sup.play_from(url.to_string(), live, start_at, Instant::now());
@@ -167,21 +187,30 @@ impl Player {
                 }
             }
         }
-        // Switch to hardware decoding once a tall enough video plays. A
-        // reconnect (new generation, same stream) keeps it.
-        if self.hardware_decode
-            && !self.hw_active
-            && self.sup.status() == Status::Playing
-            && self.hw_gen != self.sup.generation()
-        {
+        // Tall (above 1080p) video: tune the decoder and, if enabled, switch to
+        // hardware decoding, once per stream when its size is known. A
+        // reconnect (new generation, same stream) keeps both.
+        if self.sup.status() == Status::Playing && self.hw_gen != self.sup.generation() {
             if let Some(h) = self.sup.backend().video_height() {
                 self.hw_gen = self.sup.generation();
-                if wants_hwdec(self.hardware_decode, h) {
-                    self.sup.backend_mut().set_hwdec(HW_MODES);
-                    self.hw_active = true;
-                    eprintln!("hwdec: {h}p video, hardware decoding on");
+                if h > HW_MIN_HEIGHT && !self.tuned {
+                    let b = self.sup.backend_mut();
+                    for (k, v) in TALL_TUNING {
+                        b.set_property(k, v);
+                    }
+                    self.tuned = true;
+                    eprintln!("tuning: {h}p video, decoder tuned");
+                    if wants_hwdec(self.hardware_decode, h) {
+                        b.set_hwdec(HW_MODES);
+                        self.hw_active = true;
+                        eprintln!("hwdec: hardware decoding on");
+                    }
                 }
             }
+        }
+        if self.tuned && self.sup.status() == Status::Playing && self.stats_at.elapsed() >= STATS_EVERY {
+            self.stats_at = Instant::now();
+            eprintln!("{:>9.3}s stats: {}", self.t0.elapsed().as_secs_f64(), self.sup.backend().stats());
         }
         let s = self.sup.status();
         if s != self.last_status {

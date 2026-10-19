@@ -945,6 +945,27 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Set any mpv property by name (decoder options re-create the decoder).
+    pub fn set_property(&mut self, name: &str, value: &str) {
+        let (n, v) = (CString::new(name).unwrap(), CString::new(value).unwrap());
+        unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
+    }
+
+    /// One line of playback health for the log: decoder, dropped frames,
+    /// buffered seconds, measured fps.
+    pub fn stats(&self) -> String {
+        let h = self.core.handle;
+        let p = |k: &str| get_opt_string(h, k).unwrap_or_else(|| "?".into());
+        format!(
+            "hwdec={} dropped: vo={} decoder={} cache={}s fps={}",
+            p("hwdec-current"),
+            p("frame-drop-count"),
+            p("decoder-frame-drop-count"),
+            p("demuxer-cache-duration").chars().take(5).collect::<String>(),
+            p("estimated-vf-fps").chars().take(5).collect::<String>(),
+        )
+    }
+
     /// Hardware decoder in use (`no` = software).
     pub fn hwdec_current(&self) -> String {
         get_string(self.core.handle, "hwdec-current")
