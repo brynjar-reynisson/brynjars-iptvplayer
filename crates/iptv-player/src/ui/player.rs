@@ -14,6 +14,10 @@ use crate::state::status_text;
 /// Hardware decoding is only used for video taller than this (1080p).
 pub const HW_MIN_HEIGHT: i64 = 1080;
 
+/// mpv `hwdec` value used above 1080p: copy-back decoders only (the zero-copy
+/// `auto-safe` choice gave corrupt video with the OpenGL render API).
+pub const HW_MODES: &str = "d3d11va-copy,nvdec-copy,dxva2-copy";
+
 /// Whether a video of `height` pixels should be hardware decoded.
 pub fn wants_hwdec(hardware_decode: bool, height: i64) -> bool {
     hardware_decode && height > HW_MIN_HEIGHT
@@ -173,7 +177,7 @@ impl Player {
             if let Some(h) = self.sup.backend().video_height() {
                 self.hw_gen = self.sup.generation();
                 if wants_hwdec(self.hardware_decode, h) {
-                    self.sup.backend_mut().set_hwdec("auto-safe");
+                    self.sup.backend_mut().set_hwdec(HW_MODES);
                     self.hw_active = true;
                     eprintln!("hwdec: {h}p video, hardware decoding on");
                 }

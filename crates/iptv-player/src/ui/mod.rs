@@ -731,7 +731,11 @@ impl App {
         match enter_action(self.selected_entry(), self.playing_entry()) {
             EnterAction::OpenPlayer => {
                 self.zap.cancel();
-                self.set_fullscreen(ctx, true);
+                // Enter on the playing channel does nothing more (fullscreen is
+                // double-click / F11 / the button); a movie or episode goes fullscreen.
+                if self.playback.as_ref().is_some_and(|p| !p.is_live()) {
+                    self.set_fullscreen(ctx, true);
+                }
             }
             EnterAction::Play(e) => self.play_from(self.tab_list(), e, self.tab),
             EnterAction::Nothing if self.tab == Tab::Favorites && self.fav.cursor().is_some() => {
