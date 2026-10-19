@@ -56,9 +56,10 @@ groups) live in the data directory. The app looks for it in this order:
 - **Up/Down** move the selection. While live TV plays, they also switch channel after a
   short pause (300 ms), so holding the key opens only one stream.
 - Live TV: **Right** works like Enter on the channel list (plays the selected channel). **Left**
-  moves the keyboard to the country list (outlined); Up/Down then change country, and **Right**
+  moves the keyboard to the country list (outlined); Up/Down then walk the rows, and **Right**
   or **Enter** go back into the channels and play the first one. **Esc** also leaves the country
-  list.
+  list. The selected country is opened to show its groups (Sport, Kids, News, ...) indented
+  under it: pick the country row for all its channels or a group row for just that group.
 - **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's
   bottom right (or **F11** / **Alt+Enter**) makes the player fill the whole screen, without
   the channel list. **Esc** goes back to how it was before. Otherwise **Esc** leaves the filter box, or stops
