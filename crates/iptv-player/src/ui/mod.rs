@@ -10,6 +10,7 @@
 
 pub mod live;
 pub mod player;
+pub mod previews;
 pub mod vod;
 
 use std::collections::HashSet;
@@ -38,6 +39,7 @@ use crate::state::vod::{
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::seek::{self, SeekState};
+use previews::Previews;
 use crate::state::{format_bytes, format_hms, safe_text, tab_enter_visible, Tab};
 
 /// How long the played/total time stays visible after the mouse last moved.
@@ -141,6 +143,8 @@ struct App {
     activity: Option<Instant>,
     /// Seek bar state (movies/episodes).
     seek: SeekState,
+    /// Preview frames above the seek bar.
+    previews: Previews,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -214,6 +218,7 @@ impl App {
         let positions = Positions::load(&opts.data_dir);
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
+        let user_agent_for_previews = user_agent.clone();
         let wake = cc.egui_ctx.clone();
         let search = SearchWorker::spawn(move || wake.request_repaint());
         let wake = cc.egui_ctx.clone();
@@ -228,6 +233,7 @@ impl App {
             fs_return_view: None,
             activity: None,
             seek: SeekState::default(),
+            previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             sub_menu: false,
             sub_cursor: 0,
             positions,
@@ -482,6 +488,7 @@ impl App {
         }
         self.sub_menu = false;
         self.seek.reset();
+        self.previews.reset();
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
@@ -586,6 +593,7 @@ impl App {
         }
         self.playback = None;
         self.sub_menu = false;
+        self.previews.reset();
         self.view = View::Browse;
     }
 
@@ -1216,9 +1224,19 @@ impl App {
         painter.text(egui::pos2(strip.right() - PAD, y), egui::Align2::RIGHT_CENTER, format_hms(dur), font.clone(), dim);
         if resp.hovered() || self.seek.dragging() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            // Time under the mouse, above the bar.
+            // Time under the mouse, above the bar, with a preview frame above that.
             if let Some(m) = ui.ctx().pointer_latest_pos() {
-                let label = format_hms(if self.seek.dragging() { shown } else { at(m.x) });
+                let secs = if self.seek.dragging() { shown } else { at(m.x) };
+                let url = self.playback.as_ref().map(|p| p.url().to_string());
+                if let Some(tex) = url.and_then(|u| self.previews.at(&u, secs)) {
+                    let size = tex.size_vec2();
+                    let cx = m.x.clamp(strip.left() + size.x / 2.0, strip.right() - size.x / 2.0);
+                    let r = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 32.0 - size.y / 2.0), size);
+                    let pt = ui.painter();
+                    pt.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    pt.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)), egui::StrokeKind::Outside);
+                }
+                let label = format_hms(secs);
                 let galley = ui.painter().layout_no_wrap(label, font, egui::Color32::WHITE);
                 let w = galley.size() + egui::vec2(12.0, 6.0);
                 let cx = m.x.clamp(bar.left(), bar.right());
@@ -1627,6 +1645,7 @@ impl eframe::App for App {
         }
         self.poll_background();
         self.titles.poll();
+        self.previews.poll(&ctx);
         if let Ok(p) = &mut self.player {
             p.update();
             if p.status() == Status::Finished {
