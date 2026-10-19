@@ -63,6 +63,12 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
+/// Seconds as `hh:mm:ss` (negative/NaN clamp to 0).
+pub fn format_hms(secs: f64) -> String {
+    let s = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
 /// Last line of defence before any error/warning text reaches the screen:
 /// redacts anything URL-shaped (messages from `fetch` are already scrubbed).
 pub fn safe_text(msg: &str) -> String {
@@ -72,6 +78,14 @@ pub fn safe_text(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hms() {
+        assert_eq!(format_hms(0.0), "00:00:00");
+        assert_eq!(format_hms(3725.9), "01:02:05");
+        assert_eq!(format_hms(-4.0), "00:00:00");
+        assert_eq!(format_hms(f64::NAN), "00:00:00");
+    }
 
     #[test]
     fn status_texts() {

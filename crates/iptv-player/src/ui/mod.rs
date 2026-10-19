@@ -35,7 +35,10 @@ use crate::state::vod::{
     visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
-use crate::state::{format_bytes, safe_text, Tab};
+use crate::state::{format_bytes, format_hms, safe_text, Tab};
+
+/// How long the played/total time stays visible after the mouse last moved.
+const TIME_SHOW: Duration = Duration::from_secs(3);
 use live::{ListView, RowAction};
 use player::Player;
 
@@ -130,6 +133,8 @@ struct App {
     top_country: Option<String>,
     /// View to return to when leaving fullscreen.
     fs_return_view: Option<View>,
+    /// Last time the mouse moved over the video (shows the time overlay for `TIME_SHOW`).
+    mouse_moved: Option<Instant>,
     /// Where movies/episodes stopped (`positions.json`), for resuming.
     positions: Positions,
     /// Last time the playing position was written to disk.
@@ -202,6 +207,7 @@ impl App {
             user_agent,
             top_country,
             fs_return_view: None,
+            mouse_moved: None,
             positions,
             positions_saved: Instant::now(),
             data,
@@ -980,6 +986,29 @@ impl App {
                     }
                     if self.view != View::Player {
                         r.on_hover_text("Double-click: full view");
+                    }
+                    // Played/total time at the bottom centre for a few seconds after the mouse moves over the video.
+                    if ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO) && ui.rect_contains_pointer(rect) {
+                        self.mouse_moved = Some(Instant::now());
+                    }
+                    if let (Some(t), Some((pos, dur))) = (self.mouse_moved, p.position()) {
+                        let left = TIME_SHOW.saturating_sub(t.elapsed());
+                        if !left.is_zero() {
+                            let total = dur.map_or_else(|| "--:--:--".to_string(), format_hms);
+                            let galley = ui.painter().layout_no_wrap(
+                                format!("{}/{total}", format_hms(pos)),
+                                egui::FontId::monospace(16.0),
+                                egui::Color32::WHITE,
+                            );
+                            let bg = egui::Rect::from_center_size(
+                                egui::pos2(rect.center().x, rect.bottom() - 25.0),
+                                galley.size() + egui::vec2(20.0, 8.0),
+                            );
+                            let pt = ui.painter_at(rect);
+                            pt.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(160));
+                            pt.galley(bg.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+                            ui.ctx().request_repaint_after(left);
+                        }
                     }
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
