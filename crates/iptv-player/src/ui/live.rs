@@ -147,15 +147,33 @@ where
     action
 }
 
-/// Country list (left panel). Returns a clicked country index.
-pub fn countries(ui: &mut egui::Ui, lib: &Library, selected: Option<usize>, view: &mut ListView, scroll_to: Option<usize>) -> Option<usize> {
+/// Country list (left panel); the selected country is followed by its
+/// groups. Returns the clicked `(country, group)`.
+pub fn countries(
+    ui: &mut egui::Ui,
+    lib: &Library,
+    selected: (Option<usize>, Option<usize>),
+    view: &mut ListView,
+    scroll_to: Option<usize>,
+) -> Option<(usize, Option<usize>)> {
     let cs = lib.countries();
-    let a = list(ui, "countries", cs.len(), view, scroll_to, |ui, i| {
-        let label = format!("{}  ({})", cs[i].name, cs[i].channels.len());
-        row(ui, RowLook { text: &label, selected: selected == Some(i), playing: false, star: false, greyed: false })
+    let groups = selected.0.and_then(|c| cs.get(c)).map_or(0, |c| c.groups.len());
+    // Row r: a country, or (for the rows right after the selected one) a group of it.
+    let at = |r: usize| match selected.0 {
+        Some(s) if r > s && r <= s + groups => (s, Some(r - s - 1)),
+        Some(s) if r > s + groups => (r - groups, None),
+        _ => (r, None),
+    };
+    let a = list(ui, "countries", cs.len() + groups, view, scroll_to, |ui, r| {
+        let (c, g) = at(r);
+        let (label, is_selected) = match g {
+            Some(g) => (format!("      {}  ({})", cs[c].groups[g].name, cs[c].groups[g].channels.len()), selected.1 == Some(g)),
+            None => (format!("{}  ({})", cs[c].name, cs[c].channels.len()), selected.0 == Some(c) && selected.1.is_none()),
+        };
+        row(ui, RowLook { text: &label, selected: is_selected, playing: false, star: false, greyed: false })
     });
     a.map(|a| match a {
-        RowAction::Click(i) | RowAction::DoubleClick(i) => i,
+        RowAction::Click(r) | RowAction::DoubleClick(r) => at(r),
     })
 }
 

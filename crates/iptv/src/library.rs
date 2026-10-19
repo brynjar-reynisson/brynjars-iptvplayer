@@ -5,7 +5,25 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Country {
     pub name: String,
+    /// All live channels of the country (in playlist order).
     pub channels: Vec<usize>,
+    /// The country's sub-groups (the part after `Country - ` of the playlist
+    /// group; for "Other" the whole group title), in first-seen order.
+    pub groups: Vec<ChannelGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelGroup {
+    pub name: String,
+    pub channels: Vec<usize>,
+}
+
+/// Add entry `i` to the group `name` of `groups` (created on first use).
+fn push_group(groups: &mut Vec<ChannelGroup>, name: &str, i: usize) {
+    match groups.iter_mut().find(|g| g.name == name) {
+        Some(g) => g.channels.push(i),
+        None => groups.push(ChannelGroup { name: name.to_string(), channels: vec![i] }),
+    }
 }
 
 pub struct Library {
@@ -122,6 +140,7 @@ impl Library {
         let mut countries: Vec<Country> = Vec::new();
         let mut pos: HashMap<String, usize> = HashMap::new();
         let mut other: Vec<usize> = Vec::new();
+        let mut other_groups: Vec<ChannelGroup> = Vec::new();
         let mut movies = Vec::new();
         let mut series = Builder::new();
         let mut live_idx = NameIndex::default();
@@ -135,14 +154,18 @@ impl Library {
                     // An empty country (" - X") and a real "Other - X" join
                     // the catch-all "Other" (always last, never duplicated).
                     match e.group.split_once(" - ").filter(|(c, _)| !c.trim().is_empty() && *c != OTHER) {
-                        Some((c, _)) => {
+                        Some((c, g)) => {
                             let p = *pos.entry(c.to_string()).or_insert_with(|| {
-                                countries.push(Country { name: c.to_string(), channels: Vec::new() });
+                                countries.push(Country { name: c.to_string(), channels: Vec::new(), groups: Vec::new() });
                                 countries.len() - 1
                             });
                             countries[p].channels.push(i);
+                            push_group(&mut countries[p].groups, g.trim(), i);
                         }
-                        None => other.push(i),
+                        None => {
+                            other.push(i);
+                            push_group(&mut other_groups, e.group.trim(), i);
+                        }
                     }
                 }
                 Kind::Movie => {
@@ -159,7 +182,7 @@ impl Library {
             }
         }
         if !other.is_empty() {
-            countries.push(Country { name: OTHER.to_string(), channels: other });
+            countries.push(Country { name: OTHER.to_string(), channels: other, groups: other_groups });
         }
         let shows = series.finish();
         let mut show_idx = NameIndex::default();

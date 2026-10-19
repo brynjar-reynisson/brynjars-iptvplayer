@@ -28,6 +28,8 @@ pub fn filter_channels(lib: &Library, channels: &[usize], query: &str) -> Vec<us
 #[derive(Debug, Default)]
 pub struct LiveBrowser {
     country: Option<usize>,
+    /// Selected group of the selected country (`None` = all its channels).
+    group: Option<usize>,
     filter: String,
     list: ChannelList,
     /// Keyboard focus is on the country list (Up/Down change country).
@@ -42,6 +44,17 @@ impl LiveBrowser {
     /// Selected country (index into `Library::countries`).
     pub fn country(&self) -> Option<usize> {
         self.country
+    }
+
+    /// Selected group (index into the selected country's `groups`).
+    pub fn group(&self) -> Option<usize> {
+        self.group
+    }
+
+    /// Row of the selection in the country panel: countries are one row each
+    /// and the selected country is followed by its groups.
+    pub fn row_index(&self) -> Option<usize> {
+        self.country.map(|c| c + self.group.map_or(0, |g| g + 1))
     }
 
     pub fn filter(&self) -> &str {
@@ -62,11 +75,18 @@ impl LiveBrowser {
     /// otherwise select the first country.
     pub fn set_library(&mut self, old: Option<&Library>, new: &Library) {
         let old_country = old.zip(self.country).and_then(|(l, c)| l.countries().get(c)).map(|c| c.name.clone());
+        let old_group = old
+            .zip(self.country.zip(self.group))
+            .and_then(|(l, (c, g))| l.countries().get(c)?.groups.get(g))
+            .map(|g| g.name.clone());
         let old_key = old.zip(self.list.current()).map(|(l, e)| favorite_key(l.entry(e)));
         let country = old_country
             .and_then(|n| new.countries().iter().position(|c| c.name == n))
             .or(if new.countries().is_empty() { None } else { Some(0) });
         self.country = country;
+        self.group = old_group.and_then(|n| {
+            new.countries().get(country?)?.groups.iter().position(|g| g.name == n)
+        });
         self.rebuild(new);
         if let Some(i) = old_key.and_then(|k| new.find_by_key(&k)) {
             self.list.select_entry(i);
@@ -75,9 +95,35 @@ impl LiveBrowser {
 
     /// Select country `i` (the filter text is kept).
     pub fn select_country(&mut self, lib: &Library, i: usize) {
-        if i < lib.countries().len() && self.country != Some(i) {
+        if i < lib.countries().len() && (self.country != Some(i) || self.group.is_some()) {
             self.country = Some(i);
+            self.group = None;
             self.rebuild(lib);
+        }
+    }
+
+    /// Select group `g` of the selected country (`None` = the whole country).
+    pub fn select_group(&mut self, lib: &Library, g: Option<usize>) {
+        let n = self.country.and_then(|c| lib.countries().get(c)).map_or(0, |c| c.groups.len());
+        let g = g.filter(|g| *g < n);
+        if self.group != g {
+            self.group = g;
+            self.rebuild(lib);
+        }
+    }
+
+    /// Move one row up/down the country panel (wrapping): the selected
+    /// country, then its groups, then the next country.
+    pub fn step_row(&mut self, lib: &Library, delta: i32) {
+        let Some(c) = self.country else {
+            return self.step_country(lib, delta);
+        };
+        let rows = 1 + lib.countries().get(c).map_or(0, |c| c.groups.len()) as i64;
+        let p = self.group.map_or(0, |g| g as i64 + 1) + delta as i64;
+        if (0..rows).contains(&p) {
+            self.select_group(lib, p.checked_sub(1).filter(|g| *g >= 0).map(|g| g as usize));
+        } else {
+            self.step_country(lib, delta);
         }
     }
 
@@ -127,7 +173,13 @@ impl LiveBrowser {
 
     fn rebuild(&mut self, lib: &Library) {
         let items = match self.country.and_then(|c| lib.countries().get(c)) {
-            Some(c) => filter_channels(lib, &c.channels, &self.filter),
+            Some(c) => {
+                let channels = match self.group.and_then(|g| c.groups.get(g)) {
+                    Some(g) => &g.channels,
+                    None => &c.channels,
+                };
+                filter_channels(lib, channels, &self.filter)
+            }
             None => Vec::new(),
         };
         self.list = ChannelList::new(items);
@@ -172,6 +224,37 @@ pub(crate) mod tests {
         b.set_library(None, &lib);
         assert_eq!(b.country(), Some(0));
         assert_eq!(b.list().items(), &[0, 1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn rows_walk_country_then_its_groups_then_next_country() {
+        let lib = sample_lib(); // Sweden: Nationella [0,1], Sport [3,4], Other [5]; Norway: Main [2]
+        let mut b = LiveBrowser::new();
+        b.set_library(None, &lib);
+        assert_eq!((b.country(), b.group(), b.row_index()), (Some(0), None, Some(0)));
+        b.step_row(&lib, 1);
+        assert_eq!((b.country(), b.group(), b.row_index()), (Some(0), Some(0), Some(1)));
+        assert_eq!(b.list().items(), &[0, 1]);
+        b.step_row(&lib, 1);
+        assert_eq!(b.list().items(), &[3, 4]);
+        b.step_row(&lib, 1);
+        assert_eq!(b.list().items(), &[5]);
+        b.step_row(&lib, 1);
+        assert_eq!((b.country(), b.group(), b.row_index()), (Some(1), None, Some(1)));
+        assert_eq!(b.list().items(), &[2]);
+        b.step_row(&lib, -1);
+        assert_eq!((b.country(), b.group()), (Some(0), None), "up from a country goes to the previous country row");
+        b.step_row(&lib, -1);
+        assert_eq!(b.country(), Some(1), "wraps");
+        // A group is kept by name across a library swap; the filter applies inside it.
+        b.select_country(&lib, 0);
+        b.select_group(&lib, Some(1));
+        b.set_filter(&lib, "arets");
+        assert_eq!(b.list().items(), &[4]);
+        b.set_library(Some(&lib), &sample_lib());
+        assert_eq!((b.country(), b.group()), (Some(0), Some(1)));
+        b.select_country(&lib, 0);
+        assert_eq!(b.group(), None, "selecting the country row clears the group");
     }
 
     #[test]

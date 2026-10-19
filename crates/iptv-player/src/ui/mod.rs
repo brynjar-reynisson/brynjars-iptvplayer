@@ -887,12 +887,12 @@ impl App {
         }
         if left {
             self.live.focus_countries();
-            self.country_scroll = self.live.country();
+            self.country_scroll = self.live.row_index();
         }
         if (up || down) && country_active {
             if let Some(lib) = self.shown_lib.clone() {
-                self.live.step_country(&lib, if up { -1 } else { 1 });
-                self.country_scroll = self.live.country();
+                self.live.step_row(&lib, if up { -1 } else { 1 });
+                self.country_scroll = self.live.row_index();
                 self.scroll_to = Some(0);
             }
         } else {
@@ -1349,8 +1349,11 @@ impl App {
             Tab::Live => {
                 egui::Panel::left("countries").resizable(true).default_size(190.0).show(ui, |ui| {
                     let scroll = self.country_scroll.take();
-                    if let Some(c) = live::countries(ui, &lib, self.live.country(), &mut self.country_view, scroll) {
+                    if let Some((c, g)) =
+                        live::countries(ui, &lib, (self.live.country(), self.live.group()), &mut self.country_view, scroll)
+                    {
                         self.live.select_country(&lib, c);
+                        self.live.select_group(&lib, g);
                         self.live.focus_countries();
                         self.scroll_to = Some(0);
                     }
