@@ -138,6 +138,8 @@ struct App {
     mouse_moved: Option<Instant>,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
+    /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
+    sub_cursor: usize,
     /// Where movies/episodes stopped (`positions.json`), for resuming.
     positions: Positions,
     /// Last time the playing position was written to disk.
@@ -212,6 +214,7 @@ impl App {
             fs_return_view: None,
             mouse_moved: None,
             sub_menu: false,
+            sub_cursor: 0,
             positions,
             positions_saved: Instant::now(),
             data,
@@ -460,6 +463,37 @@ impl App {
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
+    }
+
+    /// Menu rows: Off, then the tracks of the playing video.
+    fn sub_rows(&self) -> Vec<Option<i64>> {
+        let tracks = self.player.as_ref().map(Player::sub_tracks).unwrap_or_default();
+        std::iter::once(None).chain(tracks.iter().map(|t| Some(t.id))).collect()
+    }
+
+    /// Up/Down move the highlight (wrapping), Enter picks the row and closes the menu.
+    fn sub_menu_keys(&mut self, up: bool, down: bool, enter: bool) {
+        let rows = self.sub_rows();
+        let n = rows.len();
+        self.sub_cursor = self.sub_cursor.min(n - 1);
+        if up {
+            self.sub_cursor = (self.sub_cursor + n - 1) % n;
+        }
+        if down {
+            self.sub_cursor = (self.sub_cursor + 1) % n;
+        }
+        if enter {
+            self.choose_sub(rows[self.sub_cursor]);
+        }
+    }
+
+    /// Switch subtitles now (playback continues), remember the choice for the show, close the menu.
+    fn choose_sub(&mut self, id: Option<i64>) {
+        self.sub_menu = false;
+        if let Ok(p) = &mut self.player {
+            let choice = p.select_sub(id);
+            self.remember_sub(choice);
+        }
     }
 
     /// Show name of an episode (the key of its remembered subtitle choice).
@@ -779,6 +813,13 @@ impl App {
             self.set_fullscreen(ctx, !fullscreen);
         }
         let esc = esc && !fullscreen;
+        // The open subtitle menu owns Up/Down/Enter.
+        let (up, down, enter) = if self.sub_menu {
+            self.sub_menu_keys(up, down, enter);
+            (false, false, false)
+        } else {
+            (up, down, enter)
+        };
         let typing = ctx.egui_wants_keyboard_input();
         let (fav, space, slash, back) = if typing {
             (false, false, false, false)
@@ -1078,6 +1119,8 @@ impl App {
                         }
                         if s_resp.on_hover_text("Subtitles").clicked() {
                             self.sub_menu = !self.sub_menu;
+                            // Start on the row in use.
+                            self.sub_cursor = tracks.iter().position(|t| Some(t.id) == current).map_or(0, |i| i + 1);
                         }
                         if self.sub_menu {
                             let area = egui::Area::new(egui::Id::unique("sub_menu"))
@@ -1085,20 +1128,51 @@ impl App {
                                 .pivot(egui::Align2::RIGHT_BOTTOM)
                                 .fixed_pos(sbtn.right_top() - egui::vec2(0.0, 6.0))
                                 .show(ui.ctx(), |ui| {
-                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                        ui.set_min_width(160.0);
-                                        if ui.selectable_label(current.is_none(), "Off").clicked() {
-                                            pick_sub = Some(None);
-                                        }
-                                        for t in &tracks {
-                                            if ui.selectable_label(current == Some(t.id), subtitles::label(t)).clicked() {
-                                                pick_sub = Some(Some(t.id));
+                                    // The player's look: black background, white text.
+                                    egui::Frame::NONE
+                                        .fill(egui::Color32::from_black_alpha(220))
+                                        .corner_radius(6.0)
+                                        .inner_margin(6.0)
+                                        .show(ui, |ui| {
+                                            let labels: Vec<(Option<i64>, String)> =
+                                                std::iter::once((None, "Off".to_string()))
+                                                    .chain(tracks.iter().map(|t| (Some(t.id), subtitles::label(t))))
+                                                    .collect();
+                                            for (i, (id, text)) in labels.iter().enumerate() {
+                                                let (row, resp) =
+                                                    ui.allocate_exact_size(egui::vec2(210.0, 26.0), egui::Sense::click());
+                                                if resp.hovered() {
+                                                    self.sub_cursor = i;
+                                                }
+                                                if i == self.sub_cursor {
+                                                    ui.painter().rect_filled(row, 4.0, egui::Color32::from_white_alpha(45));
+                                                }
+                                                ui.painter().text(
+                                                    row.left_center() + egui::vec2(8.0, 0.0),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    text,
+                                                    egui::FontId::proportional(14.0),
+                                                    egui::Color32::WHITE,
+                                                );
+                                                if *id == current {
+                                                    // Dot: the track in use.
+                                                    ui.painter().circle_filled(
+                                                        row.right_center() - egui::vec2(12.0, 0.0),
+                                                        3.5,
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                }
+                                                if resp.clicked() {
+                                                    pick_sub = Some(*id);
+                                                }
                                             }
-                                        }
-                                        if tracks.is_empty() {
-                                            ui.weak("No subtitles in this video");
-                                        }
-                                    });
+                                            if tracks.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new("No subtitles in this video")
+                                                        .color(egui::Color32::from_white_alpha(150)),
+                                                );
+                                            }
+                                        });
                                 });
                             let outside = ui.ctx().input(|i| i.pointer.any_pressed())
                                 && !area.response.contains_pointer()
@@ -1170,8 +1244,9 @@ impl App {
                 self.set_fullscreen(&ui.ctx().clone(), !fs);
             }
             if let (Some(id), Ok(p)) = (pick_sub, &mut self.player) {
-                // Playback continues; the menu stays open for another try.
+                // Playback continues; picking closes the menu.
                 let choice = p.select_sub(id);
+                self.sub_menu = false;
                 self.remember_sub(choice);
             }
             if toggle_pause {
