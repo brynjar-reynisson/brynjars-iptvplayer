@@ -148,9 +148,9 @@ where
 }
 
 /// Country list (left panel). Returns a clicked country index.
-pub fn countries(ui: &mut egui::Ui, lib: &Library, selected: Option<usize>, view: &mut ListView) -> Option<usize> {
+pub fn countries(ui: &mut egui::Ui, lib: &Library, selected: Option<usize>, view: &mut ListView, scroll_to: Option<usize>) -> Option<usize> {
     let cs = lib.countries();
-    let a = list(ui, "countries", cs.len(), view, None, |ui, i| {
+    let a = list(ui, "countries", cs.len(), view, scroll_to, |ui, i| {
         let label = format!("{}  ({})", cs[i].name, cs[i].channels.len());
         row(ui, RowLook { text: &label, selected: selected == Some(i), playing: false, star: false, greyed: false })
     });

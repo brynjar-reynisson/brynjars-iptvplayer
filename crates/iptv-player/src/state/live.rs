@@ -30,6 +30,8 @@ pub struct LiveBrowser {
     country: Option<usize>,
     filter: String,
     list: ChannelList,
+    /// Keyboard focus is on the country list (Up/Down change country).
+    country_focus: bool,
 }
 
 impl LiveBrowser {
@@ -76,6 +78,37 @@ impl LiveBrowser {
         if i < lib.countries().len() && self.country != Some(i) {
             self.country = Some(i);
             self.rebuild(lib);
+        }
+    }
+
+    /// Move to the next/previous country (wrapping); the filter is kept.
+    pub fn step_country(&mut self, lib: &Library, delta: i32) {
+        let n = lib.countries().len() as i64;
+        if n == 0 {
+            return;
+        }
+        let next = match self.country {
+            Some(c) => (c as i64 + delta as i64).rem_euclid(n),
+            None if delta >= 0 => 0,
+            None => n - 1,
+        };
+        self.select_country(lib, next as usize);
+    }
+
+    /// Keyboard focus: country list (true) or channel list (false).
+    pub fn countries_focused(&self) -> bool {
+        self.country_focus
+    }
+
+    pub fn focus_countries(&mut self) {
+        self.country_focus = true;
+    }
+
+    /// Back to the channel list; selects its first channel if none is selected.
+    pub fn focus_channels(&mut self) {
+        self.country_focus = false;
+        if self.list.cursor().is_none() {
+            self.list.step(1);
         }
     }
 
@@ -196,5 +229,43 @@ pub(crate) mod tests {
         b.set_library(Some(&lib), &new);
         assert_eq!(new.countries()[b.country().unwrap()].name, "Norway");
         assert_eq!(b.list().current(), Some(1));
+    }
+
+    #[test]
+    fn step_country_wraps_and_keeps_filter() {
+        let lib = sample_lib();
+        let mut b = LiveBrowser::new();
+        b.set_library(None, &lib);
+        b.set_filter(&lib, "nrk");
+        b.step_country(&lib, 1);
+        assert_eq!(lib.countries()[b.country().unwrap()].name, "Norway");
+        assert_eq!(b.list().items(), &[2], "filter kept across countries");
+        b.step_country(&lib, 1);
+        assert_eq!(b.country(), Some(0), "wraps forward");
+        b.step_country(&lib, -1);
+        assert_eq!(lib.countries()[b.country().unwrap()].name, "Norway", "wraps back");
+    }
+
+    #[test]
+    fn focus_channels_selects_first_when_nothing_selected() {
+        let lib = sample_lib();
+        let mut b = LiveBrowser::new();
+        b.set_library(None, &lib);
+        assert!(!b.countries_focused());
+        b.focus_countries();
+        assert!(b.countries_focused());
+        b.step_country(&lib, 1);
+        assert_eq!(b.list().cursor(), None);
+        b.focus_channels();
+        assert!(!b.countries_focused());
+        assert_eq!(b.list().cursor(), Some(0));
+        // An existing selection is kept (Sweden has several channels).
+        b.focus_countries();
+        b.step_country(&lib, -1);
+        b.focus_channels();
+        b.list_mut().step(1);
+        b.focus_countries();
+        b.focus_channels();
+        assert_eq!(b.list().cursor(), Some(1));
     }
 }

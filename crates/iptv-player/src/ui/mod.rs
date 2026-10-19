@@ -165,6 +165,8 @@ struct App {
     focus_filter: bool,
     scroll_to: Option<usize>,
     country_view: ListView,
+    /// Country row to scroll into view (keyboard country navigation).
+    country_scroll: Option<usize>,
     channel_view: ListView,
     fav_view: ListView,
     /// `settings.json` (hidden movie/series groups).
@@ -242,6 +244,7 @@ impl App {
             focus_filter: false,
             scroll_to: None,
             country_view: ListView::default(),
+            country_scroll: None,
             channel_view: ListView::default(),
             fav_view: ListView::default(),
             settings,
@@ -843,6 +846,21 @@ impl App {
             (up, down, enter)
         };
         let typing = ctx.egui_wants_keyboard_input();
+        // Live browse: Left goes to the country list, Right = Enter. Not while a
+        // tab button has focus (arrows move between the buttons then).
+        let live_keys = self.tab == Tab::Live
+            && self.view == View::Browse
+            && !fullscreen
+            && !self.sub_menu
+            && !typing
+            && self.focused_tab.is_none();
+        let country_active = live_keys && self.live.countries_focused();
+        let (left, right) = if live_keys {
+            ctx.input_mut(|i| (i.consume_key(M::NONE, Key::ArrowLeft), i.consume_key(M::NONE, Key::ArrowRight)))
+        } else {
+            (false, false)
+        };
+        let enter = enter || right;
         // C opens/closes the subtitle menu (movies and episodes only).
         let vod_playing = self.playback.as_ref().is_some_and(|p| !p.is_live());
         let (fav, space, slash, back, sub_key) = if typing {
@@ -868,13 +886,30 @@ impl App {
         if sub_key {
             self.toggle_sub_menu();
         }
-        if up {
-            self.step(-1);
+        if left {
+            self.live.focus_countries();
+            self.country_scroll = self.live.country();
         }
-        if down {
-            self.step(1);
+        if (up || down) && country_active {
+            if let Some(lib) = self.shown_lib.clone() {
+                self.live.step_country(&lib, if up { -1 } else { 1 });
+                self.country_scroll = self.live.country();
+                self.scroll_to = Some(0);
+            }
+        } else {
+            if up {
+                self.step(-1);
+            }
+            if down {
+                self.step(1);
+            }
         }
         if enter {
+            if country_active {
+                // Into the channels: select the first one; below it is played.
+                self.live.focus_channels();
+                self.scroll_to = self.live.list().cursor();
+            }
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
@@ -897,6 +932,8 @@ impl App {
         if esc {
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
+            } else if self.tab == Tab::Live && self.view == View::Browse && self.live.countries_focused() {
+                self.live.focus_channels();
             } else if self.view == View::Player || self.playback.is_some() {
                 self.stop();
             } else {
@@ -924,6 +961,7 @@ impl App {
                 }
                 _ => {
                     self.tab = Tab::Live;
+                    self.live.focus_channels();
                     self.focus_filter = true;
                 }
             }
@@ -1109,9 +1147,6 @@ impl App {
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
                         toggle_fs = true;
-                    }
-                    if self.view != View::Player {
-                        r.on_hover_text("Double-click: full screen");
                     }
                     // Played/total time at the bottom centre for a few seconds after the mouse moves over the video.
                     if ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO) && ui.rect_contains_pointer(rect) {
@@ -1312,9 +1347,16 @@ impl App {
         match self.tab {
             Tab::Live => {
                 egui::Panel::left("countries").resizable(true).default_size(190.0).show(ui, |ui| {
-                    if let Some(c) = live::countries(ui, &lib, self.live.country(), &mut self.country_view) {
+                    let scroll = self.country_scroll.take();
+                    if let Some(c) = live::countries(ui, &lib, self.live.country(), &mut self.country_view, scroll) {
                         self.live.select_country(&lib, c);
+                        self.live.focus_countries();
                         self.scroll_to = Some(0);
+                    }
+                    if self.live.countries_focused() {
+                        // Keyboard focus is here: outline the panel.
+                        let stroke = egui::Stroke::new(2.0, ui.visuals().selection.bg_fill);
+                        ui.painter().rect_stroke(ui.max_rect(), 2.0, stroke, egui::StrokeKind::Inside);
                     }
                 });
                 egui::Panel::left("channels").resizable(true).default_size(330.0).show(ui, |ui| {
@@ -1332,6 +1374,7 @@ impl App {
                     );
                     if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
                         self.live.list_mut().set_cursor(i);
+                        self.live.focus_channels();
                         let e = self.live.list().current();
                         // A click plays at once and cancels a pending zap.
                         match e {
