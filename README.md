@@ -69,8 +69,11 @@ groups) live in the data directory. The app looks for it in this order:
   performs (**Space** does the same).
 - For movies and episodes, moving the mouse over the video or pressing a key shows a seek
   bar below the video for 3 seconds: the played and total time with a dot at the current
-  position. Click or drag on the bar to jump (the jump happens when you let go), or press
-  **Left**/**Right** to step 10 seconds back/forward.
+  position, and a small preview frame of the video above the mouse (or above the dot after
+  an arrow-key step). Click or drag on the bar to jump (the jump happens when you let go),
+  or press **Left**/**Right** to step 10 seconds back/forward. Previews use a second
+  connection to the provider, opened when you first hover the bar; if the provider refuses
+  it, the bar works without previews.
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.

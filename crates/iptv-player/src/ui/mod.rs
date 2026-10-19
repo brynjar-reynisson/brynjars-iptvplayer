@@ -46,6 +46,8 @@ use crate::state::{format_bytes, format_hms, safe_text, tab_enter_visible, Tab};
 const TIME_SHOW: Duration = Duration::from_secs(3);
 /// Height of the strip below a movie/episode that holds the seek bar.
 const SEEK_BAR_H: f32 = 28.0;
+/// How long the preview stays above the dot after an arrow-key seek.
+const KEY_PREVIEW: Duration = Duration::from_millis(1500);
 use live::{ListView, RowAction};
 use player::Player;
 
@@ -145,6 +147,8 @@ struct App {
     seek: SeekState,
     /// Preview frames above the seek bar.
     previews: Previews,
+    /// Last arrow-key seek (the preview shows above the dot for `KEY_PREVIEW`).
+    key_seek: Option<Instant>,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -234,6 +238,7 @@ impl App {
             activity: None,
             seek: SeekState::default(),
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
+            key_seek: None,
             sub_menu: false,
             sub_cursor: 0,
             positions,
@@ -830,6 +835,8 @@ impl App {
         let target = seek::step_target(from, delta, dur);
         p.seek_to(target);
         self.seek.sought(target, now);
+        self.key_seek = Some(now);
+        self.activity = Some(now);
     }
 
     // ---- input -------------------------------------------------------------
@@ -1222,29 +1229,38 @@ impl App {
         let dim = egui::Color32::from_white_alpha(200);
         painter.text(egui::pos2(strip.left() + PAD, y), egui::Align2::LEFT_CENTER, format_hms(shown), font.clone(), dim);
         painter.text(egui::pos2(strip.right() - PAD, y), egui::Align2::RIGHT_CENTER, format_hms(dur), font.clone(), dim);
-        if resp.hovered() || self.seek.dragging() {
+        let mouse = resp.hovered() || self.seek.dragging();
+        if mouse {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            // Time under the mouse, above the bar, with a preview frame above that.
-            if let Some(m) = ui.ctx().pointer_latest_pos() {
-                let secs = if self.seek.dragging() { shown } else { at(m.x) };
-                let url = self.playback.as_ref().map(|p| p.url().to_string());
-                if let Some(tex) = url.and_then(|u| self.previews.at(&u, secs)) {
-                    let size = tex.size_vec2();
-                    let cx = m.x.clamp(strip.left() + size.x / 2.0, strip.right() - size.x / 2.0);
-                    let r = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 32.0 - size.y / 2.0), size);
-                    let pt = ui.painter();
-                    pt.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    pt.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)), egui::StrokeKind::Outside);
-                }
-                let label = format_hms(secs);
-                let galley = ui.painter().layout_no_wrap(label, font, egui::Color32::WHITE);
-                let w = galley.size() + egui::vec2(12.0, 6.0);
-                let cx = m.x.clamp(bar.left(), bar.right());
-                let bg = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 14.0), w);
+        }
+        // Time and preview frame above the mouse, or above the dot for a moment
+        // after an arrow-key seek.
+        let keying = self.key_seek.map_or(Duration::ZERO, |t| KEY_PREVIEW.saturating_sub(t.elapsed()));
+        if !keying.is_zero() {
+            ui.ctx().request_repaint_after(keying);
+        }
+        let anchor = match ui.ctx().pointer_latest_pos() {
+            Some(m) if mouse => Some((m.x, if self.seek.dragging() { shown } else { at(m.x) })),
+            _ if !keying.is_zero() => Some((x, shown)),
+            _ => None,
+        };
+        if let Some((ax, secs)) = anchor {
+            let url = self.playback.as_ref().map(|p| p.url().to_string());
+            if let Some(tex) = url.and_then(|u| self.previews.at(&u, secs)) {
+                let size = tex.size_vec2();
+                let cx = ax.clamp(strip.left() + size.x / 2.0, strip.right() - size.x / 2.0);
+                let r = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 32.0 - size.y / 2.0), size);
                 let pt = ui.painter();
-                pt.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(200));
-                pt.galley(bg.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+                pt.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                pt.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)), egui::StrokeKind::Outside);
             }
+            let galley = ui.painter().layout_no_wrap(format_hms(secs), font, egui::Color32::WHITE);
+            let w = galley.size() + egui::vec2(12.0, 6.0);
+            let cx = ax.clamp(bar.left(), bar.right());
+            let bg = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 14.0), w);
+            let pt = ui.painter();
+            pt.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(200));
+            pt.galley(bg.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
         }
     }
 
