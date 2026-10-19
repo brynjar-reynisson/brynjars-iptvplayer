@@ -36,7 +36,7 @@ use crate::state::vod::{
     visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
-use crate::state::{format_bytes, format_hms, safe_text, tab_enter, Tab};
+use crate::state::{format_bytes, format_hms, safe_text, tab_enter_visible, Tab};
 
 /// How long the played/total time stays visible after the mouse last moved.
 const TIME_SHOW: Duration = Duration::from_secs(3);
@@ -870,7 +870,7 @@ impl App {
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
-            if let Some((tab, focus_search)) = tab_enter(self.focused_tab) {
+            if let Some((tab, focus_search)) = tab_enter_visible(self.focused_tab, !fullscreen && self.view == View::Browse) {
                 // Enter on a focused tab button opens that tab.
                 self.tab = tab;
                 self.view = View::Browse;

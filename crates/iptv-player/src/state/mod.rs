@@ -41,6 +41,16 @@ pub fn tab_enter(focused: Option<Tab>) -> Option<(Tab, bool)> {
     focused.map(|t| (t, matches!(t, Tab::Movies | Tab::Series)))
 }
 
+/// `tab_enter`, but only while the tab bar is drawn (Browse view, not
+/// fullscreen): `focused_tab` is stale otherwise.
+pub fn tab_enter_visible(focused: Option<Tab>, tab_bar_visible: bool) -> Option<(Tab, bool)> {
+    if tab_bar_visible {
+        tab_enter(focused)
+    } else {
+        None
+    }
+}
+
 /// Player overlay text for a supervisor status ("" while playing normally).
 pub fn status_text(s: Status, retry_in: Option<Duration>) -> String {
     let wait = retry_in.map(|d| format!(" (next try in {:.1} s)", d.as_secs_f32())).unwrap_or_default();
@@ -92,6 +102,12 @@ mod tests {
         assert_eq!(tab_enter(Some(Tab::Live)), Some((Tab::Live, false)));
         assert_eq!(tab_enter(Some(Tab::Favorites)), Some((Tab::Favorites, false)));
         assert_eq!(tab_enter(None), None);
+    }
+
+    #[test]
+    fn tab_enter_ignored_when_tab_bar_hidden() {
+        assert_eq!(tab_enter_visible(Some(Tab::Movies), false), None);
+        assert_eq!(tab_enter_visible(Some(Tab::Movies), true), Some((Tab::Movies, true)));
     }
 
     #[test]
