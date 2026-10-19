@@ -10,4 +10,5 @@ pub mod favorites;
 pub mod settings;
 pub mod subtitles;
 pub mod positions;
+pub mod episode_titles;
 pub mod supervisor;
