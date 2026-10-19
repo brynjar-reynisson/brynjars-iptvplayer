@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use iptv::subtitles::{pick, SubChoice, SubTrack};
 use iptv::supervisor::{Status, Supervisor};
 
 use crate::mpv_backend::{GlInit, MpvBackend, MpvOptions, MpvRenderer};
@@ -15,6 +16,10 @@ pub struct Player {
     renderer: Arc<MpvRenderer>,
     paused: bool,
     last_status: Status,
+    /// Subtitle choice to (re)apply on every load of the current video.
+    want_sub: Option<SubChoice>,
+    /// Supervisor generation `want_sub` was last applied for.
+    sub_gen: u32,
     /// For log timestamps.
     t0: Instant,
 }
@@ -36,7 +41,7 @@ impl Player {
         })?;
         eprintln!("libmpv: {}", backend.mpv_version());
         let renderer = backend.renderer().ok_or_else(|| anyhow::anyhow!("libmpv render context missing"))?;
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, t0: Instant::now() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, t0: Instant::now() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -50,6 +55,7 @@ impl Player {
             self.sup.backend_mut().set_pause(false);
             self.paused = false;
         }
+        self.want_sub = None;
         eprintln!("{:>9.3}s play (generation {})", self.t0.elapsed().as_secs_f64(), self.sup.generation() + 1);
         self.sup.play_from(url.to_string(), live, start_at, Instant::now());
     }
@@ -77,6 +83,34 @@ impl Player {
         self.sup.position()
     }
 
+    /// Subtitle choice to apply once the video plays (and again after a
+    /// reconnect, which resets mpv's own selection). `None` = mpv's default.
+    pub fn set_want_sub(&mut self, want: Option<SubChoice>) {
+        self.want_sub = want;
+        self.sub_gen = 0;
+    }
+
+    pub fn sub_tracks(&self) -> Vec<SubTrack> {
+        self.sup.backend().sub_tracks()
+    }
+
+    /// Selected subtitle track id (`None` = off).
+    pub fn current_sub(&self) -> Option<i64> {
+        self.sup.backend().current_sub()
+    }
+
+    /// The user picked a track (`None` = off): switch now, playback continues.
+    /// Returns what to remember for the next episodes.
+    pub fn select_sub(&mut self, id: Option<i64>) -> SubChoice {
+        let choice = id
+            .and_then(|id| self.sub_tracks().into_iter().find(|t| t.id == id))
+            .map_or(SubChoice::Off, |t| SubChoice::of(&t));
+        self.sup.backend_mut().set_sub(id);
+        self.want_sub = Some(choice.clone());
+        self.sub_gen = self.sup.generation();
+        choice
+    }
+
     pub fn paused(&self) -> bool {
         self.paused
     }
@@ -98,6 +132,15 @@ impl Player {
         self.sup.tick(now);
         for line in self.sup.backend_mut().take_log() {
             eprintln!("mpv {line}"); // already scrubbed by the backend
+        }
+        // Apply the wanted subtitles once per load, as soon as it plays.
+        if self.sup.status() == Status::Playing && self.sub_gen != self.sup.generation() {
+            self.sub_gen = self.sup.generation();
+            if let Some(want) = &self.want_sub {
+                if let Some(sel) = pick(&self.sup.backend().sub_tracks(), want) {
+                    self.sup.backend_mut().set_sub(sel);
+                }
+            }
         }
         let s = self.sup.status();
         if s != self.last_status {

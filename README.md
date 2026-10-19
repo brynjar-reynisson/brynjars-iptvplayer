@@ -66,6 +66,9 @@ groups) live in the data directory. The app looks for it in this order:
   performs (**Space** does the same).
 - For movies and episodes, moving the mouse over the video shows the played and total
   time (`hh:mm:ss/hh:mm:ss`) at the bottom centre for 3 seconds.
+- Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
+  playback continues. For series the choice is remembered per show and matched in later
+  episodes (by language); stored in `settings.json`.
 - Movies and episodes resume where you stopped (closing the app, stopping, or picking
   something else). Positions are saved every 15 s in `positions.json`. Anything watched to
   within the last minute (or 95 %) counts as finished and starts over, as does anything

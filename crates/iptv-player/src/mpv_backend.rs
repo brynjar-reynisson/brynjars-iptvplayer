@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use eframe::glow::{self, HasContext};
 use iptv::redact::redact_url;
+use iptv::subtitles::SubTrack;
 use iptv::supervisor::{Backend, ErrorClass, PlayerEvent};
 use libmpv2_sys as sys;
 
@@ -899,6 +900,39 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Subtitle tracks of the loaded file (empty until it is open).
+    pub fn sub_tracks(&self) -> Vec<SubTrack> {
+        let h = self.core.handle;
+        let n: usize = get_opt_string(h, "track-list/count").and_then(|c| c.parse().ok()).unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..n {
+            let prop = |k: &str| get_opt_string(h, &format!("track-list/{i}/{k}"));
+            if prop("type").as_deref() != Some("sub") {
+                continue;
+            }
+            let Some(id) = prop("id").and_then(|v| v.parse().ok()) else { continue };
+            out.push(SubTrack {
+                id,
+                lang: prop("lang").filter(|l| !l.is_empty()),
+                title: prop("title").filter(|t| !t.is_empty()),
+                forced: prop("forced").as_deref() == Some("yes"),
+            });
+        }
+        out
+    }
+
+    /// Selected subtitle track id (`None` = off).
+    pub fn current_sub(&self) -> Option<i64> {
+        get_opt_string(self.core.handle, "sid").and_then(|v| v.parse().ok())
+    }
+
+    /// Select a subtitle track, or `None` for off. Playback continues.
+    pub fn set_sub(&mut self, id: Option<i64>) {
+        let n = CString::new("sid").unwrap();
+        let v = CString::new(id.map_or_else(|| "no".to_string(), |i| i.to_string())).unwrap();
+        unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
+    }
+
     /// Drain scrubbed warn/error log lines.
     pub fn take_log(&mut self) -> Vec<String> {
         self.log.drain(..).collect()
@@ -970,15 +1004,20 @@ impl MpvBackend {
 }
 
 fn get_string(handle: *mut sys::mpv_handle, name: &str) -> String {
-    let name = CString::new(name).unwrap();
+    get_opt_string(handle, name).unwrap_or_else(|| String::from("?"))
+}
+
+/// A property as text; `None` if mpv has no such property or value.
+fn get_opt_string(handle: *mut sys::mpv_handle, name: &str) -> Option<String> {
+    let name = CString::new(name).ok()?;
     unsafe {
         let p = sys::mpv_get_property_string(handle, name.as_ptr());
         if p.is_null() {
-            return String::from("?");
+            return None;
         }
         let s = CStr::from_ptr(p).to_string_lossy().into_owned();
         sys::mpv_free(p as *mut c_void);
-        s
+        Some(s)
     }
 }
 

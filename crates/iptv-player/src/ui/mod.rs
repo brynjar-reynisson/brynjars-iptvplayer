@@ -22,9 +22,10 @@ use eframe::egui;
 use iptv::favorites::Favorites;
 use iptv::fetch::{self, RefreshEvent, RefreshOptions, Refresher, Source};
 use iptv::library::{Library, SearchScope};
-use iptv::playlist::favorite_key;
+use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
 use iptv::settings::Settings;
+use iptv::subtitles;
 use iptv::supervisor::Status;
 
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
@@ -135,6 +136,8 @@ struct App {
     fs_return_view: Option<View>,
     /// Last time the mouse moved over the video (shows the time overlay for `TIME_SHOW`).
     mouse_moved: Option<Instant>,
+    /// The subtitle menu above the video is open.
+    sub_menu: bool,
     /// Where movies/episodes stopped (`positions.json`), for resuming.
     positions: Positions,
     /// Last time the playing position was written to disk.
@@ -208,6 +211,7 @@ impl App {
             top_country,
             fs_return_view: None,
             mouse_moved: None,
+            sub_menu: false,
             positions,
             positions_saved: Instant::now(),
             data,
@@ -445,12 +449,32 @@ impl App {
         self.save_position();
         let resume = if pb.is_live() { None } else { self.positions.resume_for(pb.key()) };
         match &mut self.player {
-            Ok(p) => p.play_from(pb.url(), pb.is_live(), resume),
+            Ok(p) => {
+                p.play_from(pb.url(), pb.is_live(), resume);
+                let pref = Self::sub_show(&pb).and_then(|show| self.settings.sub_pref(&show).cloned());
+                p.set_want_sub(pref);
+            }
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
+        self.sub_menu = false;
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
+    }
+
+    /// Show name of an episode (the key of its remembered subtitle choice).
+    fn sub_show(pb: &Playback) -> Option<String> {
+        let kind = pb.entry_index().map(|i| pb.library().entry(i).kind)?;
+        (kind == Kind::Series).then(|| iptv::series::parse_episode(pb.name()).map(|r| r.show)).flatten()
+    }
+
+    /// The user picked subtitles: remember the choice for the show's next episodes.
+    fn remember_sub(&mut self, choice: subtitles::SubChoice) {
+        let Some(show) = self.playback.as_ref().and_then(Self::sub_show) else { return };
+        self.settings.set_sub_pref(&show, choice);
+        if let Err(e) = self.settings.save() {
+            self.message = Some(safe_text(&format!("Could not save settings: {e:#}")));
+        }
     }
 
     /// Remember where the playing movie/episode is (live is never saved).
@@ -496,6 +520,7 @@ impl App {
             p.stop();
         }
         self.playback = None;
+        self.sub_menu = false;
         self.view = View::Browse;
     }
 
@@ -741,6 +766,13 @@ impl App {
                 i.consume_key(M::COMMAND, Key::F),
             )
         });
+        // Esc closes the subtitle menu before it does anything else.
+        let esc = if esc && self.sub_menu {
+            self.sub_menu = false;
+            false
+        } else {
+            esc
+        };
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if toggle_fs || (esc && fullscreen) {
             // Esc only leaves fullscreen; it does nothing else this press.
@@ -978,6 +1010,7 @@ impl App {
             let rect = ui.max_rect();
             let mut toggle_pause = false;
             let mut toggle_fs = false;
+            let mut pick_sub: Option<Option<i64>> = None;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
@@ -1019,6 +1052,62 @@ impl App {
                     }
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
+                    // Subtitle button ("CC"), movies and episodes only, left of the play/pause button.
+                    if !pb.is_live() {
+                        let sbtn = btn.translate(egui::vec2(-76.0, 0.0));
+                        let s_resp = ui.interact(sbtn, egui::Id::unique("sub_btn"), egui::Sense::click());
+                        let tracks = if self.sub_menu || s_resp.hovered() { p.sub_tracks() } else { Vec::new() };
+                        let current = p.current_sub();
+                        let sa = if s_resp.hovered() || self.sub_menu { 230 } else { 140 };
+                        let sp = ui.painter_at(rect);
+                        sp.rect_filled(sbtn, 4.0, egui::Color32::from_black_alpha(sa / 2));
+                        sp.text(
+                            sbtn.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "CC",
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_white_alpha(sa),
+                        );
+                        if current.is_some() {
+                            // Underline: subtitles are on.
+                            let y = sbtn.center().y + 9.0;
+                            sp.line_segment(
+                                [egui::pos2(sbtn.center().x - 9.0, y), egui::pos2(sbtn.center().x + 9.0, y)],
+                                egui::Stroke::new(2.0, egui::Color32::from_white_alpha(sa)),
+                            );
+                        }
+                        if s_resp.on_hover_text("Subtitles").clicked() {
+                            self.sub_menu = !self.sub_menu;
+                        }
+                        if self.sub_menu {
+                            let area = egui::Area::new(egui::Id::unique("sub_menu"))
+                                .order(egui::Order::Foreground)
+                                .pivot(egui::Align2::RIGHT_BOTTOM)
+                                .fixed_pos(sbtn.right_top() - egui::vec2(0.0, 6.0))
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(160.0);
+                                        if ui.selectable_label(current.is_none(), "Off").clicked() {
+                                            pick_sub = Some(None);
+                                        }
+                                        for t in &tracks {
+                                            if ui.selectable_label(current == Some(t.id), subtitles::label(t)).clicked() {
+                                                pick_sub = Some(Some(t.id));
+                                            }
+                                        }
+                                        if tracks.is_empty() {
+                                            ui.weak("No subtitles in this video");
+                                        }
+                                    });
+                                });
+                            let outside = ui.ctx().input(|i| i.pointer.any_pressed())
+                                && !area.response.contains_pointer()
+                                && !sbtn.contains(ui.ctx().pointer_latest_pos().unwrap_or_default());
+                            if outside {
+                                self.sub_menu = false;
+                            }
+                        }
+                    }
                     // Play/pause button, left of it: shows the action a click performs.
                     let pbtn = btn.translate(egui::vec2(-38.0, 0.0));
                     let pb_resp = ui.interact(pbtn, egui::Id::unique("pause_btn"), egui::Sense::click());
@@ -1079,6 +1168,11 @@ impl App {
             if toggle_fs {
                 let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
                 self.set_fullscreen(&ui.ctx().clone(), !fs);
+            }
+            if let (Some(id), Ok(p)) = (pick_sub, &mut self.player) {
+                // Playback continues; the menu stays open for another try.
+                let choice = p.select_sub(id);
+                self.remember_sub(choice);
             }
             if toggle_pause {
                 if let Ok(p) = &mut self.player {

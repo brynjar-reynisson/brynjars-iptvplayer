@@ -1,11 +1,14 @@
 //! User settings (`settings.json` beside `favorites.json`): the group titles
-//! hidden from Movies/Series results. Same safety rules as favorites: atomic
+//! hidden from Movies/Series results, and the subtitle choice remembered per show. Same safety rules as favorites: atomic
 //! writes, and an unreadable file (corrupt, unknown/future version) is moved
 //! aside to `settings.json.bad[.N]`, never deleted or overwritten.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use crate::subtitles::SubChoice;
 
 const FORMAT_VERSION: u64 = 1;
 
@@ -14,7 +17,12 @@ struct SettingsFile {
     version: u64,
     #[serde(default)]
     hidden_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sub_prefs: BTreeMap<String, SubChoice>,
 }
+
+/// Most shows with a remembered subtitle choice.
+const MAX_SUB_PREFS: usize = 1000;
 
 /// Settings store. Each instance is an in-memory copy; `save` rewrites the
 /// whole file.
@@ -24,6 +32,8 @@ pub struct Settings {
     /// Group titles (e.g. `Movies: Arabic`) hidden from Movies/Series results,
     /// sorted, no duplicates.
     pub hidden_groups: Vec<String>,
+    /// Subtitle choice per show (key: lowercased show name).
+    sub_prefs: BTreeMap<String, SubChoice>,
     /// Set when an unreadable settings.json could not be moved aside; `save`
     /// then refuses so the original is never overwritten.
     blocked: Option<String>,
@@ -33,7 +43,7 @@ pub fn path_in(dir: &Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-fn parse(bytes: &[u8]) -> Option<Vec<String>> {
+fn parse(bytes: &[u8]) -> Option<(Vec<String>, BTreeMap<String, SubChoice>)> {
     let f: SettingsFile = serde_json::from_slice(bytes).ok()?;
     if f.version != FORMAT_VERSION {
         return None;
@@ -41,7 +51,7 @@ fn parse(bytes: &[u8]) -> Option<Vec<String>> {
     let mut g = f.hidden_groups;
     g.sort();
     g.dedup();
-    Some(g)
+    Some((g, f.sub_prefs))
 }
 
 impl Settings {
@@ -53,13 +63,14 @@ impl Settings {
 
     fn load_with(dir: &Path, mover: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Settings {
         let path = path_in(dir);
-        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), blocked: None };
+        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), sub_prefs: BTreeMap::new(), blocked: None };
         let unreadable = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return s,
             Err(_) => true,
             Ok(bytes) => match parse(&bytes) {
-                Some(g) => {
+                Some((g, prefs)) => {
                     s.hidden_groups = g;
+                    s.sub_prefs = prefs;
                     false
                 }
                 None => true,
@@ -92,7 +103,20 @@ impl Settings {
         }
     }
 
-    /// Atomic write of `{"version":1,"hidden_groups":[...]}`.
+    pub fn sub_pref(&self, show: &str) -> Option<&SubChoice> {
+        self.sub_prefs.get(&show.to_lowercase())
+    }
+
+    /// Remember the subtitle choice for `show` (in memory; call `save`).
+    pub fn set_sub_pref(&mut self, show: &str, choice: SubChoice) {
+        let key = show.to_lowercase();
+        if self.sub_prefs.len() >= MAX_SUB_PREFS && !self.sub_prefs.contains_key(&key) {
+            self.sub_prefs.pop_first();
+        }
+        self.sub_prefs.insert(key, choice);
+    }
+
+    /// Atomic write of `{"version":1,"hidden_groups":[...],"sub_prefs":{...}}`.
     pub fn save(&self) -> Result<()> {
         if let Some(msg) = &self.blocked {
             return Err(anyhow!("{msg}"));
@@ -101,6 +125,7 @@ impl Settings {
         let json = serde_json::to_vec_pretty(&SettingsFile {
             version: FORMAT_VERSION,
             hidden_groups: self.hidden_groups.clone(),
+            sub_prefs: self.sub_prefs.clone(),
         })
         .context("serializing settings")?;
         crate::fsutil::atomic_write(&path, &json).with_context(|| format!("writing {}", path.display()))
@@ -138,6 +163,25 @@ mod tests {
         for e in std::fs::read_dir(d.path()).unwrap() {
             assert!(!e.unwrap().file_name().to_string_lossy().ends_with(".tmp"));
         }
+    }
+
+    #[test]
+    fn sub_prefs_roundtrip_case_insensitive_and_capped() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Settings::load(d.path());
+        let c = SubChoice::Track { lang: Some("en".into()), title: None, forced: false };
+        s.set_sub_pref("The Show (2019)", c.clone());
+        s.set_sub_pref("Other", SubChoice::Off);
+        s.save().unwrap();
+        let g = Settings::load(d.path());
+        assert_eq!(g.sub_pref("the show (2019)"), Some(&c));
+        assert_eq!(g.sub_pref("OTHER"), Some(&SubChoice::Off));
+        assert_eq!(g.sub_pref("missing"), None);
+        let mut s = g;
+        for i in 0..MAX_SUB_PREFS + 5 {
+            s.set_sub_pref(&format!("show {i:05}"), SubChoice::Off);
+        }
+        assert_eq!(s.sub_prefs.len(), MAX_SUB_PREFS);
     }
 
     #[test]
