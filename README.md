@@ -67,8 +67,10 @@ groups) live in the data directory. The app looks for it in this order:
 - **Ctrl+F** or **/** focuses the channel filter (on Movies/Series, the search box).
 - A play/pause button sits left of the full-screen button and shows the action a click
   performs (**Space** does the same).
-- For movies and episodes, moving the mouse over the video shows the played and total
-  time (`hh:mm:ss/hh:mm:ss`) at the bottom centre for 3 seconds.
+- For movies and episodes, moving the mouse over the video or pressing a key shows a seek
+  bar below the video for 3 seconds: the played and total time with a dot at the current
+  position. Click or drag on the bar to jump (the jump happens when you let go), or press
+  **Left**/**Right** to step 10 seconds back/forward.
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.

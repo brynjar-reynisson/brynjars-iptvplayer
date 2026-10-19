@@ -137,8 +137,8 @@ struct App {
     top_countries: Vec<String>,
     /// View to return to when leaving fullscreen.
     fs_return_view: Option<View>,
-    /// Last time the mouse moved over the video (shows the time overlay for `TIME_SHOW`).
-    mouse_moved: Option<Instant>,
+    /// Last mouse move over the video or key press (shows the seek bar for `TIME_SHOW`).
+    activity: Option<Instant>,
     /// Seek bar state (movies/episodes).
     seek: SeekState,
     /// The subtitle menu above the video is open.
@@ -226,7 +226,7 @@ impl App {
             user_agent,
             top_countries,
             fs_return_view: None,
-            mouse_moved: None,
+            activity: None,
             seek: SeekState::default(),
             sub_menu: false,
             sub_cursor: 0,
@@ -828,6 +828,9 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers as M};
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
+            self.activity = Some(Instant::now());
+        }
         let focused = [filter_id(), vod::movie_search_id(), vod::series_search_id()]
             .into_iter()
             .find(|id| ctx.memory(|m| m.has_focus(*id)));
@@ -1170,6 +1173,12 @@ impl App {
             return; // duration unknown (yet): nothing to seek in
         };
         let now = Instant::now();
+        // Only after mouse/keyboard activity (or while dragging / a menu is open).
+        let left = self.activity.map_or(Duration::ZERO, |t| TIME_SHOW.saturating_sub(t.elapsed()));
+        if left.is_zero() && !self.seek.dragging() && !self.sub_menu {
+            return;
+        }
+        ui.ctx().request_repaint_after(left);
         let bar = egui::Rect::from_min_max(
             egui::pos2(strip.left() + PAD + TIME_W, strip.top()),
             egui::pos2(strip.right() - PAD - TIME_W, strip.bottom()),
@@ -1232,6 +1241,7 @@ impl App {
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     // Movies/episodes: a strip below the video holds the seek bar.
+                    let full = rect;
                     let (rect, bar_rect) = if pb.is_live() {
                         (rect, None)
                     } else {
@@ -1252,28 +1262,9 @@ impl App {
                     if r.double_clicked() {
                         toggle_fs = true;
                     }
-                    // Played/total time at the bottom centre for a few seconds after the mouse moves over the video.
-                    if ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO) && ui.rect_contains_pointer(rect) {
-                        self.mouse_moved = Some(Instant::now());
-                    }
-                    if let (Some(t), Some((pos, dur))) = (self.mouse_moved, p.position()) {
-                        let left = TIME_SHOW.saturating_sub(t.elapsed());
-                        if !left.is_zero() {
-                            let total = dur.map_or_else(|| "--:--:--".to_string(), format_hms);
-                            let galley = ui.painter().layout_no_wrap(
-                                format!("{}/{total}", format_hms(pos)),
-                                egui::FontId::monospace(16.0),
-                                egui::Color32::WHITE,
-                            );
-                            let bg = egui::Rect::from_center_size(
-                                egui::pos2(rect.center().x, rect.bottom() - 25.0),
-                                galley.size() + egui::vec2(20.0, 8.0),
-                            );
-                            let pt = ui.painter_at(rect);
-                            pt.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(160));
-                            pt.galley(bg.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
-                            ui.ctx().request_repaint_after(left);
-                        }
+                    // Mouse or keyboard activity shows the seek bar for `TIME_SHOW`.
+                    if ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO) && ui.rect_contains_pointer(full) {
+                        self.activity = Some(Instant::now());
                     }
                     bar_job = bar_rect.map(|bar| (bar, p.position()));
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
