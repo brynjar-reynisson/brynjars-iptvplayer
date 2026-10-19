@@ -18,10 +18,19 @@ const FETCH_GAP: Duration = Duration::from_millis(300);
 
 type Answer = (String, Option<Titles>);
 
+enum Msg {
+    /// Normal lookup: the cache may answer.
+    Lookup(String),
+    /// Retry: skip the cache and fetch again.
+    Retry(String),
+}
+
 pub struct TitleLoader {
-    tx: Sender<String>,
+    tx: Sender<Msg>,
     rx: Receiver<Answer>,
     requested: HashSet<String>,
+    /// Retries sent whose answer has not arrived yet.
+    retrying: HashSet<String>,
     answers: HashMap<String, Option<Arc<Titles>>>,
 }
 
@@ -31,18 +40,23 @@ fn now_secs() -> u64 {
 
 impl TitleLoader {
     pub fn new(data_dir: PathBuf, base_url: String, wake: impl Fn() + Send + 'static) -> TitleLoader {
-        let (tx, req_rx) = channel::<String>();
+        let (tx, req_rx) = channel::<Msg>();
         let (ans_tx, rx) = channel::<Answer>();
         let spawned = std::thread::Builder::new().name("episode-titles".into()).spawn(move || {
             let mut cache = TitleCache::load(&data_dir);
             let mut last_fetch: Option<Instant> = None;
-            while let Ok(show) = req_rx.recv() {
+            while let Ok(msg) = req_rx.recv() {
+                let (show, retry) = match msg {
+                    Msg::Lookup(s) => (s, false),
+                    Msg::Retry(s) => (s, true),
+                };
                 let q = clean_query(&show);
                 let result = if q.name.trim().is_empty() {
                     None
                 } else {
                     let key = cache_key(&q);
-                    match cache.get(&key, now_secs()) {
+                    let looked = if retry { Lookup::Unknown } else { cache.get(&key, now_secs()) };
+                    match looked {
                         Lookup::Hit(t) => Some(t),
                         Lookup::Miss => None,
                         Lookup::Unknown => {
@@ -82,7 +96,7 @@ impl TitleLoader {
         if let Err(e) = spawned {
             eprintln!("episode titles: cannot start worker: {e}");
         }
-        TitleLoader { tx, rx, requested: HashSet::new(), answers: HashMap::new() }
+        TitleLoader { tx, rx, requested: HashSet::new(), retrying: HashSet::new(), answers: HashMap::new() }
     }
 
     /// Ask for a show's titles (keyed by the raw show name). Ignored for
@@ -93,13 +107,26 @@ impl TitleLoader {
         }
         self.requested.insert(show.to_string());
         // A dead worker just means no titles.
-        let _ = self.tx.send(show.to_string());
+        let _ = self.tx.send(Msg::Lookup(show.to_string()));
+    }
+
+    /// Look again (bypassing the cache) at every show that was answered
+    /// without titles (not found, or the lookup failed). Shows still waiting
+    /// for their first answer or for a retry are left alone.
+    pub fn retry_failed(&mut self) {
+        let failed: Vec<String> =
+            self.answers.iter().filter(|(s, t)| t.is_none() && !self.retrying.contains(*s)).map(|(s, _)| s.clone()).collect();
+        for show in failed {
+            self.retrying.insert(show.clone());
+            let _ = self.tx.send(Msg::Retry(show));
+        }
     }
 
     /// Shows whose answer arrived since the last call.
     pub fn poll(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         while let Ok((show, t)) = self.rx.try_recv() {
+            self.retrying.remove(&show);
             self.answers.insert(show.clone(), t.filter(|t| !t.is_empty()).map(Arc::new));
             out.push(show);
         }
@@ -196,5 +223,32 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert!(l.poll().is_empty());
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_failed_refetches_shows_without_titles_but_not_those_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, seen) = server("500 Internal Server Error", "");
+        let mut l = TitleLoader::new(dir.path().to_path_buf(), base, || {});
+        l.request("Fake Show");
+        assert_eq!(wait_poll(&mut l), vec!["Fake Show".to_string()]);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // The error is cached for an hour, but a retry bypasses the cache.
+        l.retry_failed();
+        l.retry_failed();
+        assert_eq!(wait_poll(&mut l), vec!["Fake Show".to_string()]);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(l.poll().is_empty(), "the second retry call was deduped");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let (base2, seen2) = server("200 OK", JSON);
+        let mut ok = TitleLoader::new(dir2.path().to_path_buf(), base2, || {});
+        ok.request("Fake Show");
+        assert_eq!(wait_poll(&mut ok), vec!["Fake Show".to_string()]);
+        ok.retry_failed();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(ok.poll().is_empty());
+        assert_eq!(seen2.lock().unwrap().len(), 1, "a show with titles is not fetched again");
     }
 }

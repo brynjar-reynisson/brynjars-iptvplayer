@@ -72,7 +72,8 @@ groups) live in the data directory. The app looks for it in this order:
 - Episode titles: when you open a show, titles (`S01E02 - Title`) are looked up on TVmaze
   (needs internet; only the show name is sent) and cached in `episode-titles.json` beside the
   other data files (kept 30 days; not-found results 1 day). Obscure or Nordic shows may not be
-  found; those rows just show `S01E02`.
+  found; those rows just show `S01E02`. Pressing Refresh (F5) also retries shows whose lookup
+  failed or found nothing.
 - Movies and episodes resume where you stopped (closing the app, stopping, or picking
   something else). Positions are saved every 15 s in `positions.json`. Anything watched to
   within the last minute (or 95 %) counts as finished and starts over, as does anything

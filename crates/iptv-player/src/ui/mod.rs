@@ -310,6 +310,8 @@ impl App {
         // Picks up a `user_agent` / `top_country` edited in config.toml since
         // startup (streams keep the startup user agent until restart).
         (self.user_agent, self.top_country, _) = configured_prefs(&self.data_dir);
+        // Refresh also retries episode-title lookups that found nothing.
+        self.titles.retry_failed();
         let a = self.data.request_refresh(force);
         self.run_actions(a);
     }
@@ -1479,10 +1481,6 @@ impl eframe::App for App {
             eprintln!("startup: first frame after {} ms", self.t0.elapsed().as_millis());
         }
         self.poll_background();
-        // Idempotent: covers every path that opens a show (click, Enter, rebase).
-        if let Some(o) = self.series.open() {
-            self.titles.request(&o.name);
-        }
         self.titles.poll();
         if let Ok(p) = &mut self.player {
             p.update();
@@ -1525,6 +1523,13 @@ impl eframe::App for App {
             } else {
                 self.phase_screen(ui);
             }
+        }
+
+        // After the panels, so a show opened by a click this frame is requested
+        // at once (the worker's answer repaints). Idempotent: covers every
+        // path that opens a show (click, Enter, rebase).
+        if let Some(o) = self.series.open() {
+            self.titles.request(&o.name);
         }
 
         let spent = frame_start.elapsed();

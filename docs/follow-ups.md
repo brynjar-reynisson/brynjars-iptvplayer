@@ -27,8 +27,7 @@ Known gaps and ideas that were found during implementation and review but not do
 - **Second title source (TMDB)** if TVmaze coverage of the playlist's shows turns out to be poor.
 - **Episode numbering differences** between the provider and TVmaze (specials, absolute numbering) can show a wrong or missing title.
 - **Regional tags** `(UK)`/`(US)` are stripped from the show name, so `The Office (UK)` can match the US show (both share one cache key).
-- **Title lookups are serial with a 10 s timeout**, so browsing offline queues delays (a failed lookup is cached for 1 h, but within one session it is not retried until restart).
-- **Title request goes out one frame late.** `titles.request` runs at the top of `ui()`, before `browse()`, so after a mouse click that opens a show the lookup may not start until the next input/repaint. Move the request after `browse()`.
+- **Title lookups are serial with a 10 s timeout**, so browsing offline queues delays (a failed lookup is cached for 1 h and, within a session, only retried by Refresh/F5 or after a restart).
 - **Expired titles can be replaced by an error.** When a 30-day hit expires and the refetch fails (or returns not-found), the old titles are overwritten; keeping them on failure would be nicer.
 - **`clean_query` strips any 2-3 letter bracket tag** (`(New)`, `(TV)`), not only country tags like `(UK)`/`(US)`.
 - **Loader tests** use 200 ms sleeps for negative assertions (slightly slow, could be flaky under load).
