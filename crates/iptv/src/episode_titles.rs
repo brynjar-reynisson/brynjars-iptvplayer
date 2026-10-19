@@ -263,6 +263,68 @@ impl TitleCache {
     }
 }
 
+/// Result of one TVmaze lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fetched {
+    Found(Titles),
+    NotFound,
+    Failed(String),
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Blocking `GET {base_url}/singlesearch/shows?q=<name>&embed=episodes`.
+/// 404 or a non-matching/empty show = `NotFound`; everything else that goes
+/// wrong = `Failed(reason)`. The reason never contains the URL.
+pub fn fetch_titles(base_url: &str, q: &Query) -> Fetched {
+    if q.name.trim().is_empty() {
+        return Fetched::NotFound;
+    }
+    let url = format!(
+        "{}/singlesearch/shows?q={}&embed=episodes",
+        base_url.trim_end_matches('/'),
+        percent_encode(&q.name)
+    );
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(crate::config::DEFAULT_USER_AGENT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Fetched::Failed(format!("http client: {}", e.without_url())),
+    };
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(e) => return Fetched::Failed(format!("request failed: {}", e.without_url())),
+    };
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Fetched::NotFound;
+    }
+    if status.as_u16() >= 400 {
+        return Fetched::Failed(format!("server returned HTTP {}", status.as_u16()));
+    }
+    let body = match resp.bytes() {
+        Ok(b) => b,
+        Err(e) => return Fetched::Failed(format!("reading response: {}", e.without_url())),
+    };
+    match parse_response(&body, q) {
+        Ok(Some(t)) if !t.is_empty() => Fetched::Found(t),
+        Ok(_) => Fetched::NotFound,
+        Err(e) => Fetched::Failed(format!("{e:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +414,103 @@ mod tests {
         assert_eq!(c.items.len(), 500);
         assert_eq!(c.get("k0", 1), Lookup::Unknown);
         assert_eq!(c.get("k500", 501), Lookup::Miss);
+    }
+
+    // --- fetch_titles (local servers) ---
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// Serves `status_line` + `body` to every connection, recording raw requests.
+    fn server(status_line: &'static str, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let mut b = [0u8; 4096];
+                let n = s.read(&mut b).unwrap_or(0);
+                s2.lock().unwrap().push(String::from_utf8_lossy(&b[..n]).into_owned());
+                let _ = write!(s, "HTTP/1.1 {status_line}
+Content-Length: {}
+Connection: close
+
+{body}", body.len());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    #[test]
+    fn fetch_found() {
+        let (base, seen) = server("200 OK", JSON_EPS);
+        let r = fetch_titles(&base, &q("Fake Show", None));
+        let Fetched::Found(t) = r else { panic!("{r:?}") };
+        assert_eq!(t.get(1, 2), Some("The Visit"));
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req.lines().next().unwrap().contains("/singlesearch/shows?q=Fake%20Show&embed=episodes"), "{req}");
+        assert!(req.to_lowercase().contains(&format!("user-agent: {}", crate::config::DEFAULT_USER_AGENT.to_lowercase())), "{req}");
+    }
+
+    // The test JSON fixture has one usable episode.
+    const JSON_EPS: &str = r#"{"name":"Fake Show","premiered":"2019-05-01","_embedded":{"episodes":[
+        {"season":1,"number":2,"name":"The Visit"}]}}"#;
+
+    #[test]
+    fn fetch_404_is_not_found() {
+        let (base, _) = server("404 Not Found", "");
+        assert_eq!(fetch_titles(&base, &q("Fake Show", None)), Fetched::NotFound);
+    }
+
+    #[test]
+    fn fetch_500_is_failed() {
+        let (base, _) = server("500 Internal Server Error", "");
+        assert!(matches!(fetch_titles(&base, &q("Fake Show", None)), Fetched::Failed(_)));
+    }
+
+    #[test]
+    fn fetch_bad_json_is_failed() {
+        let (base, _) = server("200 OK", "<html>");
+        assert!(matches!(fetch_titles(&base, &q("Fake Show", None)), Fetched::Failed(_)));
+    }
+
+    #[test]
+    fn fetch_connection_refused_is_failed_without_url() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        let r = fetch_titles(&format!("http://127.0.0.1:{p}"), &q("Fake Show", None));
+        let Fetched::Failed(m) = r else { panic!("{r:?}") };
+        assert!(!m.contains("127.0.0.1") && !m.contains("http"), "{m}");
+    }
+
+    #[test]
+    fn fetch_encodes_nordic_name() {
+        let (base, seen) = server("404 Not Found", "");
+        let _ = fetch_titles(&base, &q("Ófærð", None));
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req.lines().next().unwrap().contains("%C3%93f%C3%A6r%C3%B0"), "{req}");
+    }
+
+    #[test]
+    fn fetch_empty_name_is_not_found_without_network() {
+        let (base, seen) = server("200 OK", JSON_EPS);
+        assert_eq!(fetch_titles(&base, &q("  ", None)), Fetched::NotFound);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fetch_show_without_episodes_is_not_found() {
+        let (base, _) = server("200 OK", r#"{"name":"Fake Show","_embedded":{"episodes":[]}}"#);
+        assert_eq!(fetch_titles(&base, &q("Fake Show", None)), Fetched::NotFound);
+    }
+
+    #[test]
+    fn fetch_non_matching_show_is_not_found() {
+        let (base, _) = server("200 OK", JSON_EPS);
+        assert_eq!(fetch_titles(&base, &q("Other Show", None)), Fetched::NotFound);
     }
 }
