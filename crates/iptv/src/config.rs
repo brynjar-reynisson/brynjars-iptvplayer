@@ -16,9 +16,6 @@ pub struct Config {
     /// order, the rest alphabetically. The old single `top_country` key is
     /// still read when `top_countries` is absent.
     pub top_countries: Vec<String>,
-    /// Optional `hardware_decode` key (`true`/`false`); missing = `false`
-    /// (software decoding; hardware decoding showed corrupt video on some GPUs).
-    pub hardware_decode: bool,
 }
 
 /// Never prints the URL (it carries the account credentials).
@@ -28,7 +25,6 @@ impl std::fmt::Debug for Config {
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
             .field("top_countries", &self.top_countries)
-            .field("hardware_decode", &self.hardware_decode)
             .finish()
     }
 }
@@ -93,13 +89,7 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
                 .collect(),
         }
     };
-    let hardware_decode = match value.get("hardware_decode") {
-        None => false,
-        Some(v) => v
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("{}: `hardware_decode` must be true or false", path.display()))?,
-    };
-    Ok(Config { playlist_url, user_agent, top_countries, hardware_decode })
+    Ok(Config { playlist_url, user_agent, top_countries })
 }
 
 #[cfg(test)]
@@ -142,15 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn hardware_decode_defaults_to_false_and_must_be_a_bool() {
-        assert!(!load_with("").unwrap().hardware_decode);
-        assert!(load_with("hardware_decode = true\n").unwrap().hardware_decode);
-        assert!(!load_with("hardware_decode = false\n").unwrap().hardware_decode);
-        assert!(format!("{:#}", load_with("hardware_decode = \"no\"\n").unwrap_err()).contains("hardware_decode"));
-        assert!(format!("{:#}", load_with("hardware_decode = 1\n").unwrap_err()).contains("hardware_decode"));
-    }
-
-    #[test]
     fn invalid_user_agent_is_rejected_without_url() {
         for extra in ["user_agent = \"bad\\nagent\"\n", "user_agent = \"tab\\there\"\n", "user_agent = 5\n"] {
             let err = format!("{:#}", load_with(extra).unwrap_err());
@@ -165,7 +146,6 @@ mod tests {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
             top_countries: Vec::new(),
-            hardware_decode: false,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");

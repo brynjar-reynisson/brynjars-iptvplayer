@@ -11,12 +11,8 @@ use iptv::supervisor::{Status, Supervisor};
 use crate::mpv_backend::{GlInit, MpvBackend, MpvOptions, MpvRenderer};
 use crate::state::status_text;
 
-/// Hardware decoding is only used for video taller than this (1080p).
-pub const HW_MIN_HEIGHT: i64 = 1080;
-
-/// mpv `hwdec` value used above 1080p: copy-back decoders only (the zero-copy
-/// `auto-safe` choice gave corrupt video with the OpenGL render API).
-pub const HW_MODES: &str = "d3d11va-copy,nvdec-copy,dxva2-copy";
+/// Streams taller than this (1080p) get [`TALL_TUNING`].
+pub const TALL_MIN_HEIGHT: i64 = 1080;
 
 /// Tuning for streams above 1080p, applied when one plays and undone for the
 /// next stream (the previous values are read from mpv at startup):
@@ -40,11 +36,6 @@ pub const TALL_TUNING: [(&str, &str); 10] = [
 /// How often the playback stats of a tall stream are logged.
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
-/// Whether a video of `height` pixels should be hardware decoded.
-pub fn wants_hwdec(hardware_decode: bool, height: i64) -> bool {
-    hardware_decode && height > HW_MIN_HEIGHT
-}
-
 pub struct Player {
     sup: Supervisor<MpvBackend>,
     renderer: Arc<MpvRenderer>,
@@ -54,13 +45,8 @@ pub struct Player {
     want_sub: Option<SubChoice>,
     /// Supervisor generation `want_sub` was last applied for.
     sub_gen: u32,
-    /// `hardware_decode` from `config.toml`: use hardware decoding, but only
-    /// for streams taller than [`HW_MIN_HEIGHT`] (software is clean for HD).
-    hardware_decode: bool,
-    /// Supervisor generation whose video size was checked for hwdec.
-    hw_gen: u32,
-    /// Hardware decoding is switched on for the current stream.
-    hw_active: bool,
+    /// Supervisor generation whose video size was checked for tuning.
+    tune_gen: u32,
     /// Tall-stream tuning is applied to the current stream.
     tuned: bool,
     /// mpv's values of the `TALL_TUNING` options before any tuning.
@@ -72,10 +58,9 @@ pub struct Player {
 }
 
 impl Player {
-    /// `user_agent`: sent on every stream request (blank = default). `hardware_decode`:
-    /// mpv `auto-safe` hardware decoding for streams above 1080p; everything
-    /// else (and everything if false) is decoded in software (`hwdec=no`).
-    pub fn new(cc: &eframe::CreationContext<'_>, user_agent: &str, hardware_decode: bool) -> anyhow::Result<Player> {
+    /// `user_agent`: sent on every stream request (blank = default). Video is
+    /// decoded in software; streams above 1080p get [`TALL_TUNING`].
+    pub fn new(cc: &eframe::CreationContext<'_>, user_agent: &str) -> anyhow::Result<Player> {
         let get_proc_address = cc
             .get_proc_address
             .clone()
@@ -83,7 +68,6 @@ impl Player {
         let (c1, c2) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
         let backend = MpvBackend::new(MpvOptions {
             user_agent: user_agent.to_string(),
-            hwdec: Some("no".to_string()),
             gl: Some(GlInit { get_proc_address, on_frame: Box::new(move || c1.request_repaint()) }),
             on_wakeup: Some(Box::new(move || c2.request_repaint())),
         })?;
@@ -93,7 +77,7 @@ impl Player {
             .iter()
             .filter_map(|(k, _)| backend.property(k).map(|v| (*k, v)))
             .collect::<Vec<_>>();
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, tune_gen: 0, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -108,14 +92,12 @@ impl Player {
             self.paused = false;
         }
         self.want_sub = None;
-        if self.hw_active || self.tuned {
-            // A new stream starts in plain software again; it is upgraded when its size is known.
+        if self.tuned {
+            // A new stream starts untuned again; it is tuned when its size is known.
             let b = self.sup.backend_mut();
-            b.set_hwdec("no");
             for (k, v) in &self.tall_defaults {
                 b.set_property(k, v);
             }
-            self.hw_active = false;
             self.tuned = false;
         }
         eprintln!("{:>9.3}s play (generation {})", self.t0.elapsed().as_secs_f64(), self.sup.generation() + 1);
@@ -204,24 +186,19 @@ impl Player {
                 }
             }
         }
-        // Tall (above 1080p) video: tune the decoder and, if enabled, switch to
-        // hardware decoding, once per stream when its size is known. A
-        // reconnect (new generation, same stream) keeps both.
-        if self.sup.status() == Status::Playing && self.hw_gen != self.sup.generation() {
+        // Tall (above 1080p) video: tune the decoder and renderer once per
+        // stream when its size is known. A reconnect (new generation, same
+        // stream) keeps it.
+        if self.sup.status() == Status::Playing && self.tune_gen != self.sup.generation() {
             if let Some(h) = self.sup.backend().video_height() {
-                self.hw_gen = self.sup.generation();
-                if h > HW_MIN_HEIGHT && !self.tuned {
+                self.tune_gen = self.sup.generation();
+                if h > TALL_MIN_HEIGHT && !self.tuned {
                     let b = self.sup.backend_mut();
                     for (k, v) in TALL_TUNING {
                         b.set_property(k, v);
                     }
                     self.tuned = true;
                     eprintln!("tuning: {h}p video, decoder tuned");
-                    if wants_hwdec(self.hardware_decode, h) {
-                        b.set_hwdec(HW_MODES);
-                        self.hw_active = true;
-                        eprintln!("hwdec: hardware decoding on");
-                    }
                 }
             }
         }
@@ -276,19 +253,5 @@ impl Player {
     pub fn shutdown(&mut self, gl: Option<&eframe::glow::Context>) {
         self.sup.stop();
         self.renderer.destroy(gl);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hardware_decoding_only_above_1080p_and_only_if_enabled() {
-        assert!(!wants_hwdec(true, 1080));
-        assert!(!wants_hwdec(true, 720));
-        assert!(wants_hwdec(true, 1440));
-        assert!(wants_hwdec(true, 2160));
-        assert!(!wants_hwdec(false, 2160));
     }
 }

@@ -27,10 +27,6 @@ until you pick something else.
    - Optional: `top_countries = "Iceland, United Kingdom"` lists those live countries first, in that
      order (comma-separated). The rest are alphabetical, with "Other" last. Applies after
      the next refresh (F5) or restart. The old single `top_country` key still works.
-   - Optional: `hardware_decode = true` turns on hardware video decoding, but only for
-     streams taller than 1080p (4K). Everything else is decoded in software, which is
-     clean; hardware decoding showed black dashes and blocky corruption on some graphics
-     cards. Off by default. Needs a restart.
    - The first download can take a long time while the provider generates the file.
    - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
      a restart.
@@ -126,8 +122,8 @@ groups) live in the data directory. The app looks for it in this order:
   options do nothing. The app's retry supervisor does the reconnecting.
 - After a quick channel switch, the first retry of the new channel can come sooner than
   the backoff says. Log lines that arrive within 500 ms of the switch are ignored.
-- Hardware decoding (`hardware_decode = true`) showed corrupt video (black dashes) on the
-  developer's graphics card, so it is off by default and, when on, only used for streams
-  above 1080p (where software decoding may not keep up).
+- Video is always decoded in software: hardware decoding showed corrupt video (black
+  dashes) on the developer's graphics card. 4K streams get cheaper scaling and decoder
+  settings so they keep up.
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.

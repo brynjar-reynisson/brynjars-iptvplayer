@@ -99,13 +99,12 @@ fn filter_id() -> egui::Id {
     egui::Id::unique("channel_filter")
 }
 
-/// `(user_agent, top_countries, hardware_decode)` from `config.toml` if it
-/// loads, else the default UA, no top countries and software decoding (also
-/// with `--playlist-file`).
-fn configured_prefs(data_dir: &std::path::Path) -> (String, Vec<String>, bool) {
+/// `(user_agent, top_countries)` from `config.toml` if it loads, else the
+/// default UA and no top countries (also with `--playlist-file`).
+fn configured_prefs(data_dir: &std::path::Path) -> (String, Vec<String>) {
     iptv::config::load(data_dir).map_or_else(
-        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), Vec::new(), false),
-        |c| (c.user_agent, c.top_countries, c.hardware_decode),
+        |_| (iptv::config::DEFAULT_USER_AGENT.to_string(), Vec::new()),
+        |c| (c.user_agent, c.top_countries),
     )
 }
 
@@ -200,9 +199,9 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
-        let (user_agent, top_countries, hardware_decode) = configured_prefs(&opts.data_dir);
+        let (user_agent, top_countries) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
-        let player = Player::new(cc, &user_agent, hardware_decode).map_err(|e| safe_text(&format!("{e:#}")));
+        let player = Player::new(cc, &user_agent).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
             eprintln!("player unavailable: {e}");
         }
@@ -312,7 +311,7 @@ impl App {
         }
         // Picks up a `user_agent` / `top_countries` edited in config.toml since
         // startup (streams keep the startup user agent until restart).
-        (self.user_agent, self.top_countries, _) = configured_prefs(&self.data_dir);
+        (self.user_agent, self.top_countries) = configured_prefs(&self.data_dir);
         // Refresh also retries episode-title lookups that found nothing.
         self.titles.retry_failed();
         let a = self.data.request_refresh(force);

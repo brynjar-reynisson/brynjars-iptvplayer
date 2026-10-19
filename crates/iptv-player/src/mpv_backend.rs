@@ -65,7 +65,8 @@ pub const BASE_OPTIONS: &[(&str, &str)] = &[
     ("cache", "yes"),
     ("demuxer-max-bytes", "64MiB"),
     ("demuxer-max-back-bytes", "16MiB"),
-    ("hwdec", "auto-safe"),
+    // Software decoding: hardware decoding showed corrupt video.
+    ("hwdec", "no"),
     // Do not let mpv_render_context_render block the UI thread.
     ("video-timing-offset", "0"),
 ];
@@ -767,8 +768,6 @@ pub struct MpvOptions {
     /// HTTP User-Agent for stream requests (blank = the default, see
     /// [`init_options`]). Same value as the playlist download uses.
     pub user_agent: String,
-    /// mpv `hwdec` override (`config.toml` `hwdec`); `None` = `auto-safe`.
-    pub hwdec: Option<String>,
     /// `Some` = render in-app via the OpenGL render API (`vo=libmpv`);
     /// `None` = headless (`vo=null`, `ao=null`; tests and demos).
     pub gl: Option<GlInit>,
@@ -817,11 +816,7 @@ impl MpvBackend {
         }
         let core = Arc::new(Core { handle, wakeup: Mutex::new(ptr::null_mut()) });
         let headless = opts.gl.is_none();
-        let mut init = init_options(headless, &opts.user_agent);
-        if let Some(h) = &opts.hwdec {
-            init.retain(|(k, _)| k != "hwdec");
-            init.push(("hwdec".into(), h.clone()));
-        }
+        let init = init_options(headless, &opts.user_agent);
         for (k, v) in init {
             let (ck, cv) = (cstr(&k)?, cstr(&v)?);
             let r = unsafe { sys::mpv_set_option_string(handle, ck.as_ptr(), cv.as_ptr()) };
@@ -938,13 +933,6 @@ impl MpvBackend {
         get_opt_string(self.core.handle, "height").and_then(|v| v.parse().ok()).filter(|h| *h > 0)
     }
 
-    /// Change the hardware decoding mode (`no`, `auto-safe`, ...) of the
-    /// running player; mpv re-creates the video decoder, playback continues.
-    pub fn set_hwdec(&mut self, mode: &str) {
-        let (n, v) = (CString::new("hwdec").unwrap(), CString::new(mode).unwrap());
-        unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
-    }
-
     /// Read any mpv property as text (`None` if unknown/unavailable).
     pub fn property(&self, name: &str) -> Option<String> {
         get_opt_string(self.core.handle, name)
@@ -956,24 +944,18 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
-    /// One line of playback health for the log: decoder, dropped frames,
-    /// buffered seconds, measured fps.
+    /// One line of playback health for the log: dropped frames, buffered
+    /// seconds, measured fps.
     pub fn stats(&self) -> String {
         let h = self.core.handle;
         let p = |k: &str| get_opt_string(h, k).unwrap_or_else(|| "?".into());
         format!(
-            "hwdec={} dropped: vo={} decoder={} cache={}s fps={}",
-            p("hwdec-current"),
+            "dropped: vo={} decoder={} cache={}s fps={}",
             p("frame-drop-count"),
             p("decoder-frame-drop-count"),
             p("demuxer-cache-duration").chars().take(5).collect::<String>(),
             p("estimated-vf-fps").chars().take(5).collect::<String>(),
         )
-    }
-
-    /// Hardware decoder in use (`no` = software).
-    pub fn hwdec_current(&self) -> String {
-        get_string(self.core.handle, "hwdec-current")
     }
 
     /// Drain scrubbed warn/error log lines.

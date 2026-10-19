@@ -9,9 +9,3 @@ playlist_url = "http://example.invalid/get.php?username=USER&password=PASS&type=
 # (e.g. "Iceland, United Kingdom"). The other countries are alphabetical, with "Other" last.
 # Applies after the next refresh (F5) or restart.
 # top_countries = "Iceland, United Kingdom"
-
-# Optional: use hardware video decoding for streams taller than 1080p (4K) only;
-# everything else stays in software (default false = software for all).
-# Hardware decoding showed black horizontal dashes / blocky corruption on some
-# graphics cards. Needs a restart.
-# hardware_decode = true
