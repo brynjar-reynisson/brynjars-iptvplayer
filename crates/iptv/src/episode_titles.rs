@@ -116,7 +116,7 @@ pub fn parse_response(json: &[u8], q: &Query) -> Result<Option<Titles>> {
     }
     if let (Some(want), Some(p)) = (q.year, show.premiered.as_deref()) {
         let got: Option<u32> = p.get(..4).and_then(|y| y.parse().ok());
-        if got.is_some_and(|g| g != want) {
+        if got.is_some_and(|g| g.abs_diff(want) > 1) {
             return Ok(None);
         }
     }
@@ -150,6 +150,7 @@ enum Kind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
     at: u64,
+    #[serde(rename = "status")]
     kind: Kind,
     #[serde(default)]
     titles: BTreeMap<String, String>,
@@ -158,7 +159,7 @@ struct Entry {
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     version: u64,
-    #[serde(default)]
+    #[serde(default, rename = "shows")]
     items: BTreeMap<String, Entry>,
 }
 
@@ -291,6 +292,10 @@ mod tests {
         assert!(parse_response(JSON.as_bytes(), &q("Fake Show", Some(2019))).unwrap().is_some());
         assert!(parse_response(JSON.as_bytes(), &q("Fake Show", Some(2005))).unwrap().is_none());
         assert!(parse_response(JSON.as_bytes(), &q("Other Show", None)).unwrap().is_none());
+        for (want, ok) in [(2017, false), (2018, true), (2020, true), (2021, false)] {
+            let r = parse_response(JSON.replace("2019-05-01", &format!("{want}-05-01")).as_bytes(), &q("Fake Show", Some(2019)));
+            assert_eq!(r.unwrap().is_some(), ok, "premiered {want}");
+        }
         let np = JSON.replace(r#""2019-05-01""#, "null");
         assert!(parse_response(np.as_bytes(), &q("Fake Show", Some(2005))).unwrap().is_some());
     }
@@ -316,6 +321,10 @@ mod tests {
         assert_eq!(c.get("e", 61 * 60), Lookup::Unknown);
         assert_eq!(c.get("absent", 0), Lookup::Unknown);
         c.save_if_dirty().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path_in(d.path())).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["shows"]["h"]["status"], "hit");
+        assert_eq!(v["shows"]["h"]["titles"]["1:2"], "The Visit");
         assert_eq!(TitleCache::load(d.path()).get("h", DAY), Lookup::Hit(t));
     }
 
@@ -328,7 +337,7 @@ mod tests {
         assert_eq!(c.get("x", 0), Lookup::Unknown);
         assert!(!f.exists());
         assert!(d.path().join("episode-titles.json.bad").exists());
-        std::fs::write(&f, br#"{"version":9,"items":{}}"#).unwrap();
+        std::fs::write(&f, br#"{"version":9,"shows":{}}"#).unwrap();
         let _ = TitleCache::load(d.path());
         assert!(d.path().join("episode-titles.json.bad.1").exists());
     }
