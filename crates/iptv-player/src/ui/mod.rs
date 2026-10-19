@@ -36,7 +36,7 @@ use crate::state::vod::{
     visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
-use crate::state::{format_bytes, format_hms, safe_text, Tab};
+use crate::state::{format_bytes, format_hms, safe_text, tab_enter, Tab};
 
 /// How long the played/total time stays visible after the mouse last moved.
 const TIME_SHOW: Duration = Duration::from_secs(3);
@@ -180,6 +180,9 @@ struct App {
     group_filter: String,
     /// Focus the Movies/Series search box on the next frame.
     focus_search: bool,
+    /// Tab button that has keyboard focus this frame (Enter on it opens the tab).
+    focused_tab: Option<Tab>,
+    focused_tab_id: Option<egui::Id>,
     last_tab: Tab,
     movie_view: ListView,
     show_view: ListView,
@@ -245,6 +248,8 @@ impl App {
             groups_rx: None,
             group_filter: String::new(),
             focus_search: false,
+            focused_tab: None,
+            focused_tab_id: None,
             last_tab: Tab::Live,
             movie_view: ListView::default(),
             show_view: ListView::default(),
@@ -865,7 +870,16 @@ impl App {
             if let Some(id) = focused {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
-            if fullscreen && self.playback.is_some() {
+            if let Some((tab, focus_search)) = tab_enter(self.focused_tab) {
+                // Enter on a focused tab button opens that tab.
+                self.tab = tab;
+                self.view = View::Browse;
+                self.focus_search = focus_search;
+                self.focused_tab = None;
+                if let Some(id) = self.focused_tab_id.take() {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+            } else if fullscreen && self.playback.is_some() {
                 // Enter in fullscreen leaves it again.
                 self.set_fullscreen(ctx, false);
             } else {
@@ -929,8 +943,15 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
+                self.focused_tab = None;
+                self.focused_tab_id = None;
                 for t in Tab::ALL {
-                    if ui.selectable_label(self.tab == t, t.label()).clicked() {
+                    let resp = ui.selectable_label(self.tab == t, t.label());
+                    if resp.has_focus() {
+                        self.focused_tab = Some(t);
+                        self.focused_tab_id = Some(resp.id);
+                    }
+                    if resp.clicked() {
                         self.tab = t;
                     }
                 }

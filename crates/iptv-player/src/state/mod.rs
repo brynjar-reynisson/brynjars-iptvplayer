@@ -35,6 +35,12 @@ impl Tab {
     }
 }
 
+/// Enter on a keyboard-focused tab button: the tab to open and whether its
+/// search box gets the focus (Movies/Series only). `None` = no tab has focus.
+pub fn tab_enter(focused: Option<Tab>) -> Option<(Tab, bool)> {
+    focused.map(|t| (t, matches!(t, Tab::Movies | Tab::Series)))
+}
+
 /// Player overlay text for a supervisor status ("" while playing normally).
 pub fn status_text(s: Status, retry_in: Option<Duration>) -> String {
     let wait = retry_in.map(|d| format!(" (next try in {:.1} s)", d.as_secs_f32())).unwrap_or_default();
@@ -78,6 +84,15 @@ pub fn safe_text(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_enter_opens_focused_tab() {
+        assert_eq!(tab_enter(Some(Tab::Movies)), Some((Tab::Movies, true)));
+        assert_eq!(tab_enter(Some(Tab::Series)), Some((Tab::Series, true)));
+        assert_eq!(tab_enter(Some(Tab::Live)), Some((Tab::Live, false)));
+        assert_eq!(tab_enter(Some(Tab::Favorites)), Some((Tab::Favorites, false)));
+        assert_eq!(tab_enter(None), None);
+    }
 
     #[test]
     fn hms() {
