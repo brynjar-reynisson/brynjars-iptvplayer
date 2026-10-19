@@ -127,6 +127,13 @@ impl Player {
         self.sup.position()
     }
 
+    /// Seek the playing movie/episode to `secs` (ignored when idle).
+    pub fn seek_to(&mut self, secs: f64) {
+        if self.sup.status() != Status::Idle {
+            self.sup.backend_mut().seek(secs, true);
+        }
+    }
+
     /// Subtitle choice to apply once the video plays (and again after a
     /// reconnect, which resets mpv's own selection). `None` = mpv's default.
     pub fn set_want_sub(&mut self, want: Option<SubChoice>) {

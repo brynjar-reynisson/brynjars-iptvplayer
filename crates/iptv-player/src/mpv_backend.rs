@@ -933,6 +933,18 @@ impl MpvBackend {
         get_opt_string(self.core.handle, "height").and_then(|v| v.parse().ok()).filter(|h| *h > 0)
     }
 
+    /// Seek the loaded movie/episode: to `secs` (absolute) or by `secs`
+    /// (relative, may be negative). Playback and pause state continue.
+    pub fn seek(&mut self, secs: f64, absolute: bool) {
+        let args = [
+            CString::new("seek").unwrap(),
+            CString::new(format!("{secs:.3}")).unwrap(),
+            CString::new(if absolute { "absolute" } else { "relative" }).unwrap(),
+        ];
+        let mut argv = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), ptr::null()];
+        unsafe { sys::mpv_command(self.core.handle, argv.as_mut_ptr()) };
+    }
+
     /// Read any mpv property as text (`None` if unknown/unavailable).
     pub fn property(&self, name: &str) -> Option<String> {
         get_opt_string(self.core.handle, name)

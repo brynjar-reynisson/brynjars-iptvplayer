@@ -37,10 +37,13 @@ use crate::state::vod::{
     visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
+use crate::state::seek::{self, SeekState};
 use crate::state::{format_bytes, format_hms, safe_text, tab_enter_visible, Tab};
 
 /// How long the played/total time stays visible after the mouse last moved.
 const TIME_SHOW: Duration = Duration::from_secs(3);
+/// Height of the strip below a movie/episode that holds the seek bar.
+const SEEK_BAR_H: f32 = 28.0;
 use live::{ListView, RowAction};
 use player::Player;
 
@@ -136,6 +139,8 @@ struct App {
     fs_return_view: Option<View>,
     /// Last time the mouse moved over the video (shows the time overlay for `TIME_SHOW`).
     mouse_moved: Option<Instant>,
+    /// Seek bar state (movies/episodes).
+    seek: SeekState,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -222,6 +227,7 @@ impl App {
             top_countries,
             fs_return_view: None,
             mouse_moved: None,
+            seek: SeekState::default(),
             sub_menu: false,
             sub_cursor: 0,
             positions,
@@ -475,6 +481,7 @@ impl App {
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
         self.sub_menu = false;
+        self.seek.reset();
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
@@ -805,6 +812,18 @@ impl App {
         self.fav.reload(self.shown_lib.as_deref(), &self.favs);
     }
 
+    /// Move the playing movie/episode by `delta` seconds.
+    fn seek_by(&mut self, delta: f64) {
+        let Ok(p) = &mut self.player else { return };
+        let Some((pos, dur)) = p.position() else { return };
+        // Step from what the bar shows, so quick presses add up.
+        let now = Instant::now();
+        let from = self.seek.shown(pos, now);
+        let target = seek::step_target(from, delta, dur);
+        p.seek_to(target);
+        self.seek.sought(target, now);
+    }
+
     // ---- input -------------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -845,6 +864,16 @@ impl App {
             (up, down, enter)
         };
         let typing = ctx.egui_wants_keyboard_input();
+        // Left/Right step through the playing movie/episode (before the
+        // browse keys below, which would otherwise take them).
+        if self.playback.as_ref().is_some_and(|p| !p.is_live()) && !typing && !self.sub_menu && self.focused_tab.is_none() {
+            let dir = ctx.input_mut(|i| {
+                i.consume_key(M::NONE, Key::ArrowRight) as i32 - i.consume_key(M::NONE, Key::ArrowLeft) as i32
+            });
+            if dir != 0 {
+                self.seek_by(dir as f64 * seek::STEP_SECS);
+            }
+        }
         // Live browse: Left goes to the country list, Right = Enter. Not while a
         // tab button has focus (arrows move between the buttons then).
         let live_keys = self.tab == Tab::Live
@@ -1129,6 +1158,69 @@ impl App {
         });
     }
 
+    /// Seek bar in `strip` (below the video): elapsed time, a thin line with a
+    /// dot at the position, total time. Click or drag to move; the seek
+    /// happens on release.
+    fn seek_bar(&mut self, ui: &mut egui::Ui, strip: egui::Rect, position: Option<(f64, Option<f64>)>) {
+        const PAD: f32 = 12.0;
+        const TIME_W: f32 = 70.0;
+        let painter = ui.painter_at(strip);
+        painter.rect_filled(strip, 0.0, egui::Color32::BLACK);
+        let Some((pos, Some(dur))) = position.filter(|(_, d)| d.is_some_and(|d| d > 0.0)) else {
+            return; // duration unknown (yet): nothing to seek in
+        };
+        let now = Instant::now();
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(strip.left() + PAD + TIME_W, strip.top()),
+            egui::pos2(strip.right() - PAD - TIME_W, strip.bottom()),
+        );
+        let resp = ui.interact(bar, egui::Id::unique("seek_bar"), egui::Sense::click_and_drag());
+        let at = |x: f32| seek::target_at(seek::fraction(x, bar.left(), bar.right()), dur);
+        if resp.drag_started() || resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.seek.drag(at(p.x));
+            }
+        }
+        let mut target = None;
+        if resp.drag_stopped() {
+            target = self.seek.release(now);
+        } else if resp.clicked() {
+            target = resp.interact_pointer_pos().map(|p| at(p.x));
+        }
+        if let Some(t) = target {
+            if let Ok(p) = &mut self.player {
+                p.seek_to(t);
+            }
+            self.seek.sought(t, now);
+        }
+        let shown = self.seek.shown(pos, now).clamp(0.0, dur);
+        let active = resp.hovered() || self.seek.dragging();
+        let white = egui::Color32::from_white_alpha(if active { 255 } else { 200 });
+        let (y, x0, x1) = (bar.center().y, bar.left(), bar.right());
+        let x = x0 + (x1 - x0) * (shown / dur) as f32;
+        painter.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], egui::Stroke::new(3.0, egui::Color32::from_white_alpha(70)));
+        painter.line_segment([egui::pos2(x0, y), egui::pos2(x, y)], egui::Stroke::new(3.0, white));
+        painter.circle_filled(egui::pos2(x, y), if active { 8.0 } else { 6.0 }, white);
+        let font = egui::FontId::monospace(13.0);
+        let dim = egui::Color32::from_white_alpha(200);
+        painter.text(egui::pos2(strip.left() + PAD, y), egui::Align2::LEFT_CENTER, format_hms(shown), font.clone(), dim);
+        painter.text(egui::pos2(strip.right() - PAD, y), egui::Align2::RIGHT_CENTER, format_hms(dur), font.clone(), dim);
+        if resp.hovered() || self.seek.dragging() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            // Time under the mouse, above the bar.
+            if let Some(m) = ui.ctx().pointer_latest_pos() {
+                let label = format_hms(if self.seek.dragging() { shown } else { at(m.x) });
+                let galley = ui.painter().layout_no_wrap(label, font, egui::Color32::WHITE);
+                let w = galley.size() + egui::vec2(12.0, 6.0);
+                let cx = m.x.clamp(bar.left(), bar.right());
+                let bg = egui::Rect::from_center_size(egui::pos2(cx, strip.top() - 14.0), w);
+                let pt = ui.painter();
+                pt.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(200));
+                pt.galley(bg.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
+            }
+        }
+    }
+
     fn video_area(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
@@ -1136,8 +1228,19 @@ impl App {
             let mut toggle_fs = false;
             let mut toggle_sub = false;
             let mut pick_sub: Option<Option<i64>> = None;
+            let mut bar_job: Option<(egui::Rect, Option<(f64, Option<f64>)>)> = None;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
+                    // Movies/episodes: a strip below the video holds the seek bar.
+                    let (rect, bar_rect) = if pb.is_live() {
+                        (rect, None)
+                    } else {
+                        let split = rect.bottom() - SEEK_BAR_H;
+                        (
+                            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), split)),
+                            Some(egui::Rect::from_min_max(egui::pos2(rect.left(), split), rect.max)),
+                        )
+                    };
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
                     let gone = if pb.in_playlist() { "" } else { "  (not in playlist)" };
                     let mut title = format!("{}{fav}{gone}", pb.name());
@@ -1172,6 +1275,7 @@ impl App {
                             ui.ctx().request_repaint_after(left);
                         }
                     }
+                    bar_job = bar_rect.map(|bar| (bar, p.position()));
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
                     // Subtitle button ("CC"), movies and episodes only, left of the play/pause button.
@@ -1317,6 +1421,9 @@ impl App {
                         ui.visuals().weak_text_color(),
                     );
                 }
+            }
+            if let Some((bar, position)) = bar_job {
+                self.seek_bar(ui, bar, position);
             }
             if toggle_sub {
                 self.toggle_sub_menu();
