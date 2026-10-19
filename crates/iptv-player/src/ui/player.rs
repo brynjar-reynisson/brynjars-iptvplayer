@@ -18,13 +18,24 @@ pub const HW_MIN_HEIGHT: i64 = 1080;
 /// `auto-safe` choice gave corrupt video with the OpenGL render API).
 pub const HW_MODES: &str = "d3d11va-copy,nvdec-copy,dxva2-copy";
 
-/// Decoder tuning for streams above 1080p (software decoding must keep up
-/// with 4K): all cores for frame and slice threading, and cheaper deblocking
-/// of non-reference frames. Reset to `TALL_DEFAULTS` for the next stream.
-pub const TALL_TUNING: [(&str, &str); 3] =
-    [("vd-lavc-threads", "0"), ("vd-lavc-skiploopfilter", "nonref"), ("vd-lavc-fast", "yes")];
-pub const TALL_DEFAULTS: [(&str, &str); 3] =
-    [("vd-lavc-threads", "0"), ("vd-lavc-skiploopfilter", "default"), ("vd-lavc-fast", "no")];
+/// Tuning for streams above 1080p, applied when one plays and undone for the
+/// next stream (the previous values are read from mpv at startup):
+/// - decoder: all cores, cheaper deblocking of non-reference frames;
+/// - renderer: cheap bilinear scaling and no linear-light/sigmoid/dither work.
+///   With mpv's default high-quality scalers the video output dropped about
+///   half of the frames of a 50 fps 4K stream (decoder drops were 0, cache full).
+pub const TALL_TUNING: [(&str, &str); 10] = [
+    ("vd-lavc-threads", "0"),
+    ("vd-lavc-skiploopfilter", "nonref"),
+    ("vd-lavc-fast", "yes"),
+    ("scale", "bilinear"),
+    ("dscale", "bilinear"),
+    ("cscale", "bilinear"),
+    ("correct-downscaling", "no"),
+    ("linear-downscaling", "no"),
+    ("sigmoid-upscaling", "no"),
+    ("dither-depth", "no"),
+];
 
 /// How often the playback stats of a tall stream are logged.
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -52,6 +63,8 @@ pub struct Player {
     hw_active: bool,
     /// Tall-stream tuning is applied to the current stream.
     tuned: bool,
+    /// mpv's values of the `TALL_TUNING` options before any tuning.
+    tall_defaults: Vec<(&'static str, String)>,
     /// When the stats were last logged.
     stats_at: Instant,
     /// For log timestamps.
@@ -76,7 +89,11 @@ impl Player {
         })?;
         eprintln!("libmpv: {}", backend.mpv_version());
         let renderer = backend.renderer().ok_or_else(|| anyhow::anyhow!("libmpv render context missing"))?;
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, tuned: false, stats_at: Instant::now(), t0: Instant::now() })
+        let tall_defaults = TALL_TUNING
+            .iter()
+            .filter_map(|(k, _)| backend.property(k).map(|v| (*k, v)))
+            .collect::<Vec<_>>();
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, hardware_decode, hw_gen: 0, hw_active: false, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -95,7 +112,7 @@ impl Player {
             // A new stream starts in plain software again; it is upgraded when its size is known.
             let b = self.sup.backend_mut();
             b.set_hwdec("no");
-            for (k, v) in TALL_DEFAULTS {
+            for (k, v) in &self.tall_defaults {
                 b.set_property(k, v);
             }
             self.hw_active = false;

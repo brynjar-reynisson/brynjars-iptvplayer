@@ -945,6 +945,11 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Read any mpv property as text (`None` if unknown/unavailable).
+    pub fn property(&self, name: &str) -> Option<String> {
+        get_opt_string(self.core.handle, name)
+    }
+
     /// Set any mpv property by name (decoder options re-create the decoder).
     pub fn set_property(&mut self, name: &str, value: &str) {
         let (n, v) = (CString::new(name).unwrap(), CString::new(value).unwrap());
