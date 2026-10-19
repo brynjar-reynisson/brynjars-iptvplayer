@@ -6,6 +6,7 @@ pub mod favs;
 pub mod live;
 pub mod nav;
 pub mod playback;
+pub mod titles;
 pub mod vod;
 pub mod zap;
 

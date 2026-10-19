@@ -165,6 +165,7 @@ pub fn episodes(
     open: &OpenShow,
     playing: Option<usize>,
     favs: &Favorites,
+    titles: Option<&iptv::episode_titles::Titles>,
     view: &mut ListView,
     scroll_to: Option<usize>,
 ) -> Option<RowAction> {
@@ -175,7 +176,7 @@ pub fn episodes(
             row(ui, RowLook { text: &text, selected: false, playing: false, star: false, greyed: true })
         }
         EpisodeRow::Episode(e) => {
-            let text = episode_text(lib, open.show, e);
+            let text = episode_text(lib, open.show, e, titles);
             row(
                 ui,
                 RowLook {

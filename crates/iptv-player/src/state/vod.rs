@@ -11,6 +11,7 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use iptv::episode_titles::Titles;
 use iptv::library::{normalize, Library, SearchScope};
 use iptv::playlist::favorite_key;
 use iptv::series::UNSORTED;
@@ -192,12 +193,20 @@ pub fn episode_rows(lib: &Library, show: usize, hidden: &HashSet<String>) -> Vec
 
 /// Episode row text: `S01E02 - Title` for parsed episodes; the full entry
 /// name inside `(Unsorted)` or when the name does not parse.
-pub fn episode_text(lib: &Library, show: usize, entry: usize) -> String {
+pub fn episode_text(lib: &Library, show: usize, entry: usize, titles: Option<&Titles>) -> String {
     let name = &lib.entry(entry).name;
     if lib.shows()[show].name == UNSORTED {
         return name.clone();
     }
-    iptv::series::episode_label(name).unwrap_or_else(|| name.clone())
+    let Some(label) = iptv::series::episode_label(name) else { return name.clone() };
+    if !label.contains(" - ") {
+        if let Some(r) = iptv::series::parse_episode(name) {
+            if let Some(t) = titles.and_then(|t| t.get(r.season, r.episode)) {
+                return format!("{label} - {t}");
+            }
+        }
+    }
+    label
 }
 
 // ---- background search ----------------------------------------------------
@@ -747,8 +756,8 @@ pub(crate) mod tests {
                 EpisodeRow::Episode(5),
             ]
         );
-        assert_eq!(episode_text(&lib, qh, 4), "S01E01 - Arrival");
-        assert_eq!(episode_text(&lib, qh, 5), "S02E01");
+        assert_eq!(episode_text(&lib, qh, 4, None), "S01E01 - Arrival");
+        assert_eq!(episode_text(&lib, qh, 5, None), "S02E01");
         // Season 2 is only in the hidden group: its header goes too.
         assert_eq!(
             episode_rows(&lib, qh, &hide(&["Series: Faroe"])),
@@ -758,7 +767,42 @@ pub(crate) mod tests {
         assert_eq!(episode_rows(&lib, un, &none()), vec![EpisodeRow::Season(None), EpisodeRow::Episode(7)]);
         assert_eq!(season_label(None), "Unsorted");
         assert_eq!(season_label(Some(3)), "Season 3");
-        assert_eq!(episode_text(&lib, un, 7), "Odd Lantern Special", "unsorted: full name");
+        assert_eq!(episode_text(&lib, un, 7, None), "Odd Lantern Special", "unsorted: full name");
+    }
+
+    fn titles_for(season: u32, episode: u32, title: &str) -> Titles {
+        let json = format!(
+            r#"{{"name":"x","_embedded":{{"episodes":[{{"season":{season},"number":{episode},"name":"{title}"}}]}}}}"#
+        );
+        let q = iptv::episode_titles::Query { name: "x".into(), year: None };
+        iptv::episode_titles::parse_response(json.as_bytes(), &q).unwrap().unwrap()
+    }
+
+    #[test]
+    fn episode_text_adds_title_when_name_has_none() {
+        let lib = vod_lib();
+        let qh = show_named(&lib, "Quiet Harbor");
+        let t = titles_for(1, 2, "The Visit");
+        assert_eq!(episode_text(&lib, qh, 3, Some(&t)), "S01E02 - The Visit");
+        assert_eq!(episode_text(&lib, qh, 5, Some(&t)), "S02E01", "no title for that episode");
+    }
+
+    #[test]
+    fn episode_text_prefers_playlist_title() {
+        let lib = vod_lib();
+        let qh = show_named(&lib, "Quiet Harbor");
+        let t = titles_for(1, 1, "Other Title");
+        assert_eq!(episode_text(&lib, qh, 4, Some(&t)), "S01E01 - Arrival");
+    }
+
+    #[test]
+    fn episode_text_without_titles_unchanged() {
+        let lib = vod_lib();
+        let qh = show_named(&lib, "Quiet Harbor");
+        assert_eq!(episode_text(&lib, qh, 3, None), "S01E02");
+        let un = show_named(&lib, UNSORTED);
+        let t = titles_for(1, 2, "The Visit");
+        assert_eq!(episode_text(&lib, un, 7, Some(&t)), "Odd Lantern Special");
     }
 
     #[test]

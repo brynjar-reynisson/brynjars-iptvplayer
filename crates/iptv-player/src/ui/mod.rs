@@ -31,6 +31,7 @@ use iptv::supervisor::Status;
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
+use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
     visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
@@ -172,6 +173,8 @@ struct App {
     movies: SearchList,
     series: SeriesBrowser,
     search: SearchWorker,
+    /// Episode titles from TVmaze (background worker).
+    titles: TitleLoader,
     /// Movie/series group titles + counts for the filter menu (computed off
     /// the UI thread per library: ~30 ms on 250k entries).
     groups: Option<Vec<VodGroup>>,
@@ -207,6 +210,8 @@ impl App {
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
         let wake = cc.egui_ctx.clone();
         let search = SearchWorker::spawn(move || wake.request_repaint());
+        let wake = cc.egui_ctx.clone();
+        let titles = TitleLoader::new(opts.data_dir.clone(), TVMAZE_URL.to_string(), move || wake.request_repaint());
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             data_dir: opts.data_dir,
@@ -244,6 +249,7 @@ impl App {
             movies: SearchList::new(SearchScope::Movies),
             series: SeriesBrowser::default(),
             search,
+            titles,
             groups: None,
             groups_rx: None,
             group_filter: String::new(),
@@ -1413,7 +1419,8 @@ impl App {
                             }
                             ui.strong(&open.name);
                         });
-                        let a = vod::episodes(ui, &lib, &open, playing, &self.favs, &mut self.episode_view, scroll_to);
+                        let titles = self.titles.get(&open.name);
+                        let a = vod::episodes(ui, &lib, &open, playing, &self.favs, titles.as_deref(), &mut self.episode_view, scroll_to);
                         if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
                             if let Some(e) = self.series.open_mut().and_then(|o| o.set_cursor(i)) {
                                 if Some(e) != playing {
@@ -1472,6 +1479,11 @@ impl eframe::App for App {
             eprintln!("startup: first frame after {} ms", self.t0.elapsed().as_millis());
         }
         self.poll_background();
+        // Idempotent: covers every path that opens a show (click, Enter, rebase).
+        if let Some(o) = self.series.open() {
+            self.titles.request(&o.name);
+        }
+        self.titles.poll();
         if let Ok(p) = &mut self.player {
             p.update();
             if p.status() == Status::Finished {
