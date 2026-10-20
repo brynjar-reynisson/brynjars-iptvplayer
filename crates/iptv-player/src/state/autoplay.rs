@@ -5,7 +5,9 @@
 //! result gives the offer time (`credits::offer_time`, or the real end when
 //! the scan is unavailable). At the offer time the "Next episode" prompt is
 //! shown with an `OFFER_SECS` countdown, then the next episode plays. The
-//! file finishing while armed (and not dismissed) plays it at once.
+//! file finishing while armed (and not dismissed) plays it at once. The
+//! countdown only runs while the video plays (`set_running`): paused,
+//! buffering or reconnecting holds it.
 
 use std::time::Instant;
 
@@ -45,6 +47,8 @@ pub struct Autoplay {
     next: Option<usize>,
     scan_started: bool,
     offer_at: Option<f64>,
+    /// Since when the video is not playing (the countdown is held).
+    held_since: Option<Instant>,
 }
 
 impl Default for Autoplay {
@@ -55,7 +59,7 @@ impl Default for Autoplay {
 
 impl Autoplay {
     pub fn new() -> Autoplay {
-        Autoplay { phase: Phase::Off, next: None, scan_started: false, offer_at: None }
+        Autoplay { phase: Phase::Off, next: None, scan_started: false, offer_at: None, held_since: None }
     }
 
     /// An episode starts: `next` = the next episode's entry (None or
@@ -70,6 +74,23 @@ impl Autoplay {
 
     pub fn disarm(&mut self) {
         *self = Autoplay::new();
+    }
+
+    /// Whether the video is playing now (not paused, buffering or
+    /// reconnecting). Call every frame before `update`: while it is false the
+    /// countdown is held, and it continues from where it stood afterwards.
+    pub fn set_running(&mut self, now: Instant, running: bool) {
+        match (running, self.held_since) {
+            (false, None) => self.held_since = Some(now),
+            (true, Some(held)) => {
+                self.held_since = None;
+                if let Phase::Offering { since } = &mut self.phase {
+                    // An offer that began while held has not counted at all.
+                    *since += now.saturating_duration_since(held.max(*since));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `position` = (position, duration), `scan` = `None` not available yet,
@@ -130,8 +151,8 @@ impl Autoplay {
 
     /// Countdown check while offering.
     fn tick(&mut self, now: Instant) -> Step {
-        if let Phase::Offering { since } = self.phase {
-            if now.saturating_duration_since(since).as_secs_f64() >= OFFER_SECS {
+        if let Phase::Offering { .. } = self.phase {
+            if self.held_since.is_none() && self.remaining(now) <= 0.0 {
                 self.phase = Phase::Done;
                 return Step::PlayNext;
             }
@@ -146,7 +167,11 @@ impl Autoplay {
     /// Seconds left on the countdown (0 when not offering).
     pub fn remaining(&self, now: Instant) -> f64 {
         match self.phase {
-            Phase::Offering { since } => (OFFER_SECS - now.saturating_duration_since(since).as_secs_f64()).max(0.0),
+            Phase::Offering { since } => {
+                // While held, the clock stands still at the moment it stopped.
+                let now = self.held_since.map_or(now, |h| h.max(since));
+                (OFFER_SECS - now.saturating_duration_since(since).as_secs_f64()).max(0.0)
+            }
             _ => 0.0,
         }
     }
@@ -277,6 +302,44 @@ mod tests {
         // Once.
         assert_eq!(a.update(secs(t0, 9.0), at(D - 91.0), scan.clone(), false), Step::Nothing);
         assert_eq!(a.update(secs(t0, 9.0), at(D - 91.0), scan, true), Step::Nothing);
+    }
+
+    #[test]
+    fn countdown_holds_while_not_running() {
+        let mut a = armed();
+        let t0 = scanning(&mut a);
+        let scan = samples(D - 100.0, &[Credits, Credits, Credits]);
+        assert_eq!(a.update(t0, at(D - 100.0), scan.clone(), false), Step::Offer);
+        // 2 s of countdown, then paused for 20 s.
+        a.set_running(secs(t0, 2.0), false);
+        assert_eq!(a.update(secs(t0, 10.0), at(D - 98.0), scan.clone(), false), Step::Nothing);
+        assert_eq!(a.update(secs(t0, 22.0), at(D - 98.0), scan.clone(), false), Step::Nothing);
+        assert!(a.offering());
+        assert!((a.remaining(secs(t0, 22.0)) - 6.0).abs() < 1e-6);
+        // Playing again: the remaining 6 s count from here.
+        a.set_running(secs(t0, 22.0), true);
+        assert_eq!(a.update(secs(t0, 27.9), at(D - 92.1), scan.clone(), false), Step::Nothing);
+        assert!((a.remaining(secs(t0, 25.0)) - 3.0).abs() < 1e-6);
+        assert_eq!(a.update(secs(t0, 28.0), at(D - 92.0), scan, false), Step::PlayNext);
+    }
+
+    #[test]
+    fn offer_reached_while_held_starts_counting_when_running() {
+        let mut a = armed();
+        let t0 = scanning(&mut a);
+        let scan = samples(D - 100.0, &[Credits, Credits, Credits]);
+        // Buffering when the offer time is reached.
+        a.set_running(t0, false);
+        assert_eq!(a.update(secs(t0, 5.0), at(D - 100.0), scan.clone(), false), Step::Offer);
+        assert_eq!(a.remaining(secs(t0, 30.0)), OFFER_SECS);
+        assert_eq!(a.update(secs(t0, 30.0), at(D - 100.0), scan.clone(), false), Step::Nothing);
+        a.set_running(secs(t0, 30.0), true);
+        assert_eq!(a.update(secs(t0, 37.9), at(D - 92.0), scan.clone(), false), Step::Nothing);
+        assert_eq!(a.update(secs(t0, 38.0), at(D - 92.0), scan.clone(), false), Step::PlayNext);
+        // Finishing is never held.
+        let mut b = armed();
+        b.set_running(t0, false);
+        assert_eq!(b.update(t0, at(D), None, true), Step::PlayNext);
     }
 
     #[test]

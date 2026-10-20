@@ -79,8 +79,10 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   episodes (by language); stored in `settings.json`.
 - Next episode: during the closing credits of an episode a **Next episode in 8** button
   appears at the video's bottom right and counts down; at 0 the next episode starts (the
-  last episode of a season continues with the next season). **Enter** or a click plays it
-  now; **Esc** or **Cancel** keeps watching (no offer again for that episode). The credits
+  last episode of a season continues with the next season). A click on it plays it now
+  (also **Enter** in the full player view or full screen; in the list view Enter keeps its
+  usual meaning); **Esc** or **Cancel** keeps watching (no offer again for that episode).
+  The countdown waits while the video is paused, buffering or reconnecting. The credits
   are found by looking ahead at the last 8 minutes over the preview connection; if real
   scenes follow the credits (or the check is not possible), the next episode starts only
   when the file ends. Turn it off with `"autoplay_next": false` in `settings.json`.
@@ -142,6 +144,11 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 - Next episode: credits are recognised from small preview frames (bright text lines on a
   dark plain background). Credits over moving pictures are not recognised, so such
   episodes offer the next one only at the very end; unusual title cards on black near the
-  end could be taken for credits.
+  end could be taken for credits. Not skipping content after the credits is best effort:
+  frames are checked every 10 s, so a scene after the credits shorter than about 10 s (or
+  in the last 3 s) can be missed, and frames come from the nearest keyframe, so the offer
+  can appear a few seconds early. The offer always counts down 8 s and can be cancelled.
+  The extra connection used for the check is closed when it is done (hovering the seek
+  bar opens it again).
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.

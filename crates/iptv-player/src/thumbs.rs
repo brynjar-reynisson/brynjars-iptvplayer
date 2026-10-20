@@ -4,7 +4,9 @@
 //! "Next episode" (credits detection) on that connection. The source is
 //! opened on demand (first seek-bar hover / arrow-key seek, or a tail scan)
 //! and stays open until playback changes (reset), so the extra provider
-//! connection exists from then until the next video or stop. Never logs or
+//! connection exists from then until the next video or stop, except that a
+//! finished tail scan closes it when no preview is wanted
+//! ([`Reply::Closed`]; the next hover opens it again). Never logs or
 //! stores the URL anywhere but in the command it sends to the worker.
 
 use std::collections::{HashMap, VecDeque};
@@ -42,21 +44,41 @@ pub fn nearest(cached: impl IntoIterator<Item = i64>, bucket: i64) -> Option<i64
 /// frame could not be taken).
 pub type Sample = (f64, Option<FrameKind>);
 
-/// Takes the frame at each of `times` in order via `take`; `aborted` is asked
-/// before every frame and stops the scan (`None`) when it says so.
+/// Takes the frame at each of `times` in order via `take`, keeping every
+/// result in `memo` (so a resumed scan never takes a frame twice). `aborted`
+/// is asked before each frame that is not memoised yet, except the first new
+/// one of this call, and stops the scan (`None`) when it says so: every
+/// resume makes progress, so a stream of preview requests cannot starve it.
 fn run_scan(
     times: &[f64],
+    memo: &mut HashMap<u64, Option<FrameKind>>,
     mut take: impl FnMut(f64) -> Option<FrameKind>,
     mut aborted: impl FnMut() -> bool,
 ) -> Option<Vec<Sample>> {
     let mut out = Vec::with_capacity(times.len());
+    let mut took_new = false;
     for &t in times {
-        if aborted() {
-            return None;
-        }
-        out.push((t, take(t)));
+        let kind = match memo.get(&t.to_bits()) {
+            Some(k) => *k,
+            None => {
+                if took_new && aborted() {
+                    return None;
+                }
+                took_new = true;
+                let k = take(t);
+                memo.insert(t.to_bits(), k);
+                k
+            }
+        };
+        out.push((t, kind));
     }
     Some(out)
+}
+
+/// After a finished scan: close the source (the second provider connection)
+/// unless a preview frame is waiting to be taken from it.
+fn close_after_scan(want_pending: bool) -> bool {
+    !want_pending
 }
 
 /// Whether the newest Want is served before the scan resumes: only when the
@@ -96,6 +118,9 @@ pub enum Reply {
     Failed { gen: u64, bucket: i64 },
     /// A tail scan finished (sent once per scan, never when it was dropped).
     Scanned { gen: u64, samples: Vec<Sample> },
+    /// The source of `gen` was closed after its scan (no preview was
+    /// wanted); the next request must open it again.
+    Closed { gen: u64 },
 }
 
 /// A scan in progress. Frames already classified are kept in `memo`, so a
@@ -214,14 +239,13 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     let ScanJob { gen, times, memo } = job;
                     let done = run_scan(
                         times,
-                        |t| {
-                            *memo.entry(t.to_bits()).or_insert_with(|| match m.frame_at(t, SEEK_TIMEOUT) {
-                                Ok(th) => Some(classify(&th.rgba, th.width, th.height)),
-                                Err(e) => {
-                                    eprintln!("tail scan: {e}");
-                                    None
-                                }
-                            })
+                        memo,
+                        |t| match m.frame_at(t, SEEK_TIMEOUT) {
+                            Ok(th) => Some(classify(&th.rgba, th.width, th.height)),
+                            Err(e) => {
+                                eprintln!("tail scan: {e}");
+                                None
+                            }
                         },
                         || {
                             if pending.is_empty() {
@@ -232,8 +256,15 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     );
                     match done {
                         Some(samples) => {
-                            send(Reply::Scanned { gen: *gen, samples });
+                            let gen = *gen;
+                            send(Reply::Scanned { gen, samples });
                             scan = None;
+                            // Do not keep an idle second connection open.
+                            let want_pending = want.is_some() || pending.iter().any(|c| matches!(c, Cmd::Want { .. }));
+                            if close_after_scan(want_pending) {
+                                mpv = None;
+                                send(Reply::Closed { gen });
+                            }
                         }
                         None => {
                             interrupted = true;
@@ -262,10 +293,17 @@ mod tests {
     }
 
     #[test]
+    fn source_closes_after_a_scan_unless_a_preview_is_wanted() {
+        assert!(close_after_scan(false));
+        assert!(!close_after_scan(true));
+    }
+
+    #[test]
     fn scan_collects_in_order() {
         let mut asked = Vec::new();
         let out = run_scan(
             &[10.0, 20.0, 30.0],
+            &mut HashMap::new(),
             |t| {
                 asked.push(t);
                 if t == 20.0 {
@@ -286,8 +324,10 @@ mod tests {
     #[test]
     fn scan_aborts_when_told() {
         let taken = std::cell::Cell::new(0);
+        let mut memo = HashMap::new();
         let out = run_scan(
             &[1.0, 2.0, 3.0, 4.0],
+            &mut memo,
             |_| {
                 taken.set(taken.get() + 1);
                 Some(FrameKind::Black)
@@ -296,7 +336,55 @@ mod tests {
         );
         assert_eq!(out, None);
         assert_eq!(taken.get(), 2, "no frame is taken after the abort");
-        assert_eq!(run_scan(&[1.0], |_| Some(FrameKind::Black), || true), None);
+        assert_eq!(memo.len(), 2, "taken frames are memoised");
+    }
+
+    #[test]
+    fn every_resume_takes_a_new_frame_even_when_always_aborted() {
+        // A preview request arrives before every frame: each call still
+        // takes one new frame, so the scan finishes after one call per time.
+        let times = [1.0, 2.0, 3.0];
+        let mut memo = HashMap::new();
+        let mut taken = Vec::new();
+        let mut calls = 0;
+        let out = loop {
+            calls += 1;
+            assert!(calls <= times.len(), "the scan must make progress");
+            let r = run_scan(
+                &times,
+                &mut memo,
+                |t| {
+                    taken.push(t);
+                    Some(FrameKind::Credits)
+                },
+                || true,
+            );
+            if let Some(s) = r {
+                break s;
+            }
+        };
+        assert_eq!(taken, vec![1.0, 2.0, 3.0], "no frame taken twice");
+        assert_eq!(out.len(), 3);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn memoised_frames_are_not_checked_for_an_abort() {
+        let mut memo = HashMap::new();
+        memo.insert(1.0f64.to_bits(), Some(FrameKind::Black));
+        memo.insert(2.0f64.to_bits(), None);
+        let aborts = std::cell::Cell::new(0);
+        let out = run_scan(
+            &[1.0, 2.0],
+            &mut memo,
+            |_| unreachable!("memoised"),
+            || {
+                aborts.set(aborts.get() + 1);
+                true
+            },
+        );
+        assert_eq!(out, Some(vec![(1.0, Some(FrameKind::Black)), (2.0, None)]));
+        assert_eq!(aborts.get(), 0);
     }
 
     #[test]

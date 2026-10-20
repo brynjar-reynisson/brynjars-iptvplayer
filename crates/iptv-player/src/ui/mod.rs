@@ -516,12 +516,15 @@ impl App {
     fn update_autoplay(&mut self, finished: bool) -> bool {
         let Ok(p) = &self.player else { return false };
         let position = p.position();
+        let now = Instant::now();
+        // The countdown is held while paused, buffering or reconnecting.
+        self.autoplay.set_running(now, p.status() == Status::Playing && !p.paused());
         let scan = match self.previews.scan_result() {
             ScanState::NotStarted | ScanState::Running => None,
             ScanState::Unavailable => Some(None),
             ScanState::Done(samples) => Some(Some(samples)),
         };
-        match self.autoplay.update(Instant::now(), position, scan, finished) {
+        match self.autoplay.update(now, position, scan, finished) {
             Step::StartScan(times) => {
                 if let Some(url) = self.playback.as_ref().map(|p| p.url().to_string()) {
                     self.previews.start_scan(&url, times);
@@ -934,19 +937,20 @@ impl App {
             esc
         };
         let typing = ctx.egui_wants_keyboard_input();
-        // The "Next episode" offer owns Enter (play now) and Esc (dismiss only:
-        // no stop, no leaving fullscreen this press).
-        let (enter, esc) = if self.autoplay.offering() && !typing && !self.sub_menu && (enter || esc) {
-            if enter {
-                self.autoplay.accept();
-                self.play_next_episode();
-            } else {
-                self.autoplay.dismiss();
-            }
-            (false, false)
-        } else {
-            (enter, esc)
-        };
+        // The "Next episode" offer owns Esc (dismiss only: no stop, no leaving
+        // fullscreen this press) and, in the player view (also fullscreen),
+        // Enter (play now). In the browse view Enter keeps its list meaning;
+        // the offer's buttons can still be clicked there.
+        let offer_keys = self.autoplay.offering() && !typing && !self.sub_menu;
+        let offer_enter = offer_keys && enter && self.view == View::Player && self.focused_tab.is_none();
+        let offer_esc = offer_keys && esc && !offer_enter;
+        if offer_enter {
+            self.autoplay.accept();
+            self.play_next_episode();
+        } else if offer_esc {
+            self.autoplay.dismiss();
+        }
+        let (enter, esc) = if offer_enter || offer_esc { (false, false) } else { (enter, esc) };
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if toggle_fs || (esc && fullscreen) {
             // Esc only leaves fullscreen; it does nothing else this press.

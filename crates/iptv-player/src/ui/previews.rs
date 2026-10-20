@@ -88,6 +88,13 @@ impl Previews {
                     eprintln!("tail scan: {} samples from {:.0} s: {kinds}", samples.len(), from);
                     self.scan = ScanState::Done(samples);
                 }
+                Reply::Closed { gen } if gen == self.gen => {
+                    // The worker closed the idle connection after the scan: the
+                    // next hover opens it again (the scan result is kept; a
+                    // request it dropped is asked again).
+                    self.opened = false;
+                    self.wanted = None;
+                }
                 Reply::Failed { gen, bucket } if gen == self.gen => {
                     self.bad.insert(bucket);
                 }
