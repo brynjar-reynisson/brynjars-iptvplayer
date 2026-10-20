@@ -5,10 +5,22 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use eframe::egui;
 
+use crate::state::credits::FrameKind;
 use crate::thumbs::{bucket_of, nearest, Reply, ThumbService};
 
 /// Most previews kept per video (240x135 RGBA = 130 KB each).
 const MAX_KEPT: usize = 300;
+
+/// Progress of the tail scan of the current video.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanState {
+    NotStarted,
+    Running,
+    /// `(time, kind)` per sampled time, in the order asked (`None` = no frame).
+    Done(Vec<(f64, Option<FrameKind>)>),
+    /// The second source cannot be opened: no scan for this video.
+    Unavailable,
+}
 
 pub struct Previews {
     svc: ThumbService,
@@ -23,6 +35,7 @@ pub struct Previews {
     /// Buckets whose frame could not be taken.
     bad: HashSet<i64>,
     wanted: Option<i64>,
+    scan: ScanState,
 }
 
 impl Previews {
@@ -36,6 +49,7 @@ impl Previews {
             order: VecDeque::new(),
             bad: HashSet::new(),
             wanted: None,
+            scan: ScanState::NotStarted,
         }
     }
 
@@ -51,6 +65,7 @@ impl Previews {
         self.order.clear();
         self.bad.clear();
         self.wanted = None;
+        self.scan = ScanState::NotStarted;
     }
 
     /// Adopt finished frames. Every frame.
@@ -58,6 +73,9 @@ impl Previews {
         for reply in self.svc.poll() {
             match reply {
                 Reply::OpenFailed { gen } if gen == self.gen => self.unavailable = true,
+                Reply::Scanned { gen, samples } if gen == self.gen && self.scan == ScanState::Running => {
+                    self.scan = ScanState::Done(samples);
+                }
                 Reply::Failed { gen, bucket } if gen == self.gen => {
                     self.bad.insert(bucket);
                 }
@@ -81,16 +99,40 @@ impl Previews {
         }
     }
 
+    /// Start the tail scan of the current video at `times` (opens the second
+    /// source if needed). Nothing happens when that source is unavailable.
+    pub fn start_scan(&mut self, url: &str, times: Vec<f64>) {
+        if self.unavailable {
+            return;
+        }
+        self.ensure_open(url);
+        self.svc.scan(self.gen, times);
+        self.scan = ScanState::Running;
+    }
+
+    /// Where the tail scan of the current video stands (see [`Previews::poll`]).
+    pub fn scan_result(&mut self) -> ScanState {
+        if self.unavailable {
+            ScanState::Unavailable
+        } else {
+            self.scan.clone()
+        }
+    }
+
+    fn ensure_open(&mut self, url: &str) {
+        if !self.opened {
+            self.svc.open(self.gen, url);
+            self.opened = true;
+        }
+    }
+
     /// The preview to show at `secs` (the nearest one taken so far), asking
     /// for the exact one. The first call per video opens the second source.
     pub fn at(&mut self, url: &str, secs: f64) -> Option<&egui::TextureHandle> {
         if self.unavailable {
             return None;
         }
-        if !self.opened {
-            self.svc.open(self.gen, url);
-            self.opened = true;
-        }
+        self.ensure_open(url);
         let bucket = bucket_of(secs);
         if !self.tex.contains_key(&bucket) && !self.bad.contains(&bucket) && self.wanted != Some(bucket) {
             self.svc.want(self.gen, bucket);

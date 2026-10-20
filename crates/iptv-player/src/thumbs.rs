@@ -5,9 +5,11 @@
 //! while the user hovers the seek bar. Never logs or stores the URL anywhere
 //! but in the command it sends to the worker.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+use crate::state::credits::{classify, FrameKind};
 use crate::thumb_mpv::{Thumb, ThumbMpv};
 
 /// Width of a preview in pixels.
@@ -34,9 +36,31 @@ pub fn nearest(cached: impl IntoIterator<Item = i64>, bucket: i64) -> Option<i64
     cached.into_iter().min_by_key(|b| ((b - bucket).abs(), *b))
 }
 
+/// One tail-scan sample: time and what the frame looks like (`None` = the
+/// frame could not be taken).
+pub type Sample = (f64, Option<FrameKind>);
+
+/// Takes the frame at each of `times` in order via `take`; `aborted` is asked
+/// before every frame and stops the scan (`None`) when it says so.
+fn run_scan(
+    times: &[f64],
+    mut take: impl FnMut(f64) -> Option<FrameKind>,
+    mut aborted: impl FnMut() -> bool,
+) -> Option<Vec<Sample>> {
+    let mut out = Vec::with_capacity(times.len());
+    for &t in times {
+        if aborted() {
+            return None;
+        }
+        out.push((t, take(t)));
+    }
+    Some(out)
+}
+
 enum Cmd {
     Open { gen: u64, url: String },
     Want { gen: u64, bucket: i64 },
+    Scan { gen: u64, times: Vec<f64> },
     Close,
 }
 
@@ -46,6 +70,16 @@ pub enum Reply {
     Frame { gen: u64, bucket: i64, thumb: Thumb },
     /// A frame could not be taken.
     Failed { gen: u64, bucket: i64 },
+    /// A tail scan finished (sent once per scan, never when it was dropped).
+    Scanned { gen: u64, samples: Vec<Sample> },
+}
+
+/// A scan in progress. Frames already classified are kept in `memo`, so a
+/// scan interrupted by a newer command resumes without taking them again.
+struct ScanJob {
+    gen: u64,
+    times: Vec<f64>,
+    memo: HashMap<u64, Option<FrameKind>>,
 }
 
 pub struct ThumbService {
@@ -75,6 +109,13 @@ impl ThumbService {
         let _ = self.tx.send(Cmd::Want { gen, bucket });
     }
 
+    /// Classify the frames at `times` of the source opened for `gen` (replaces
+    /// any earlier scan). Answered once with [`Reply::Scanned`]; dropped
+    /// without a reply when the source is closed or replaced.
+    pub fn scan(&self, gen: u64, times: Vec<f64>) {
+        let _ = self.tx.send(Cmd::Scan { gen, times });
+    }
+
     /// Drop the source (and its connection).
     pub fn close(&self) {
         let _ = self.tx.send(Cmd::Close);
@@ -91,14 +132,26 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
         let _ = tx.send(r);
         wake();
     };
-    while let Ok(first) = rx.recv() {
+    // Commands taken off the channel while a scan checked for newer work.
+    let mut pending: VecDeque<Cmd> = VecDeque::new();
+    let mut want: Option<(u64, i64)> = None;
+    let mut scan: Option<ScanJob> = None;
+    loop {
         // Handle a burst of commands at once: opens/closes in order, only the
-        // newest Want.
-        let mut want = None;
-        for cmd in std::iter::once(first).chain(rx.try_iter()) {
+        // newest Want and the newest Scan.
+        let mut burst: Vec<Cmd> = pending.drain(..).chain(rx.try_iter()).collect();
+        if burst.is_empty() && scan.is_none() && want.is_none() {
+            match rx.recv() {
+                Ok(cmd) => burst.push(cmd),
+                Err(_) => return,
+            }
+            burst.extend(rx.try_iter());
+        }
+        for cmd in burst {
             match cmd {
                 Cmd::Open { gen, url } => {
                     want = None;
+                    scan = None;
                     mpv = None;
                     match ThumbMpv::new(&user_agent, THUMB_WIDTH).and_then(|m| m.open(&url, OPEN_TIMEOUT).map(|_| m)) {
                         Ok(m) => mpv = Some((gen, m)),
@@ -109,13 +162,51 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     }
                 }
                 Cmd::Want { gen, bucket } => want = Some((gen, bucket)),
+                Cmd::Scan { gen, times } => scan = Some(ScanJob { gen, times, memo: HashMap::new() }),
                 Cmd::Close => {
                     want = None;
+                    scan = None;
                     mpv = None;
                 }
             }
         }
-        if let (Some((gen, bucket)), Some((open_gen, m))) = (want, &mpv) {
+        // The scan goes first; any command arriving meanwhile interrupts it
+        // (frames taken so far are kept) and is handled before it resumes.
+        if let Some(job) = &mut scan {
+            match &mpv {
+                Some((open_gen, m)) if *open_gen == job.gen => {
+                    let ScanJob { gen, times, memo } = job;
+                    let done = run_scan(
+                        times,
+                        |t| {
+                            *memo.entry(t.to_bits()).or_insert_with(|| match m.frame_at(t, SEEK_TIMEOUT) {
+                                Ok(th) => Some(classify(&th.rgba, th.width, th.height)),
+                                Err(e) => {
+                                    eprintln!("tail scan: {e}");
+                                    None
+                                }
+                            })
+                        },
+                        || {
+                            if pending.is_empty() {
+                                pending.extend(rx.try_recv().ok());
+                            }
+                            !pending.is_empty()
+                        },
+                    );
+                    match done {
+                        Some(samples) => {
+                            send(Reply::Scanned { gen: *gen, samples });
+                            scan = None;
+                        }
+                        None => continue,
+                    }
+                }
+                // No source for this scan (closed, failed to open, or another video).
+                _ => scan = None,
+            }
+        }
+        if let (Some((gen, bucket)), Some((open_gen, m))) = (want.take(), &mpv) {
             if gen == *open_gen {
                 match m.frame_at(bucket_secs(bucket), SEEK_TIMEOUT) {
                     Ok(thumb) => send(Reply::Frame { gen, bucket, thumb }),
@@ -132,6 +223,44 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_collects_in_order() {
+        let mut asked = Vec::new();
+        let out = run_scan(
+            &[10.0, 20.0, 30.0],
+            |t| {
+                asked.push(t);
+                if t == 20.0 {
+                    None
+                } else {
+                    Some(FrameKind::Credits)
+                }
+            },
+            || false,
+        );
+        assert_eq!(asked, vec![10.0, 20.0, 30.0]);
+        assert_eq!(
+            out,
+            Some(vec![(10.0, Some(FrameKind::Credits)), (20.0, None), (30.0, Some(FrameKind::Credits))])
+        );
+    }
+
+    #[test]
+    fn scan_aborts_when_told() {
+        let taken = std::cell::Cell::new(0);
+        let out = run_scan(
+            &[1.0, 2.0, 3.0, 4.0],
+            |_| {
+                taken.set(taken.get() + 1);
+                Some(FrameKind::Black)
+            },
+            || taken.get() >= 2,
+        );
+        assert_eq!(out, None);
+        assert_eq!(taken.get(), 2, "no frame is taken after the abort");
+        assert_eq!(run_scan(&[1.0], |_| Some(FrameKind::Black), || true), None);
+    }
 
     #[test]
     fn buckets_round_to_the_nearest_ten_seconds() {
