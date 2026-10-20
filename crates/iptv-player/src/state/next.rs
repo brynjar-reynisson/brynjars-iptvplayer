@@ -1,11 +1,52 @@
 //! Which episode follows the one that is playing (autoplay next episode).
 
 use std::collections::HashSet;
+use std::sync::{Arc, Weak};
 
 use iptv::library::Library;
+use iptv::playlist::Kind;
 use iptv::series::UNSORTED;
 
-use super::vod::{episode_rows, EpisodeRow};
+use super::vod::{episode_rows, EpisodeRow, Hidden};
+
+/// Playing entry, library, hidden groups.
+type CacheKey = (Option<usize>, Weak<Library>, Weak<HashSet<String>>);
+
+/// `next_episode` of the playing entry, recomputed only when the playing
+/// entry, the library (by `Arc` identity: a refresh swaps it) or the hidden
+/// groups (by `Arc` identity: a change replaces the set) change, since
+/// `next_episode` scans every show and the ">>" button asks every frame.
+/// Holds `Weak`s: never keeps an old library alive, and a freed allocation
+/// cannot be reused while the `Weak` exists, so identity is never confused.
+#[derive(Default)]
+pub struct NextCache {
+    key: Option<CacheKey>,
+    next: Option<usize>,
+    computed: u32,
+}
+
+impl NextCache {
+    /// The episode after `entry` in `lib` (`None` for live channels, movies,
+    /// `(Unsorted)`, the last episode or an entry no longer in the playlist).
+    pub fn get(&mut self, lib: &Arc<Library>, entry: Option<usize>, hidden: &Hidden) -> Option<usize> {
+        let hit = self.key.as_ref().is_some_and(|(e, l, h)| {
+            *e == entry && Weak::ptr_eq(l, &Arc::downgrade(lib)) && Weak::ptr_eq(h, &Arc::downgrade(hidden))
+        });
+        if !hit {
+            self.computed += 1;
+            self.next = entry
+                .filter(|&e| lib.entry(e).kind == Kind::Series)
+                .and_then(|e| next_episode(lib, e, hidden));
+            self.key = Some((entry, Arc::downgrade(lib), Arc::downgrade(hidden)));
+        }
+        self.next
+    }
+
+    /// How often `get` recomputed (tests).
+    pub fn computed(&self) -> u32 {
+        self.computed
+    }
+}
 
 /// The entry of the episode after `entry` in its show's visible rows (crossing
 /// season headers). `None` if `entry` is in no show, in `(Unsorted)`, in a
@@ -101,5 +142,66 @@ mod tests {
         assert_eq!(next_episode(&lib, 0, &HashSet::new()), Some(1));
         assert_eq!(next_episode(&lib, 0, &h), Some(2));
         assert_eq!(next_episode(&lib, 1, &h), None, "a hidden entry has no next");
+    }
+
+    fn arcs() -> (Arc<Library>, Hidden) {
+        (Arc::new(vod_lib()), Arc::new(HashSet::new()))
+    }
+
+    #[test]
+    fn cache_hit_does_not_recompute() {
+        let (lib, h) = arcs();
+        let mut c = NextCache::default();
+        assert_eq!(c.get(&lib, Some(4), &h), Some(3));
+        assert_eq!(c.get(&lib, Some(4), &h), Some(3));
+        assert_eq!(c.computed(), 1);
+    }
+
+    #[test]
+    fn cache_miss_on_entry_change() {
+        let (lib, h) = arcs();
+        let mut c = NextCache::default();
+        assert_eq!(c.get(&lib, Some(4), &h), Some(3));
+        assert_eq!(c.get(&lib, Some(3), &h), Some(5));
+        assert_eq!(c.get(&lib, Some(5), &h), None, "last episode");
+        assert_eq!(c.get(&lib, None, &h), None, "not in playlist");
+        assert_eq!(c.computed(), 4);
+    }
+
+    #[test]
+    fn cache_miss_on_library_change() {
+        let (lib, h) = arcs();
+        let mut c = NextCache::default();
+        c.get(&lib, Some(4), &h);
+        // A refresh: same content, new Arc.
+        let swapped = Arc::new(vod_lib());
+        assert_eq!(c.get(&swapped, Some(4), &h), Some(3));
+        assert_eq!(c.computed(), 2);
+        drop(lib);
+        assert_eq!(c.get(&swapped, Some(4), &h), Some(3));
+        assert_eq!(c.computed(), 2);
+    }
+
+    #[test]
+    fn cache_miss_on_hidden_change() {
+        let lib = Arc::new(Library::build(vec![
+            vod(Kind::Series, "1", "Quiet Harbor S01E01", "Series: A"),
+            vod(Kind::Series, "2", "Quiet Harbor S01E02", "Series: B"),
+            vod(Kind::Series, "3", "Quiet Harbor S01E03", "Series: A"),
+        ]));
+        let mut c = NextCache::default();
+        let none: Hidden = Arc::new(HashSet::new());
+        assert_eq!(c.get(&lib, Some(0), &none), Some(1));
+        let h: Hidden = Arc::new(hide(&["Series: B"]));
+        assert_eq!(c.get(&lib, Some(0), &h), Some(2));
+        assert_eq!(c.computed(), 2);
+    }
+
+    #[test]
+    fn cache_none_for_non_episodes() {
+        let (lib, h) = arcs();
+        let mut c = NextCache::default();
+        assert_eq!(c.get(&lib, Some(0), &h), None, "movie");
+        assert_eq!(c.get(&lib, Some(7), &h), None, "(Unsorted)");
     }
 }

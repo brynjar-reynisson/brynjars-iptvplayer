@@ -50,6 +50,7 @@ Known gaps and ideas that were found during implementation and review but not do
 - **`mpv.lib` generation is manual** (dumpbin → hand-written `.def` → `lib /def`, documented in `AGENTS.md`). Add a script to generate it from `libmpv-2.dll`.
 - **`build.rs`** has `rerun-if-changed` on files that do not exist when libmpv is absent, so the build script reruns on every build in that case (harmless).
 - **Library ready time** from cache was measured at 0.43–0.48 s in the last run (earlier runs under load showed 1.0–1.3 s, still on a background thread so the window is usable within ~0.1–0.5 s). A lazily built search index (`OnceLock`) or one concatenated string with offsets would cut build time and memory further.
+- **Narrow video panel.** The **>>** next-episode button hides itself when it does not fit, but the fullscreen, play/pause and CC buttons are always drawn and get clipped at the panel's left edge when it is very narrow (seen at ~100 px wide).
 
 ## Ideas (not requested)
 
@@ -58,3 +59,4 @@ Known gaps and ideas that were found during implementation and review but not do
 - Per-country ordering or hiding of live channels.
 - Audio-track selection UI (mpv defaults are used now).
 - A UI switch for `autoplay_next` (settings.json only for now).
+- A "previous episode" button/key to match the **>>** next-episode button.

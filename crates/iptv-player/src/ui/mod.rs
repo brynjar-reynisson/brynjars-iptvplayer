@@ -33,7 +33,7 @@ use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
-use crate::state::next::{next_episode, show_episodes, show_of};
+use crate::state::next::{next_episode, show_episodes, show_of, NextCache};
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -155,6 +155,9 @@ struct App {
     key_seek: Option<Instant>,
     /// "Next episode" offer / autoplay of the playing episode.
     autoplay: Autoplay,
+    /// Next episode of the playing one, for the ">>" button (cached: the
+    /// lookup scans every show).
+    next_cache: NextCache,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -248,6 +251,7 @@ impl App {
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
             autoplay: Autoplay::new(),
+            next_cache: NextCache::default(),
             sub_menu: false,
             sub_cursor: 0,
             positions,
@@ -567,7 +571,7 @@ impl App {
                 }
                 false
             }
-            Step::PlayNext => self.play_next_episode(),
+            Step::PlayNext => self.play_next_episode(true),
             Step::Offer => {
                 eprintln!("autoplay: offer shown at {:.1} s", position.map_or(0.0, |(p, _)| p));
                 false
@@ -576,13 +580,16 @@ impl App {
         }
     }
 
-    /// Play the episode after the playing one (autoplay or "Next episode"
-    /// accepted), through `start` (resume, subtitle preference, positions).
-    /// The finished episode's position is forgotten and the open show's
-    /// cursor moves to the new episode. False if there is no next episode
-    /// (any more: e.g. the playlist changed).
-    fn play_next_episode(&mut self) -> bool {
-        match self.try_play_next_episode() {
+    /// Play the episode after the playing one (autoplay, "Next episode"
+    /// accepted or the ">>" button), through `start` (resume, subtitle
+    /// preference, positions). With `finished` (autoplay/offer) the old
+    /// episode's position is forgotten; the ">>" button skips an unfinished
+    /// episode, so its position stays (beyond what `start`'s save already
+    /// forgets near the end). The open show's cursor moves to the new
+    /// episode. False if there is no next episode (any more: e.g. the
+    /// playlist changed).
+    fn play_next_episode(&mut self, finished: bool) -> bool {
+        match self.try_play_next_episode(finished) {
             Ok(name) => {
                 eprintln!("autoplay: starting next episode: {name}");
                 true
@@ -595,7 +602,21 @@ impl App {
         }
     }
 
-    fn try_play_next_episode(&mut self) -> Result<String, NextFail> {
+    /// The playing episode has a next one (cached, cheap every frame).
+    fn next_available(&mut self) -> bool {
+        self.playback
+            .as_ref()
+            .is_some_and(|pb| !pb.is_live() && self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some())
+    }
+
+    /// The ">>" button or N: skip to the next episode now, independent of
+    /// `autoplay_next` and the offer. The skipped episode keeps its position.
+    fn skip_to_next_episode(&mut self) {
+        eprintln!("autoplay: next episode button clicked");
+        self.play_next_episode(false);
+    }
+
+    fn try_play_next_episode(&mut self, finished: bool) -> Result<String, NextFail> {
         let pb = self.playback.as_ref().ok_or(NextFail::NothingPlaying)?;
         let cur = pb.entry_index().ok_or(NextFail::NotInPlaylist)?;
         let lib = pb.library().clone();
@@ -604,9 +625,11 @@ impl App {
         let old_key = pb.key().to_string();
         let list = show_episodes(&lib, show, &self.hidden);
         self.start(Playback::new(lib.clone(), list, next, Tab::Series));
-        self.positions.forget(&old_key);
-        if let Err(e) = self.positions.save_if_dirty() {
-            eprintln!("could not save positions: {}", safe_text(&format!("{e:#}")));
+        if finished {
+            self.positions.forget(&old_key);
+            if let Err(e) = self.positions.save_if_dirty() {
+                eprintln!("could not save positions: {}", safe_text(&format!("{e:#}")));
+            }
         }
         if self.shown_lib.as_ref().is_some_and(|l| Arc::ptr_eq(l, &lib)) {
             if let Some(o) = self.series.open_mut().filter(|o| o.show == show) {
@@ -1002,7 +1025,7 @@ impl App {
         if offer_enter {
             eprintln!("autoplay: offer accepted");
             self.autoplay.accept();
-            self.play_next_episode();
+            self.play_next_episode(true);
         } else if offer_esc {
             eprintln!("autoplay: offer dismissed");
             self.autoplay.dismiss();
@@ -1048,6 +1071,15 @@ impl App {
         let enter = enter || right;
         // C opens/closes the subtitle menu (movies and episodes only).
         let vod_playing = self.playback.as_ref().is_some_and(|p| !p.is_live());
+        // N = the ">>" button (only when it is offered: an episode with a next one).
+        let next_key = !typing
+            && !self.sub_menu
+            && self.focused_tab.is_none()
+            && self.next_available()
+            && ctx.input_mut(|i| i.consume_key(M::NONE, Key::N));
+        if next_key {
+            self.skip_to_next_episode();
+        }
         let (fav, space, slash, back, sub_key) = if typing {
             (false, false, false, false, false)
         } else {
@@ -1413,6 +1445,8 @@ impl App {
             let mut bar_job: Option<(egui::Rect, Option<(f64, Option<f64>)>)> = None;
             // "Next episode" offer clicked: Some(true) = play now, Some(false) = cancel.
             let mut offer: Option<bool> = None;
+            // ">>" (next episode) button clicked.
+            let mut next_clicked = false;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     // Movies/episodes: a strip below the video holds the seek bar.
@@ -1554,6 +1588,32 @@ impl App {
                     if pb_resp.on_hover_text(if paused { "Play (Space)" } else { "Pause (Space)" }).clicked() {
                         toggle_pause = true;
                     }
+                    // Next episode button (">>" as two triangles), left of "CC":
+                    // episodes with a next one only; hidden when it would not fit
+                    // inside the video rect.
+                    let nbtn = btn.translate(egui::vec2(-114.0, 0.0));
+                    let fits = nbtn.left() >= rect.left() + 4.0 && nbtn.top() >= rect.top() + 4.0;
+                    if fits
+                        && !pb.is_live()
+                        && self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some()
+                    {
+                        let n_resp = ui.interact(nbtn, egui::Id::unique("next_btn"), egui::Sense::click());
+                        let na = if n_resp.hovered() { 230 } else { 140 };
+                        let np = ui.painter_at(rect);
+                        np.rect_filled(nbtn, 4.0, egui::Color32::from_black_alpha(na / 2));
+                        let white = egui::Color32::from_white_alpha(na);
+                        let c = nbtn.center();
+                        for dx in [-8.0, 0.0] {
+                            np.add(egui::Shape::convex_polygon(
+                                vec![c + egui::vec2(dx, -7.0), c + egui::vec2(dx, 7.0), c + egui::vec2(dx + 8.0, 0.0)],
+                                white,
+                                egui::Stroke::NONE,
+                            ));
+                        }
+                        if n_resp.on_hover_text("Next episode (N)").clicked() {
+                            next_clicked = true;
+                        }
+                    }
                     let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
                     let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
                     let alpha = if b.hovered() { 230 } else { 140 };
@@ -1616,13 +1676,16 @@ impl App {
                 Some(true) => {
                     eprintln!("autoplay: offer accepted");
                     self.autoplay.accept();
-                    self.play_next_episode();
+                    self.play_next_episode(true);
                 }
                 Some(false) => {
                     eprintln!("autoplay: offer dismissed");
                     self.autoplay.dismiss();
                 }
                 None => {}
+            }
+            if next_clicked {
+                self.skip_to_next_episode();
             }
         });
     }
