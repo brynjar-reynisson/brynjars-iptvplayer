@@ -269,7 +269,8 @@ mod tests {
     fn stinger_delays_offer() {
         let mut a = armed();
         let t0 = scanning(&mut a);
-        let scan = samples(D - 60.0, &[Content, Credits, Credits, Content, Black]);
+        // A stinger is two consecutive Content samples (one alone is noise).
+        let scan = samples(D - 70.0, &[Content, Credits, Credits, Content, Content, Black]);
         assert_eq!(a.update(t0, at(D - 50.0), scan.clone(), false), Step::Nothing);
         assert_eq!(a.update(t0, at(D - 10.0), scan.clone(), false), Step::Nothing);
         assert!(!a.offering());

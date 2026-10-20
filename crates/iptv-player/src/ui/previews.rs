@@ -2,9 +2,11 @@
 //! of frames (as egui textures) and the request bookkeeping.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use eframe::egui;
 
+use crate::scan_dump::kind_letter;
 use crate::state::credits::FrameKind;
 use crate::thumbs::{bucket_of, nearest, Reply, ThumbService};
 
@@ -36,6 +38,8 @@ pub struct Previews {
     bad: HashSet<i64>,
     wanted: Option<i64>,
     scan: ScanState,
+    /// Folder the running scan saves its frames in (printed when it finishes).
+    scan_dump: Option<PathBuf>,
 }
 
 impl Previews {
@@ -50,6 +54,7 @@ impl Previews {
             bad: HashSet::new(),
             wanted: None,
             scan: ScanState::NotStarted,
+            scan_dump: None,
         }
     }
 
@@ -66,6 +71,7 @@ impl Previews {
         self.bad.clear();
         self.wanted = None;
         self.scan = ScanState::NotStarted;
+        self.scan_dump = None;
     }
 
     /// Adopt finished frames. Every frame.
@@ -75,17 +81,12 @@ impl Previews {
                 Reply::OpenFailed { gen } if gen == self.gen => self.unavailable = true,
                 Reply::Scanned { gen, samples } if gen == self.gen && self.scan == ScanState::Running => {
                     // One letter per sample (C credits, B black, X content, ? no frame): tuning aid.
-                    let kinds: String = samples
-                        .iter()
-                        .map(|(_, k)| match k {
-                            Some(FrameKind::Credits) => 'C',
-                            Some(FrameKind::Black) => 'B',
-                            Some(FrameKind::Content) => 'X',
-                            None => '?',
-                        })
-                        .collect();
+                    let kinds: String = samples.iter().map(|(_, k)| kind_letter(*k)).collect();
                     let from = samples.first().map_or(0.0, |s| s.0);
                     eprintln!("tail scan: {} samples from {:.0} s: {kinds}", samples.len(), from);
+                    if let Some(dir) = self.scan_dump.take() {
+                        eprintln!("tail scan frames: {}", dir.display());
+                    }
                     self.scan = ScanState::Done(samples);
                 }
                 Reply::Closed { gen } if gen == self.gen => {
@@ -120,12 +121,15 @@ impl Previews {
 
     /// Start the tail scan of the current video at `times` (opens the second
     /// source if needed). Nothing happens when that source is unavailable.
-    pub fn start_scan(&mut self, url: &str, times: Vec<f64>) {
+    /// `duration` = the video's (for the refinement pass); `dump` = folder
+    /// to save the sampled frames in (`--console` only).
+    pub fn start_scan(&mut self, url: &str, times: Vec<f64>, duration: f64, dump: Option<PathBuf>) {
         if self.unavailable {
             return;
         }
         self.ensure_open(url);
-        self.svc.scan(self.gen, times);
+        self.scan_dump = dump.clone();
+        self.svc.scan(self.gen, times, duration, dump);
         self.scan = ScanState::Running;
     }
 

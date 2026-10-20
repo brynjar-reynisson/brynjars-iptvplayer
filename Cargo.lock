@@ -1276,6 +1276,7 @@ dependencies = [
  "embed-resource",
  "iptv",
  "libmpv2-sys",
+ "png",
  "tempfile",
 ]
 

@@ -6,3 +6,4 @@ config.toml
 .superpowers/
 /libmpv/
 /dist/
+scan-frames/

@@ -3,7 +3,10 @@
 //! `scan_times` plans which tail frames to sample, `classify` labels one RGBA
 //! preview frame (Credits / Black / Content), and `offer_time` picks when to
 //! offer the next episode: at the start of the final credits stretch, or at
-//! the real end when anything after the credits looks like content (stingers).
+//! the real end when content follows the credits (stingers: two or more
+//! consecutive Content samples; a single one is noise). `refine_times`
+//! plans extra frames around such single samples, so a short stinger the
+//! 10 s grid caught once still shows up twice.
 
 use crate::thumbs::BUCKET_SECS;
 
@@ -201,28 +204,98 @@ pub fn scan_times(duration: f64) -> Vec<f64> {
     times
 }
 
-/// When to offer the next episode, from tail samples `(time, kind)` (`None`
-/// = that frame could not be read). The earliest sample time T such that
-/// every sample from T on is Credits or Black and at least one is Credits;
-/// `duration` (the real end) if a frame failed, the last sample is Content,
-/// or no such T exists. Content after credits (a stinger) therefore moves the
-/// offer behind it.
-pub fn offer_time(samples: &[(f64, Option<FrameKind>)], duration: f64) -> f64 {
-    let mut sorted: Vec<(f64, FrameKind)> = Vec::with_capacity(samples.len());
-    for &(t, k) in samples {
-        match k {
-            Some(k) => sorted.push((t, k)),
-            None => return duration,
+/// Gap between a refinement frame and the isolated Content sample it checks.
+pub const REFINE_OFFSET_SECS: f64 = 5.0;
+/// Most isolated Content samples refined per scan (those closest to the end).
+pub const MAX_REFINED: usize = 12;
+
+/// The neighbours (previous / next sample) of index `i` in `kinds`.
+fn neighbours<T: Copy>(kinds: &[T], i: usize) -> impl Iterator<Item = T> + '_ {
+    let prev = i.checked_sub(1).map(|j| kinds[j]);
+    let next = kinds.get(i + 1).copied();
+    prev.into_iter().chain(next)
+}
+
+/// Sample `i` (of time-sorted labels; `None` = failed frame) is Content
+/// and none of its existing neighbours (one for the first/last sample) is:
+/// a single-sample flash, read as noise (a logo card, a lone misread
+/// credits frame). Two or more consecutive Content samples are real content.
+fn isolated_content(kinds: &[Option<FrameKind>], i: usize) -> bool {
+    kinds[i] == Some(FrameKind::Content)
+        && kinds.len() > 1
+        && neighbours(kinds, i).all(|k| k != Some(FrameKind::Content))
+}
+
+/// Sample `i` is Credits and all its existing neighbours (at least one) are
+/// Content: a stray credits-looking frame inside the show.
+fn isolated_credits(kinds: &[Option<FrameKind>], i: usize) -> bool {
+    kinds[i] == Some(FrameKind::Credits)
+        && kinds.len() > 1
+        && neighbours(kinds, i).all(|k| k == Some(FrameKind::Content))
+}
+
+/// Extra times to sample around isolated Content samples (see
+/// [`offer_time`]), so a short stinger the 10 s grid caught only once shows
+/// up as two consecutive Content samples: `t - 5` and `t + 5` for at most
+/// [`MAX_REFINED`] of them (those closest to the end first), clamped to
+/// `0 ..= duration - 3`, without times already sampled, sorted, no duplicates.
+pub fn refine_times(samples: &[(f64, Option<FrameKind>)], duration: f64) -> Vec<f64> {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let kinds: Vec<Option<FrameKind>> = sorted.iter().map(|s| s.1).collect();
+    let last = (duration - 3.0).max(0.0);
+    let sampled = |t: f64| sorted.iter().any(|s| (s.0 - t).abs() < 1e-6);
+    let mut out: Vec<f64> = Vec::new();
+    for i in (0..sorted.len()).rev().filter(|&i| isolated_content(&kinds, i)).take(MAX_REFINED) {
+        for t in [sorted[i].0 - REFINE_OFFSET_SECS, sorted[i].0 + REFINE_OFFSET_SECS] {
+            let t = t.clamp(0.0, last);
+            if !sampled(t) && !out.iter().any(|&o| (o - t).abs() < 1e-6) {
+                out.push(t);
+            }
         }
     }
-    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let tail_start = sorted.iter().rposition(|&(_, k)| k == FrameKind::Content).map_or(0, |i| i + 1);
-    let tail = &sorted[tail_start..];
-    if tail.iter().any(|&(_, k)| k == FrameKind::Credits) {
-        tail[0].0
-    } else {
-        duration
+    out.sort_by(f64::total_cmp);
+    out
+}
+
+/// When to offer the next episode, from tail samples `(time, kind)` (`None`
+/// = that frame could not be read; any failed frame = `duration`, the real
+/// end).
+///
+/// Noise first, on the original labels of the time-sorted samples: an
+/// isolated Content sample (no Content neighbour) becomes neutral (it never
+/// blocks, never counts as credits, never starts the offer); an isolated
+/// Credits sample (only Content neighbours) becomes Content. Then the offer
+/// is at the earliest Credits or Black sample after the last Content
+/// sample, if that tail holds at least one Credits sample; else `duration`.
+/// Content after credits (a stinger: two or more consecutive Content
+/// samples) therefore moves the offer behind it.
+pub fn offer_time(samples: &[(f64, Option<FrameKind>)], duration: f64) -> f64 {
+    if samples.iter().any(|s| s.1.is_none()) {
+        return duration;
     }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let kinds: Vec<Option<FrameKind>> = sorted.iter().map(|s| s.1).collect();
+    // `None` = neutral (isolated Content).
+    let smoothed: Vec<Option<FrameKind>> = (0..kinds.len())
+        .map(|i| {
+            if isolated_content(&kinds, i) {
+                None
+            } else if isolated_credits(&kinds, i) {
+                Some(FrameKind::Content)
+            } else {
+                kinds[i]
+            }
+        })
+        .collect();
+    let tail_start = smoothed.iter().rposition(|&k| k == Some(FrameKind::Content)).map_or(0, |i| i + 1);
+    let tail = &sorted[tail_start..];
+    let tail_kinds = &smoothed[tail_start..];
+    if !tail_kinds.contains(&Some(FrameKind::Credits)) {
+        return duration;
+    }
+    tail.iter().zip(tail_kinds).find(|(_, k)| k.is_some()).map_or(duration, |(s, _)| s.0)
 }
 
 #[cfg(test)]
@@ -417,16 +490,148 @@ mod tests {
         assert_eq!(offer_time(&v, D), 1020.0);
     }
 
+    /// A stinger is two or more consecutive Content samples (a single one
+    /// is noise since the noise rule; it was one sample before).
     #[test]
     fn stinger_after_credits_moves_offer_to_the_end() {
-        let v = s(&[Some(Content), Some(Credits), Some(Credits), Some(Content), Some(Black)]);
+        let v = s(&[Some(Content), Some(Credits), Some(Credits), Some(Content), Some(Content), Some(Black)]);
+        assert_eq!(offer_time(&v, D), D);
+    }
+
+    /// Two-sample stinger (was one sample before the noise rule).
+    #[test]
+    fn stinger_then_more_credits_offers_after_the_stinger() {
+        let v = s(&[Some(Credits), Some(Black), Some(Content), Some(Content), Some(Black), Some(Credits)]);
+        assert_eq!(offer_time(&v, D), 1040.0);
+    }
+
+    #[test]
+    fn two_content_samples_after_the_credits_offer_at_end() {
+        let v = s(&[Some(Content), Some(Credits), Some(Credits), Some(Credits), Some(Content), Some(Content)]);
         assert_eq!(offer_time(&v, D), D);
     }
 
     #[test]
-    fn stinger_then_more_credits_offers_after_the_stinger() {
-        let v = s(&[Some(Credits), Some(Black), Some(Content), Some(Black), Some(Credits)]);
+    fn lone_content_inside_the_credits_is_noise() {
+        let v = s(&[Some(Content), Some(Content), Some(Credits), Some(Credits), Some(Content), Some(Credits), Some(Black)]);
+        assert_eq!(offer_time(&v, D), 1020.0);
+    }
+
+    #[test]
+    fn lone_content_as_last_sample_is_noise() {
+        let v = s(&[Some(Content), Some(Credits), Some(Credits), Some(Content)]);
+        assert_eq!(offer_time(&v, D), 1010.0);
+    }
+
+    #[test]
+    fn noise_never_starts_the_offer() {
+        // X X | x(noise) B C: the offer starts at the black frame, not the noise.
+        let v = s(&[Some(Content), Some(Content), Some(Black), Some(Content), Some(Black), Some(Credits)]);
+        assert_eq!(offer_time(&v, D), 1020.0);
+        // X c x C C (as in the real episode): the stray c (only Content
+        // neighbours on the original labels) is content, x is noise, the
+        // offer starts at the first credits after it.
+        let v = s(&[Some(Content), Some(Credits), Some(Content), Some(Credits), Some(Credits)]);
         assert_eq!(offer_time(&v, D), 1030.0);
+    }
+
+    #[test]
+    fn noise_alone_is_not_credits() {
+        let v = s(&[Some(Black), Some(Content), Some(Black)]);
+        assert_eq!(offer_time(&v, D), D);
+    }
+
+    #[test]
+    fn stray_credits_inside_the_show_is_content() {
+        // X C X X B C: the stray C is content, offer at the black frame.
+        let v = s(&[Some(Content), Some(Credits), Some(Content), Some(Content), Some(Black), Some(Credits)]);
+        assert_eq!(offer_time(&v, D), 1040.0);
+    }
+
+    /// Real episode (duration 3573 s): credits start at the BB (3453 s);
+    /// lone X samples inside the credits and before the final black frame
+    /// used to push the offer to the end.
+    fn real_episode() -> (Vec<(f64, Option<FrameKind>)>, f64) {
+        let letters = "XXXXXXXXXXXXCXXXCXXXXXXXXXXXCXXXXXCXBBCCCCXCCCCXB";
+        assert_eq!(letters.len(), 49);
+        let v = letters
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let t = if i == 48 { 3570.0 } else { 3093.0 + 10.0 * i as f64 };
+                let k = match c {
+                    'C' => Credits,
+                    'B' => Black,
+                    _ => Content,
+                };
+                (t, Some(k))
+            })
+            .collect();
+        (v, 3573.0)
+    }
+
+    #[test]
+    fn real_episode_offers_at_the_credits_start() {
+        let (v, d) = real_episode();
+        assert_eq!(offer_time(&v, d), 3453.0);
+        let mut rev = v.clone();
+        rev.reverse();
+        assert_eq!(offer_time(&rev, d), 3453.0, "input order does not matter");
+    }
+
+    #[test]
+    fn refine_times_of_the_real_episode() {
+        let (v, d) = real_episode();
+        // Isolated X: index 35 (3443), 42 (3513), 47 (3563).
+        assert_eq!(refine_times(&v, d), vec![3438.0, 3448.0, 3508.0, 3518.0, 3558.0, 3568.0]);
+        // Next to the last sample, +5 clamps to the already sampled duration - 3.
+        let v = vec![(3560.0, Some(Credits)), (3568.0, Some(Content)), (3570.0, Some(Black))];
+        assert_eq!(refine_times(&v, d), vec![3563.0]);
+    }
+
+    #[test]
+    fn refine_times_skip_runs_and_clamp_to_zero() {
+        let v = vec![(0.0, Some(Content)), (10.0, Some(Credits)), (20.0, Some(Content)), (30.0, Some(Content))];
+        // 0.0 is isolated: -5 clamps to the sampled 0.0, +5 stays; the run at 20/30 is not refined.
+        assert_eq!(refine_times(&v, 100.0), vec![5.0]);
+        assert!(refine_times(&[], 100.0).is_empty());
+        assert!(refine_times(&[(10.0, Some(Content))], 100.0).is_empty(), "no neighbour: not isolated");
+    }
+
+    #[test]
+    fn refine_times_deduplicate_and_keep_the_last_twelve() {
+        // On a 5 s grid every midpoint is already sampled (or clamps onto 0).
+        let v = vec![(0.0, Some(Content)), (5.0, Some(Credits)), (10.0, Some(Content)), (15.0, Some(Credits))];
+        assert!(refine_times(&v, 100.0).is_empty());
+        // Two isolated X sharing a midpoint: 0 + 5 = 10 - 5.
+        let v = vec![(0.0, Some(Content)), (7.0, Some(Credits)), (10.0, Some(Content)), (30.0, Some(Credits))];
+        assert_eq!(refine_times(&v, 100.0), vec![5.0, 15.0], "5.0 once");
+        let many: Vec<_> = (0..40)
+            .map(|i| (i as f64 * 20.0, Some(if i % 2 == 0 { Content } else { Credits })))
+            .collect();
+        let r = refine_times(&many, 1000.0);
+        assert_eq!(r.len(), 2 * MAX_REFINED);
+        // The 12 isolated X closest to the end: 760, 720, ..., 320.
+        assert_eq!(r[0], 315.0);
+        assert_eq!(*r.last().unwrap(), 765.0);
+        let mut d = r.clone();
+        d.dedup();
+        assert_eq!(d, r);
+    }
+
+    #[test]
+    fn refined_short_stinger_blocks_but_a_logo_card_does_not() {
+        // Grid: C C X B (X = 1 sample at 1020). Refinement samples 1015, 1025.
+        let base = s(&[Some(Credits), Some(Credits), Some(Content), Some(Black)]);
+        assert_eq!(refine_times(&base, D), vec![1015.0, 1025.0]);
+        // 10 s stinger 1018..1028: 1025 is content too -> two consecutive X.
+        let mut stinger = base.clone();
+        stinger.extend([(1015.0, Some(Credits)), (1025.0, Some(Content))]);
+        assert_eq!(offer_time(&stinger, D), D);
+        // Logo card: only 1020 is content -> still noise.
+        let mut card = base.clone();
+        card.extend([(1015.0, Some(Credits)), (1025.0, Some(Black))]);
+        assert_eq!(offer_time(&card, D), 1000.0);
     }
 
     #[test]
@@ -441,9 +646,10 @@ mod tests {
         assert_eq!(offer_time(&v, D), D);
     }
 
+    /// Two Content samples at the end (one alone is noise since the noise rule).
     #[test]
-    fn last_sample_content_offers_at_end() {
-        let v = s(&[Some(Credits), Some(Credits), Some(Content)]);
+    fn last_samples_content_offers_at_end() {
+        let v = s(&[Some(Credits), Some(Credits), Some(Content), Some(Content)]);
         assert_eq!(offer_time(&v, D), D);
     }
 

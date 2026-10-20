@@ -6,6 +6,8 @@
 //!   (default: `IPTV_DATA_DIR`, then the exe's directory).
 //! - `--playlist-file` (dev): parse a local `.m3u` instead of downloading
 //!   `playlist_url`; the result is still cached under the data dir.
+//! - `--console`: status lines on stderr reach the terminal, and every tail
+//!   scan ("Next episode") saves its frames under `<data dir>/scan-frames/`.
 //!
 //! Release builds use the Windows GUI subsystem (no console window when
 //! started from Explorer). With `--console`, the process attaches to the
@@ -45,7 +47,8 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     // Opt-in: attached output lands after the shell has printed its prompt,
     // which looks like a hung command prompt until Ctrl+C.
-    if std::env::args().any(|a| a == "--console") {
+    let console = std::env::args().any(|a| a == "--console");
+    if console {
         attach_parent_console();
     }
     let mut data_dir = None;
@@ -67,5 +70,5 @@ fn main() -> anyhow::Result<()> {
     }
     let data_dir = iptv::config::data_dir(data_dir);
     eprintln!("data dir: {}", data_dir.display());
-    run(Options { data_dir, playlist_file, t0 })
+    run(Options { data_dir, playlist_file, t0, console })
 }

@@ -1,7 +1,9 @@
 //! Seek-bar preview frames: a worker thread that owns a second invisible mpv
 //! ([`ThumbMpv`]) on the playing movie/episode and answers "frame near time
 //! T" requests, newest request first. The same worker runs the tail scan for
-//! "Next episode" (credits detection) on that connection. The source is
+//! "Next episode" (credits detection) on that connection: a first pass over
+//! the planned times, then a refinement pass around isolated Content samples
+//! (`credits::refine_times`), answered once with the merged samples. The source is
 //! opened on demand (first seek-bar hover / arrow-key seek, or a tail scan)
 //! and stays open until playback changes (reset), so the extra provider
 //! connection exists from then until the next video or stop, except that a
@@ -10,10 +12,12 @@
 //! stores the URL anywhere but in the command it sends to the worker.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
-use crate::state::credits::{classify, FrameKind};
+use crate::scan_dump;
+use crate::state::credits::{classify, refine_times, FrameKind};
 use crate::thumb_mpv::{Thumb, ThumbMpv};
 
 /// Width of a preview in pixels.
@@ -75,6 +79,22 @@ fn run_scan(
     Some(out)
 }
 
+/// After the first pass of a scan over `times` gave `first`: all times
+/// (sorted) including the refinement frames around isolated Content samples
+/// ([`refine_times`]), or `None` when there is nothing to refine. Running
+/// [`run_scan`] again over them with the same memo takes only the new frames
+/// and returns the merged, time-sorted samples.
+fn with_refinement(times: &[f64], first: &[Sample], duration: f64) -> Option<Vec<f64>> {
+    let extra = refine_times(first, duration);
+    if extra.is_empty() {
+        return None;
+    }
+    let mut all = times.to_vec();
+    all.extend(extra);
+    all.sort_by(f64::total_cmp);
+    Some(all)
+}
+
 /// After a finished scan: close the source (the second provider connection)
 /// unless a preview frame is waiting to be taken from it.
 fn close_after_scan(want_pending: bool) -> bool {
@@ -106,7 +126,7 @@ fn answer_want(want: Option<(u64, i64)>, mpv: &Option<(u64, ThumbMpv)>, send: &i
 enum Cmd {
     Open { gen: u64, url: String },
     Want { gen: u64, bucket: i64 },
-    Scan { gen: u64, times: Vec<f64> },
+    Scan { gen: u64, times: Vec<f64>, duration: f64, dump: Option<PathBuf> },
     Close,
 }
 
@@ -128,7 +148,14 @@ pub enum Reply {
 struct ScanJob {
     gen: u64,
     times: Vec<f64>,
+    duration: f64,
+    /// The refinement frames were added to `times` (or there were none).
+    refined: bool,
     memo: HashMap<u64, Option<FrameKind>>,
+    /// `--console`: save every frame here when the scan finishes.
+    dump: Option<PathBuf>,
+    /// Frames kept for `dump` (empty without it), keyed by the time's bits.
+    frames: HashMap<u64, Thumb>,
 }
 
 pub struct ThumbService {
@@ -159,10 +186,13 @@ impl ThumbService {
     }
 
     /// Classify the frames at `times` of the source opened for `gen` (replaces
-    /// any earlier scan). Answered once with [`Reply::Scanned`]; dropped
-    /// without a reply when the source is closed or replaced.
-    pub fn scan(&self, gen: u64, times: Vec<f64>) {
-        let _ = self.tx.send(Cmd::Scan { gen, times });
+    /// any earlier scan), then the refinement frames around isolated Content
+    /// samples (`duration` = the video's). Answered once with
+    /// [`Reply::Scanned`] (all samples, time-sorted); dropped without a reply
+    /// when the source is closed or replaced. With `dump`, the frames are
+    /// saved there as PNG files before the reply.
+    pub fn scan(&self, gen: u64, times: Vec<f64>, duration: f64, dump: Option<PathBuf>) {
+        let _ = self.tx.send(Cmd::Scan { gen, times, duration, dump });
     }
 
     /// Drop the source (and its connection).
@@ -217,7 +247,17 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     want = Some((gen, bucket));
                     want_arrived = true;
                 }
-                Cmd::Scan { gen, times } => scan = Some(ScanJob { gen, times, memo: HashMap::new() }),
+                Cmd::Scan { gen, times, duration, dump } => {
+                    scan = Some(ScanJob {
+                        gen,
+                        times,
+                        duration,
+                        refined: false,
+                        memo: HashMap::new(),
+                        dump,
+                        frames: HashMap::new(),
+                    })
+                }
                 Cmd::Close => {
                     want = None;
                     scan = None;
@@ -236,12 +276,18 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
         if let Some(job) = &mut scan {
             match &mpv {
                 Some((open_gen, m)) if *open_gen == job.gen => {
-                    let ScanJob { gen, times, memo } = job;
+                    let ScanJob { gen, times, duration, refined, memo, dump, frames } = job;
                     let done = run_scan(
                         times,
                         memo,
                         |t| match m.frame_at(t, SEEK_TIMEOUT) {
-                            Ok(th) => Some(classify(&th.rgba, th.width, th.height)),
+                            Ok(th) => {
+                                let kind = classify(&th.rgba, th.width, th.height);
+                                if dump.is_some() {
+                                    frames.insert(t.to_bits(), th);
+                                }
+                                Some(kind)
+                            }
                             Err(e) => {
                                 eprintln!("tail scan: {e}");
                                 None
@@ -256,6 +302,21 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     );
                     match done {
                         Some(samples) => {
+                            // Second pass: frames around isolated Content
+                            // samples, same connection, memo and abort rules.
+                            if !std::mem::replace(refined, true) {
+                                if let Some(all) = with_refinement(times, &samples, *duration) {
+                                    *times = all;
+                                    continue;
+                                }
+                            }
+                            if let Some(dir) = dump {
+                                let (_, err) = scan_dump::write_frames(dir, &samples, frames);
+                                if let Some(e) = err {
+                                    eprintln!("tail scan: could not save frames: {e}");
+                                }
+                                frames.clear();
+                            }
                             let gen = *gen;
                             send(Reply::Scanned { gen, samples });
                             scan = None;
@@ -366,6 +427,48 @@ mod tests {
         assert_eq!(taken, vec![1.0, 2.0, 3.0], "no frame taken twice");
         assert_eq!(out.len(), 3);
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn refinement_pass_takes_only_the_new_frames_and_merges_in_time_order() {
+        use FrameKind::*;
+        // First pass: C C X B (X at 20 isolated) -> refinement at 15 and 25.
+        let times = vec![0.0, 10.0, 20.0, 30.0];
+        let kind_at = |t: f64| {
+            Some(match t {
+                t if t == 20.0 || t == 25.0 => Content,
+                t if t == 30.0 => Black,
+                _ => Credits,
+            })
+        };
+        let mut memo = HashMap::new();
+        let mut taken = Vec::new();
+        let first = run_scan(&times, &mut memo, |t| {
+            taken.push(t);
+            kind_at(t)
+        }, || false)
+        .unwrap();
+        let all = with_refinement(&times, &first, 100.0).expect("isolated X is refined");
+        assert_eq!(all, vec![0.0, 10.0, 15.0, 20.0, 25.0, 30.0]);
+        let merged = run_scan(&all, &mut memo, |t| {
+            taken.push(t);
+            kind_at(t)
+        }, || false)
+        .unwrap();
+        assert_eq!(taken, vec![0.0, 10.0, 20.0, 30.0, 15.0, 25.0], "no frame taken twice");
+        assert_eq!(
+            merged,
+            vec![
+                (0.0, Some(Credits)),
+                (10.0, Some(Credits)),
+                (15.0, Some(Credits)),
+                (20.0, Some(Content)),
+                (25.0, Some(Content)),
+                (30.0, Some(Black)),
+            ]
+        );
+        // Nothing isolated: no second pass.
+        assert_eq!(with_refinement(&times, &[(0.0, Some(Credits)), (10.0, Some(Black))], 100.0), None);
     }
 
     #[test]

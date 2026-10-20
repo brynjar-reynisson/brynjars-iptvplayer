@@ -60,6 +60,8 @@ pub struct Options {
     pub playlist_file: Option<PathBuf>,
     /// Process start, for startup timings on stderr.
     pub t0: Instant,
+    /// Started with `--console`: also save tail-scan frames (tuning aid).
+    pub console: bool,
 }
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
@@ -209,6 +211,8 @@ struct App {
     show_view: ListView,
     episode_view: ListView,
     t0: Instant,
+    /// `--console`: tail scans save their frames under `scan-frames/`.
+    console: bool,
     first_frame: bool,
     ready_logged: bool,
 }
@@ -285,6 +289,7 @@ impl App {
             show_view: ListView::default(),
             episode_view: ListView::default(),
             t0: opts.t0,
+            console: opts.console,
             first_frame: false,
             ready_logged: false,
         };
@@ -526,8 +531,15 @@ impl App {
         };
         match self.autoplay.update(now, position, scan, finished) {
             Step::StartScan(times) => {
-                if let Some(url) = self.playback.as_ref().map(|p| p.url().to_string()) {
-                    self.previews.start_scan(&url, times);
+                // `StartScan` is only asked for with a known duration.
+                let duration = position.and_then(|(_, d)| d).unwrap_or(0.0);
+                if let Some(pb) = &self.playback {
+                    let url = pb.url().to_string();
+                    let dump = self.console.then(|| {
+                        let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                        crate::scan_dump::dump_dir(&self.data_dir, pb.name(), unix)
+                    });
+                    self.previews.start_scan(&url, times, duration, dump);
                 }
                 false
             }
