@@ -1,6 +1,7 @@
 //! GUI-free application state (selection, navigation, filtering, favorites,
 //! startup/refresh). The egui layer in `ui` stays a thin view over this.
 
+pub mod credits;
 pub mod data;
 pub mod favs;
 pub mod live;
