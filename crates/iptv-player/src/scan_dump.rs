@@ -1,6 +1,6 @@
 //! `--console` tuning aid: the frames of a tail scan saved as PNG files
 //! under `<data dir>/scan-frames/<episode>-<unix seconds>/`, one per sample,
-//! named `NN_<time>s_<K>.png` (K = C credits, B black, X content). Written on
+//! named `NN_<time>s_<L>.png` (L = C credits, B black, K card, X content). Written on
 //! the thumbnail worker thread; the folder name comes from the episode's
 //! display name only (sanitised), never from the URL.
 
@@ -13,11 +13,12 @@ use crate::thumb_mpv::Thumb;
 /// Longest episode-name part of the folder name, in characters.
 const MAX_NAME_CHARS: usize = 60;
 
-/// One letter per sample: C credits, B black, X content, ? no frame.
+/// One letter per sample: C credits, B black, K card, X content, ? no frame.
 pub fn kind_letter(kind: Option<FrameKind>) -> char {
     match kind {
         Some(FrameKind::Credits) => 'C',
         Some(FrameKind::Black) => 'B',
+        Some(FrameKind::Card) => 'K',
         Some(FrameKind::Content) => 'X',
         None => '?',
     }
@@ -143,6 +144,8 @@ mod tests {
         assert_eq!(file_name(48, 3570.4, FrameKind::Credits), "48_3570s_C.png");
         assert_eq!(kind_letter(None), '?');
         assert_eq!(kind_letter(Some(FrameKind::Content)), 'X');
+        assert_eq!(kind_letter(Some(FrameKind::Card)), 'K');
+        assert_eq!(file_name(51, 3558.0, FrameKind::Card), "51_3558s_K.png");
     }
 
     #[test]

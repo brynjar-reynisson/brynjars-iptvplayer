@@ -1,7 +1,7 @@
 //! Closing-credits detection for "Next episode" (pure, no mpv/egui).
 //!
 //! `scan_times` plans which tail frames to sample, `classify` labels one RGBA
-//! preview frame (Credits / Black / Content), and `offer_time` picks when to
+//! preview frame (Credits / Black / Card / Content), and `offer_time` picks when to
 //! offer the next episode: at the start of the final credits stretch, or at
 //! the real end when content follows the credits (stingers: two or more
 //! consecutive Content samples; a single one is noise). `refine_times`
@@ -18,6 +18,10 @@ pub const SCAN_TAIL_SECS: f64 = 480.0;
 pub enum FrameKind {
     Credits,
     Black,
+    /// A plain-background card (end logo, production-company card, a lone
+    /// title) of any luminance: neutral like Black, never Content and never
+    /// Credits.
+    Card,
     Content,
 }
 
@@ -38,15 +42,26 @@ const BG_MIN_FRACTION: f64 = 0.80;
 const TEXT_CONTRAST: u8 = 70;
 /// ... and at least this bright.
 const TEXT_MIN_LUMA: u8 = 100;
-/// Text pixels cover this fraction of the frame (small, but not a speck).
-const TEXT_MIN_FRACTION: f64 = 0.002;
+/// Text pixels cover this fraction of the frame (small, but not a speck:
+/// 0.001 is ~33 pixels of a 240 px preview). A sparse page of five or six
+/// short lines of small grey credits text measured 0.0019 on a real episode,
+/// so 0.002 was too strict.
+const TEXT_MIN_FRACTION: f64 = 0.001;
 const TEXT_MAX_FRACTION: f64 = 0.15;
-/// Fraction of text pixels with a text pixel directly above or below:
-/// glyphs are several pixels tall, random speckle (stars, noise) is not
-/// (a 1-in-60 starfield has ~0.03). Small credits text downscaled to the
-/// 240 px preview has 1 px tall horizontal strokes: measured 0.31-0.34 on
-/// 22 px text of a 720p video, so 0.5 was too strict.
+/// Fraction of text pixels with at least a faint text pixel (see
+/// [`TEXT_WEAK_CONTRAST`]) directly above or below: glyphs are several
+/// pixels tall, random speckle (stars, noise) is not (a 1-in-60 starfield
+/// has ~0.03). Small credits text downscaled to the 240 px preview has 1 px
+/// tall horizontal strokes: measured 0.31-0.34 on 22 px text of a 720p
+/// video, so 0.5 was too strict.
 const TEXT_MIN_COHERENCE: f64 = 0.2;
+/// A vertical neighbour counts for coherence when it is at least half as far
+/// above the background as text must be (hysteresis): the strokes of small
+/// grey text are anti-aliased, their upper/lower pixels are dimmer than the
+/// text threshold. With full text pixels only, thin real credits measured
+/// 0.13-0.32; with this rule 0.87-0.97 (a starfield stays ~0, its
+/// neighbours are background).
+const TEXT_WEAK_CONTRAST: u8 = TEXT_CONTRAST / 2;
 /// Longest horizontal run of text pixels, as a fraction of the plane width
 /// (a word, not a lit wall or a horizon line).
 const MAX_RUN_FRACTION: u32 = 6; // width / 6
@@ -70,9 +85,46 @@ pub fn classify(rgba: &[u8], width: u32, height: u32) -> FrameKind {
     }
     if is_credits(&luma, pw, ph) {
         FrameKind::Credits
+    } else if is_card(&luma) {
+        FrameKind::Card
     } else {
         FrameKind::Content
     }
+}
+
+/// A card pixel is within this of the dominant luma ("flat" background) ...
+const CARD_FLAT_TOLERANCE: u8 = 10;
+/// ... and at least this fraction of the frame is flat background. Dark
+/// show scenes look plain at a glance but are gradients: at most 0.83 of a
+/// real episode's darkest scenes was within 10 of their dominant luma, while
+/// two end-logo cards (dark textured, white) measured 0.94-0.95.
+const CARD_MIN_FLAT: f64 = 0.90;
+/// A foreground pixel differs this much from the dominant luma ...
+const CARD_FG_CONTRAST: u8 = 40;
+/// ... and the foreground is at least this fraction (a logo or a line of
+/// text, not an empty flat frame; at most 1 - CARD_MIN_FLAT by the above).
+const CARD_MIN_FOREGROUND: f64 = 0.002;
+
+/// Plain-background card of any luminance (checked after credits): the
+/// dominant luma covers most of the frame and something visible sits on it.
+fn is_card(luma: &[u8]) -> bool {
+    let n = luma.len() as f64;
+    let bg = mode(luma);
+    let flat = luma.iter().filter(|&&l| l.abs_diff(bg) <= CARD_FLAT_TOLERANCE).count() as f64;
+    let fg = luma.iter().filter(|&&l| l.abs_diff(bg) > CARD_FG_CONTRAST).count() as f64;
+    flat / n >= CARD_MIN_FLAT && fg / n >= CARD_MIN_FOREGROUND
+}
+
+/// The most common luma, counting each value with its neighbours within 2
+/// (so a slightly noisy background still has one clear peak).
+fn mode(luma: &[u8]) -> u8 {
+    let mut hist = [0usize; 256];
+    for &l in luma {
+        hist[l as usize] += 1;
+    }
+    (0..256usize)
+        .max_by_key(|&v| (v.saturating_sub(2)..=(v + 2).min(255)).map(|i| hist[i]).sum::<usize>())
+        .unwrap_or(0) as u8
 }
 
 /// Luma (0..=255) sampled with a step of `width / 240` (at least 1), so the
@@ -122,7 +174,9 @@ fn is_credits(luma: &[u8], pw: usize, ph: usize) -> bool {
         return false;
     }
     let text_min = m.saturating_add(TEXT_CONTRAST).max(TEXT_MIN_LUMA);
+    let weak_min = m.saturating_add(TEXT_WEAK_CONTRAST).max(TEXT_MIN_LUMA / 2);
     let text: Vec<bool> = luma.iter().map(|&l| l >= text_min).collect();
+    let weak: Vec<bool> = luma.iter().map(|&l| l >= weak_min).collect();
     let text_count = text.iter().filter(|&&t| t).count();
     let coverage = text_count as f64 / n;
     if !(TEXT_MIN_FRACTION..=TEXT_MAX_FRACTION).contains(&coverage) {
@@ -131,7 +185,7 @@ fn is_credits(luma: &[u8], pw: usize, ph: usize) -> bool {
     let coherent = (0..ph)
         .flat_map(|y| (0..pw).map(move |x| (x, y)))
         .filter(|&(x, y)| text[y * pw + x])
-        .filter(|&(x, y)| (y > 0 && text[(y - 1) * pw + x]) || (y + 1 < ph && text[(y + 1) * pw + x]))
+        .filter(|&(x, y)| (y > 0 && weak[(y - 1) * pw + x]) || (y + 1 < ph && weak[(y + 1) * pw + x]))
         .count();
     if (coherent as f64) < TEXT_MIN_COHERENCE * text_count as f64 {
         return false;
@@ -218,8 +272,8 @@ fn neighbours<T: Copy>(kinds: &[T], i: usize) -> impl Iterator<Item = T> + '_ {
 
 /// Sample `i` (of time-sorted labels; `None` = failed frame) is Content
 /// and none of its existing neighbours (one for the first/last sample) is:
-/// a single-sample flash, read as noise (a logo card, a lone misread
-/// credits frame). Two or more consecutive Content samples are real content.
+/// a single-sample flash, read as noise (a logo card the classifier missed,
+/// a lone misread credits frame). Black and Card neighbours are neutral. Two or more consecutive Content samples are real content.
 fn isolated_content(kinds: &[Option<FrameKind>], i: usize) -> bool {
     kinds[i] == Some(FrameKind::Content)
         && kinds.len() > 1
@@ -266,8 +320,10 @@ pub fn refine_times(samples: &[(f64, Option<FrameKind>)], duration: f64) -> Vec<
 /// isolated Content sample (no Content neighbour) becomes neutral (it never
 /// blocks, never counts as credits, never starts the offer); an isolated
 /// Credits sample (only Content neighbours) becomes Content. Then the offer
-/// is at the earliest Credits or Black sample after the last Content
+/// is at the earliest Credits, Black or Card sample after the last Content
 /// sample, if that tail holds at least one Credits sample; else `duration`.
+/// Black and Card are neutral: they never end the tail and never count as
+/// credits on their own.
 /// Content after credits (a stinger: two or more consecutive Content
 /// samples) therefore moves the offer behind it.
 pub fn offer_time(samples: &[(f64, Option<FrameKind>)], duration: f64) -> f64 {
@@ -444,9 +500,93 @@ mod tests {
         assert_eq!(classify(&f, W, H), Content);
     }
 
+    /// One line of text on a plain background is not credits. It was
+    /// Content before the Card kind; it is now a neutral Card (a title card).
     #[test]
     fn single_title_line_is_not_credits() {
         let f = text_frame(&[60]);
+        assert_eq!(classify(&f, W, H), Card);
+    }
+
+    /// Like a sparse page of real credits at 240 px: five short two-column
+    /// lines of small grey text whose strokes are 1 px tall and alternate
+    /// between the two rows of a line, each with a dim anti-aliased pixel
+    /// above or below (only the hysteresis makes them coherent).
+    #[test]
+    fn sparse_small_grey_credits_are_credits() {
+        let f = frame(|x, y| {
+            let words = (76..106).contains(&x) || (124..164).contains(&x);
+            let Some(top) = [40u32, 50, 60, 70, 80].into_iter().find(|&t| (t..t + 2).contains(&y)) else {
+                return (0, 0, 0);
+            };
+            let row = y - top; // 0 or 1
+            let v = match (words, x % 4, row) {
+                (true, 0, 0) | (true, 2, 1) => 140, // stroke
+                (true, 0, 1) | (true, 2, 0) => 70,  // its anti-aliased neighbour
+                _ => 0,
+            };
+            (v, v, v)
+        });
+        assert_eq!(classify(&f, W, H), Credits);
+    }
+
+    #[test]
+    fn logo_card_on_white_is_card() {
+        let f = frame(|x, y| {
+            let logo = (95..145).contains(&x) && (40..70).contains(&y) && (x / 5 + y / 5) % 2 == 0;
+            let tagline = in_text_line(x, y, 85);
+            if logo || tagline {
+                (40, 40, 50)
+            } else {
+                let n = noise(x, y, 4) as u8;
+                (250 - n, 250 - n, 250 - n)
+            }
+        });
+        assert_eq!(classify(&f, W, H), Card);
+    }
+
+    #[test]
+    fn coloured_logo_on_dark_textured_background_is_card() {
+        let f = frame(|x, y| {
+            if (100..140).contains(&x) && (35..65).contains(&y) && (x - 100) % 8 < 5 {
+                (230, 120, 30) // orange logo strokes
+            } else if in_text_line(x, y, 75) || in_text_line(x, y, 88) {
+                (160, 160, 160)
+            } else {
+                let n = noise(x, y, 8) as u8; // fine texture
+                (6 + n, 6 + n, 8 + n)
+            }
+        });
+        assert_eq!(classify(&f, W, H), Card);
+    }
+
+    #[test]
+    fn busy_scene_is_content() {
+        // Sky gradient, a textured ground and a figure.
+        let f = frame(|x, y| {
+            if (100..120).contains(&x) && (50..110).contains(&y) {
+                (90, 60, 40)
+            } else if y < 60 {
+                (120 + y as u8, 150 + y as u8, 190)
+            } else {
+                let n = noise(x, y, 80) as u8;
+                (40 + n, 50 + n, 30 + n / 2)
+            }
+        });
+        assert_eq!(classify(&f, W, H), Content);
+    }
+
+    /// Dark scenes look plain but are gradients: never a Card.
+    #[test]
+    fn dark_gradient_scene_is_content() {
+        let f = frame(|x, y| {
+            if (150..170).contains(&x) && (40..70).contains(&y) {
+                (200, 160, 120) // a lit face
+            } else {
+                let v = (5 + x / 6) as u8; // 5 ..= 44 across the frame
+                (v, v, v + 2)
+            }
+        });
         assert_eq!(classify(&f, W, H), Content);
     }
 
@@ -568,6 +708,54 @@ mod tests {
             })
             .collect();
         (v, 3573.0)
+    }
+
+    /// The same episode with the current classifier, on the time grid of its
+    /// saved scan frames (55 samples incl. refinement): scenes X (some dark
+    /// ones read as C), BB at 3453/3463, credits 3473..=3553, two end-logo
+    /// cards K at 3558/3563, BB at 3568/3570.
+    #[test]
+    fn real_episode_frames_offer_at_the_credits_start() {
+        let letters = "XXXXXXXXXXXXCXXXCXXXXXXXXXXXCXXXXXCCXXBBCCCCCCCCCCCKKBB";
+        let mut times: Vec<f64> = (0..34).map(|i| 3093.0 + 10.0 * i as f64).collect(); // 3093..=3423
+        times.extend([3433.0, 3438.0, 3443.0, 3448.0, 3453.0, 3463.0, 3473.0, 3483.0, 3493.0, 3503.0]);
+        times.extend([3508.0, 3513.0, 3518.0, 3523.0, 3533.0, 3543.0, 3553.0, 3558.0, 3563.0, 3568.0, 3570.0]);
+        assert_eq!((letters.len(), times.len()), (55, 55));
+        let v: Vec<_> = times
+            .iter()
+            .zip(letters.chars())
+            .map(|(&t, c)| {
+                let k = match c {
+                    'C' => Credits,
+                    'B' => Black,
+                    'K' => Card,
+                    _ => Content,
+                };
+                (t, Some(k))
+            })
+            .collect();
+        assert_eq!(offer_time(&v, 3573.0), 3453.0);
+        assert!(refine_times(&v, 3573.0).is_empty(), "no isolated content left to refine");
+    }
+
+    /// Card is neutral exactly like Black: swapping one for the other never
+    /// changes the offer or the refinement plan.
+    #[test]
+    fn card_is_neutral_like_black() {
+        let patterns: [&[FrameKind]; 6] = [
+            &[Content, Content, Black, Content, Black, Credits],
+            &[Content, Credits, Black, Credits, Black],
+            &[Black, Content, Black],
+            &[Credits, Credits, Content, Black],
+            &[Credits, Black, Content, Content, Black, Credits],
+            &[Black, Black, Black],
+        ];
+        for p in patterns {
+            let black = s(&p.iter().map(|&k| Some(k)).collect::<Vec<_>>());
+            let card: Vec<_> = black.iter().map(|&(t, k)| (t, if k == Some(Black) { Some(Card) } else { k })).collect();
+            assert_eq!(offer_time(&card, D), offer_time(&black, D), "{p:?}");
+            assert_eq!(refine_times(&card, D), refine_times(&black, D), "{p:?}");
+        }
     }
 
     #[test]

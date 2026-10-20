@@ -80,7 +80,7 @@ impl Previews {
             match reply {
                 Reply::OpenFailed { gen } if gen == self.gen => self.unavailable = true,
                 Reply::Scanned { gen, samples } if gen == self.gen && self.scan == ScanState::Running => {
-                    // One letter per sample (C credits, B black, X content, ? no frame): tuning aid.
+                    // One letter per sample (C credits, B black, K card, X content, ? no frame): tuning aid.
                     let kinds: String = samples.iter().map(|(_, k)| kind_letter(*k)).collect();
                     let from = samples.first().map_or(0.0, |s| s.0);
                     eprintln!("tail scan: {} samples from {:.0} s: {kinds}", samples.len(), from);

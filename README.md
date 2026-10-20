@@ -118,8 +118,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   comes back right away and the lines appear after it. Debug builds keep a console.
 - `--console` attaches the release build to the terminal it was started from. It also
   saves the frames that the "Next episode" credits check looked at, as PNG files under
-  `scan-frames/<episode>-<time>/` in the data directory (named `NN_<seconds>s_<K>.png`,
-  K = C credits, B black, X content), and prints that folder. Useful for tuning the check
+  `scan-frames/<episode>-<time>/` in the data directory (named `NN_<seconds>s_<L>.png`,
+  L = C credits, B black, K card such as an end logo, X content), and prints that folder. Useful for tuning the check
   on real shows; delete the folder when done.
 - `--playlist-file <path.m3u>` parses a local M3U file instead of downloading
   `playlist_url` (no `config.toml` needed). F5 reads the file again.
@@ -150,8 +150,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   dark plain background). Credits over moving pictures are not recognised, so such
   episodes offer the next one only at the very end; unusual title cards on black near the
   end could be taken for credits. Not skipping content after the credits is best effort:
-  frames are checked every 10 s, and a single frame that looks like content between
-  credits is treated as noise (a logo card), so a scene after the credits shorter than
+  frames are checked every 10 s, plain logo cards (dark or white) count as neither content
+  nor credits, and a single frame that looks like content between credits is treated as noise, so a scene after the credits shorter than
   about 10 s (or in the last 3 s) can be missed, and frames come from the nearest keyframe, so the offer
   can appear a few seconds early. The offer always counts down 8 s and can be cancelled.
   The extra connection used for the check is closed when it is done (hovering the seek
