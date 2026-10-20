@@ -41,6 +41,26 @@ enum Phase {
     Done,
 }
 
+/// Why the next episode could not be started (diagnostics text).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NextFail {
+    NothingPlaying,
+    NotInPlaylist,
+    NoNextEpisode,
+    NoShow,
+}
+
+impl NextFail {
+    pub fn reason(self) -> &'static str {
+        match self {
+            NextFail::NothingPlaying => "nothing playing",
+            NextFail::NotInPlaylist => "playing entry is no longer in the playlist",
+            NextFail::NoNextEpisode => "no next episode (any more)",
+            NextFail::NoShow => "next episode has no show",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Autoplay {
     phase: Phase,
@@ -178,6 +198,23 @@ impl Autoplay {
 
     pub fn next(&self) -> Option<usize> {
         self.next
+    }
+
+    /// The fixed offer time (seconds), once the scan result (or the real
+    /// end) has decided it.
+    pub fn offer_at(&self) -> Option<f64> {
+        self.offer_at
+    }
+
+    /// Phase name for diagnostics.
+    pub fn state_name(&self) -> &'static str {
+        match self.phase {
+            Phase::Off => "Off",
+            Phase::Waiting => "Waiting",
+            Phase::Offering { .. } => "Offering",
+            Phase::Dismissed => "Dismissed",
+            Phase::Done => "Done",
+        }
     }
 
     /// Esc / Cancel: no offer again for this episode, and no autoplay when
@@ -430,6 +467,37 @@ mod tests {
         assert!(!a.offering());
         assert_eq!(a.update(secs(t0, 9.0), at(D - 91.0), scan.clone(), false), Step::Nothing);
         assert_eq!(a.update(secs(t0, 9.0), at(D), scan, true), Step::Nothing);
+    }
+
+    #[test]
+    fn state_names_and_offer_at() {
+        let mut a = Autoplay::new();
+        assert_eq!(a.state_name(), "Off");
+        a.arm(Some(7), true);
+        assert_eq!(a.state_name(), "Waiting");
+        assert_eq!(a.offer_at(), None);
+        let t0 = scanning(&mut a);
+        let scan = samples(D - 100.0, &[Credits, Credits, Credits]);
+        assert_eq!(a.update(t0, at(D - 100.0), scan.clone(), false), Step::Offer);
+        assert_eq!(a.state_name(), "Offering");
+        assert_eq!(a.offer_at(), Some(D - 100.0));
+        a.dismiss();
+        assert_eq!(a.state_name(), "Dismissed");
+        a.arm(Some(7), true);
+        a.accept();
+        assert_eq!(a.state_name(), "Done");
+        a.disarm();
+        assert_eq!(a.state_name(), "Off");
+    }
+
+    #[test]
+    fn next_fail_reasons_are_distinct() {
+        let all = [NextFail::NothingPlaying, NextFail::NotInPlaylist, NextFail::NoNextEpisode, NextFail::NoShow];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.reason(), b.reason());
+            }
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
 
-use crate::state::autoplay::{Autoplay, Step, OFFER_SECS};
+use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
@@ -509,7 +509,18 @@ impl App {
             .entry_index()
             .filter(|&e| !pb.is_live() && pb.library().entry(e).kind == Kind::Series)
             .and_then(|e| next_episode(pb.library(), e, &self.hidden));
-        self.autoplay.arm(next, self.settings.autoplay_next());
+        let enabled = self.settings.autoplay_next();
+        match (next, enabled) {
+            (Some(n), true) => eprintln!("autoplay: armed (next episode: {})", pb.library().entry(n).name),
+            (None, _) => {
+                let is_episode =
+                    pb.entry_index().is_some_and(|e| !pb.is_live() && pb.library().entry(e).kind == Kind::Series);
+                let why = if is_episode { "no next episode in the show" } else { "live or not a series episode" };
+                eprintln!("autoplay: not armed: {why}");
+            }
+            (Some(_), false) => eprintln!("autoplay: not armed: autoplay_next is off in settings.json"),
+        }
+        self.autoplay.arm(next, enabled);
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
@@ -529,10 +540,23 @@ impl App {
             ScanState::Unavailable => Some(None),
             ScanState::Done(samples) => Some(Some(samples)),
         };
-        match self.autoplay.update(now, position, scan, finished) {
+        let had_offer_time = self.autoplay.offer_at().is_some();
+        let step = self.autoplay.update(now, position, scan, finished);
+        if !had_offer_time {
+            if let Some(t) = self.autoplay.offer_at() {
+                let d = position.and_then(|(_, d)| d).unwrap_or(0.0);
+                eprintln!("autoplay: offer time {t:.1} s (duration {d:.1} s)");
+            }
+        }
+        match step {
             Step::StartScan(times) => {
                 // `StartScan` is only asked for with a known duration.
                 let duration = position.and_then(|(_, d)| d).unwrap_or(0.0);
+                eprintln!(
+                    "autoplay: tail scan requested at {:.1} s of {duration:.1} s ({} frames)",
+                    position.map_or(0.0, |(p, _)| p),
+                    times.len()
+                );
                 if let Some(pb) = &self.playback {
                     let url = pb.url().to_string();
                     let dump = self.console.then(|| {
@@ -544,7 +568,11 @@ impl App {
                 false
             }
             Step::PlayNext => self.play_next_episode(),
-            Step::Offer | Step::Nothing => false,
+            Step::Offer => {
+                eprintln!("autoplay: offer shown at {:.1} s", position.map_or(0.0, |(p, _)| p));
+                false
+            }
+            Step::Nothing => false,
         }
     }
 
@@ -554,11 +582,25 @@ impl App {
     /// cursor moves to the new episode. False if there is no next episode
     /// (any more: e.g. the playlist changed).
     fn play_next_episode(&mut self) -> bool {
-        let Some(pb) = &self.playback else { return false };
-        let Some(cur) = pb.entry_index() else { return false };
+        match self.try_play_next_episode() {
+            Ok(name) => {
+                eprintln!("autoplay: starting next episode: {name}");
+                true
+            }
+            Err(f) => {
+                eprintln!("autoplay: next episode could not be started: {}", f.reason());
+                self.message = Some("Next episode unavailable".into());
+                false
+            }
+        }
+    }
+
+    fn try_play_next_episode(&mut self) -> Result<String, NextFail> {
+        let pb = self.playback.as_ref().ok_or(NextFail::NothingPlaying)?;
+        let cur = pb.entry_index().ok_or(NextFail::NotInPlaylist)?;
         let lib = pb.library().clone();
-        let Some(next) = next_episode(&lib, cur, &self.hidden) else { return false };
-        let Some(show) = show_of(&lib, next) else { return false };
+        let next = next_episode(&lib, cur, &self.hidden).ok_or(NextFail::NoNextEpisode)?;
+        let show = show_of(&lib, next).ok_or(NextFail::NoShow)?;
         let old_key = pb.key().to_string();
         let list = show_episodes(&lib, show, &self.hidden);
         self.start(Playback::new(lib.clone(), list, next, Tab::Series));
@@ -574,7 +616,7 @@ impl App {
                 }
             }
         }
-        true
+        Ok(lib.entry(next).name.clone())
     }
 
     /// Open the subtitle menu on the row in use, or close it.
@@ -704,6 +746,7 @@ impl App {
     /// episode (see `update_autoplay`): stop and leave the list it was
     /// started from with it selected. The visible tab is not changed.
     fn on_finished(&mut self) {
+        eprintln!("autoplay: finished without autoplay (state: {})", self.autoplay.state_name());
         let Some(pb) = self.playback.take() else { return };
         if pb.is_live() {
             self.playback = Some(pb);
@@ -957,9 +1000,11 @@ impl App {
         let offer_enter = offer_keys && enter && self.view == View::Player && self.focused_tab.is_none();
         let offer_esc = offer_keys && esc && !offer_enter;
         if offer_enter {
+            eprintln!("autoplay: offer accepted");
             self.autoplay.accept();
             self.play_next_episode();
         } else if offer_esc {
+            eprintln!("autoplay: offer dismissed");
             self.autoplay.dismiss();
         }
         let (enter, esc) = if offer_enter || offer_esc { (false, false) } else { (enter, esc) };
@@ -1569,10 +1614,14 @@ impl App {
             }
             match offer {
                 Some(true) => {
+                    eprintln!("autoplay: offer accepted");
                     self.autoplay.accept();
                     self.play_next_episode();
                 }
-                Some(false) => self.autoplay.dismiss(),
+                Some(false) => {
+                    eprintln!("autoplay: offer dismissed");
+                    self.autoplay.dismiss();
+                }
                 None => {}
             }
         });
