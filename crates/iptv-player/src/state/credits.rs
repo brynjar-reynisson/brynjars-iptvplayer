@@ -18,7 +18,8 @@ pub enum FrameKind {
     Content,
 }
 
-/// The luma plane is sampled down to at most this width (previews are 240).
+/// The luma plane is sampled down by `width / PLANE_MAX_WIDTH` (previews are
+/// ~240 wide: mpv returns 241 for 1280x720, which must not halve them).
 const PLANE_MAX_WIDTH: u32 = 240;
 /// Black: mean luma below this ...
 const BLACK_MAX_MEAN: f64 = 20.0;
@@ -38,8 +39,11 @@ const TEXT_MIN_LUMA: u8 = 100;
 const TEXT_MIN_FRACTION: f64 = 0.002;
 const TEXT_MAX_FRACTION: f64 = 0.15;
 /// Fraction of text pixels with a text pixel directly above or below:
-/// glyphs are several pixels tall, random speckle (stars, noise) is not.
-const TEXT_MIN_COHERENCE: f64 = 0.5;
+/// glyphs are several pixels tall, random speckle (stars, noise) is not
+/// (a 1-in-60 starfield has ~0.03). Small credits text downscaled to the
+/// 240 px preview has 1 px tall horizontal strokes: measured 0.31-0.34 on
+/// 22 px text of a 720p video, so 0.5 was too strict.
+const TEXT_MIN_COHERENCE: f64 = 0.2;
 /// Longest horizontal run of text pixels, as a fraction of the plane width
 /// (a word, not a lit wall or a horizon line).
 const MAX_RUN_FRACTION: u32 = 6; // width / 6
@@ -68,13 +72,14 @@ pub fn classify(rgba: &[u8], width: u32, height: u32) -> FrameKind {
     }
 }
 
-/// Luma (0..=255) sampled with a step that keeps the width <= 240.
+/// Luma (0..=255) sampled with a step of `width / 240` (at least 1), so the
+/// plane is 240..480 wide for wider frames and a 241 px preview keeps every pixel.
 fn luma_plane(rgba: &[u8], width: u32, height: u32) -> Option<(Vec<u8>, usize, usize)> {
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || rgba.len() < w.checked_mul(h)?.checked_mul(4)? {
         return None;
     }
-    let step = width.div_ceil(PLANE_MAX_WIDTH).max(1) as usize;
+    let step = (width / PLANE_MAX_WIDTH).max(1) as usize;
     let (pw, ph) = (w.div_ceil(step), h.div_ceil(step));
     let mut plane = Vec::with_capacity(pw * ph);
     for y in (0..h).step_by(step) {
@@ -284,6 +289,43 @@ mod tests {
     fn white_text_rows_on_dark_is_credits() {
         let f = text_frame(&[20, 40, 60, 80, 100]);
         assert_eq!(classify(&f, W, H), Credits);
+    }
+
+    /// Like the 240 px preview of small credits text: "E"-shaped 3x5 glyphs
+    /// whose horizontal strokes are 1 px tall (coherence ~0.45).
+    #[test]
+    fn thin_stroke_text_is_credits() {
+        let glyph = |x: u32, y: u32, top: u32| {
+            if y < top || y >= top + 5 || !(60..180).contains(&x) {
+                return false;
+            }
+            let (gx, gy) = ((x - 60) % 5, y - top); // 3 px glyph + 2 px gap
+            gx < 3 && (gx == 0 || gy % 2 == 0)
+        };
+        let f = frame(|x, y| if [20, 45, 70, 95].iter().any(|&t| glyph(x, y, t)) { (150, 150, 150) } else { (0, 0, 0) });
+        assert_eq!(classify(&f, W, H), Credits);
+    }
+
+    /// mpv's previews of 1280x720 come out 241 px wide: that must not halve
+    /// the plane (thin text would be lost).
+    #[test]
+    fn preview_241_wide_keeps_thin_text() {
+        let (w, h) = (241, 136);
+        let glyph = |x: u32, y: u32, top: u32| {
+            if y < top || y >= top + 5 || !(60..180).contains(&x) {
+                return false;
+            }
+            let (gx, gy) = ((x - 60) % 5, y - top);
+            gx < 3 && (gx == 0 || gy % 2 == 0)
+        };
+        let mut f = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let v = if [20, 45, 70, 95].iter().any(|&t| glyph(x, y, t)) { 150 } else { 0 };
+                f.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        assert_eq!(classify(&f, w, h), Credits);
     }
 
     #[test]

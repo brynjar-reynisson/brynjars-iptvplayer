@@ -43,7 +43,7 @@ only files needed at runtime.
 ### Data directory
 
 `config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `episode-titles.json` (cached episode titles) and `settings.json` (hidden
-groups) live in the data directory. The app looks for it in this order:
+groups, subtitle choices, autoplay) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 
 ## Using it
@@ -77,6 +77,14 @@ groups) live in the data directory. The app looks for it in this order:
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.
+- Next episode: during the closing credits of an episode a **Next episode in 8** button
+  appears at the video's bottom right and counts down; at 0 the next episode starts (the
+  last episode of a season continues with the next season). **Enter** or a click plays it
+  now; **Esc** or **Cancel** keeps watching (no offer again for that episode). The credits
+  are found by looking ahead at the last 8 minutes over the preview connection; if real
+  scenes follow the credits (or the check is not possible), the next episode starts only
+  when the file ends. Turn it off with `"autoplay_next": false` in `settings.json`.
+  Movies, live TV and unsorted episodes are not affected.
 - Episode titles: when you open a show, titles (`S01E02 - Title`) are looked up on TVmaze
   (needs internet; only the show name is sent) and cached in `episode-titles.json` beside the
   other data files (kept 30 days; not-found results 1 day). Obscure or Nordic shows may not be
@@ -131,5 +139,9 @@ groups) live in the data directory. The app looks for it in this order:
 - Video is always decoded in software: hardware decoding showed corrupt video (black
   dashes) on the developer's graphics card. 4K streams get cheaper scaling and decoder
   settings so they keep up.
+- Next episode: credits are recognised from small preview frames (bright text lines on a
+  dark plain background). Credits over moving pictures are not recognised, so such
+  episodes offer the next one only at the very end; unusual title cards on black near the
+  end could be taken for credits.
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.

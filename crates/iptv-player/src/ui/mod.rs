@@ -29,9 +29,11 @@ use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
 
+use crate::state::autoplay::{Autoplay, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
+use crate::state::next::{next_episode, show_episodes, show_of};
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -39,7 +41,7 @@ use crate::state::vod::{
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::seek::{self, SeekState};
-use previews::Previews;
+use previews::{Previews, ScanState};
 use crate::state::{format_bytes, format_hms, safe_text, tab_enter_visible, Tab};
 
 /// How long the played/total time stays visible after the mouse last moved.
@@ -149,6 +151,8 @@ struct App {
     previews: Previews,
     /// Last arrow-key seek (the preview shows above the dot for `KEY_PREVIEW`).
     key_seek: Option<Instant>,
+    /// "Next episode" offer / autoplay of the playing episode.
+    autoplay: Autoplay,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -239,6 +243,7 @@ impl App {
             seek: SeekState::default(),
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
+            autoplay: Autoplay::new(),
             sub_menu: false,
             sub_cursor: 0,
             positions,
@@ -494,9 +499,67 @@ impl App {
         self.sub_menu = false;
         self.seek.reset();
         self.previews.reset();
+        // Episodes with a next episode get the "Next episode" offer.
+        let next = pb
+            .entry_index()
+            .filter(|&e| !pb.is_live() && pb.library().entry(e).kind == Kind::Series)
+            .and_then(|e| next_episode(pb.library(), e, &self.hidden));
+        self.autoplay.arm(next, self.settings.autoplay_next());
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         self.playback = Some(pb);
+    }
+
+    /// Per frame: drive the "Next episode" offer (tail scan, countdown).
+    /// `finished` = the episode reached its end this frame. Returns true if
+    /// the next episode was started.
+    fn update_autoplay(&mut self, finished: bool) -> bool {
+        let Ok(p) = &self.player else { return false };
+        let position = p.position();
+        let scan = match self.previews.scan_result() {
+            ScanState::NotStarted | ScanState::Running => None,
+            ScanState::Unavailable => Some(None),
+            ScanState::Done(samples) => Some(Some(samples)),
+        };
+        match self.autoplay.update(Instant::now(), position, scan, finished) {
+            Step::StartScan(times) => {
+                if let Some(url) = self.playback.as_ref().map(|p| p.url().to_string()) {
+                    self.previews.start_scan(&url, times);
+                }
+                false
+            }
+            Step::PlayNext => self.play_next_episode(),
+            Step::Offer | Step::Nothing => false,
+        }
+    }
+
+    /// Play the episode after the playing one (autoplay or "Next episode"
+    /// accepted), through `start` (resume, subtitle preference, positions).
+    /// The finished episode's position is forgotten and the open show's
+    /// cursor moves to the new episode. False if there is no next episode
+    /// (any more: e.g. the playlist changed).
+    fn play_next_episode(&mut self) -> bool {
+        let Some(pb) = &self.playback else { return false };
+        let Some(cur) = pb.entry_index() else { return false };
+        let lib = pb.library().clone();
+        let Some(next) = next_episode(&lib, cur, &self.hidden) else { return false };
+        let Some(show) = show_of(&lib, next) else { return false };
+        let old_key = pb.key().to_string();
+        let list = show_episodes(&lib, show, &self.hidden);
+        self.start(Playback::new(lib.clone(), list, next, Tab::Series));
+        self.positions.forget(&old_key);
+        if let Err(e) = self.positions.save_if_dirty() {
+            eprintln!("could not save positions: {}", safe_text(&format!("{e:#}")));
+        }
+        if self.shown_lib.as_ref().is_some_and(|l| Arc::ptr_eq(l, &lib)) {
+            if let Some(o) = self.series.open_mut().filter(|o| o.show == show) {
+                o.select_entry(next);
+                if self.tab == Tab::Series {
+                    self.scroll_to = self.vod_cursor();
+                }
+            }
+        }
+        true
     }
 
     /// Open the subtitle menu on the row in use, or close it.
@@ -599,6 +662,7 @@ impl App {
         self.playback = None;
         self.sub_menu = false;
         self.previews.reset();
+        self.autoplay.disarm();
         self.view = View::Browse;
     }
 
@@ -621,8 +685,9 @@ impl App {
         self.zap.pending().filter(|p| p.same_library(lib)).and_then(Playback::entry_index).or(self.playing_entry())
     }
 
-    /// VOD reached its natural end: stop (no autoplay) and leave the list it
-    /// was started from with it selected. The visible tab is not changed.
+    /// VOD reached its natural end and autoplay did not start the next
+    /// episode (see `update_autoplay`): stop and leave the list it was
+    /// started from with it selected. The visible tab is not changed.
     fn on_finished(&mut self) {
         let Some(pb) = self.playback.take() else { return };
         if pb.is_live() {
@@ -868,6 +933,20 @@ impl App {
         } else {
             esc
         };
+        let typing = ctx.egui_wants_keyboard_input();
+        // The "Next episode" offer owns Enter (play now) and Esc (dismiss only:
+        // no stop, no leaving fullscreen this press).
+        let (enter, esc) = if self.autoplay.offering() && !typing && !self.sub_menu && (enter || esc) {
+            if enter {
+                self.autoplay.accept();
+                self.play_next_episode();
+            } else {
+                self.autoplay.dismiss();
+            }
+            (false, false)
+        } else {
+            (enter, esc)
+        };
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if toggle_fs || (esc && fullscreen) {
             // Esc only leaves fullscreen; it does nothing else this press.
@@ -881,7 +960,6 @@ impl App {
         } else {
             (up, down, enter)
         };
-        let typing = ctx.egui_wants_keyboard_input();
         // Left/Right step through the playing movie/episode (before the
         // browse keys below, which would otherwise take them).
         if self.playback.as_ref().is_some_and(|p| !p.is_live()) && !typing && !self.sub_menu && self.focused_tab.is_none() {
@@ -1272,6 +1350,8 @@ impl App {
             let mut toggle_sub = false;
             let mut pick_sub: Option<Option<i64>> = None;
             let mut bar_job: Option<(egui::Rect, Option<(f64, Option<f64>)>)> = None;
+            // "Next episode" offer clicked: Some(true) = play now, Some(false) = cancel.
+            let mut offer: Option<bool> = None;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     // Movies/episodes: a strip below the video holds the seek bar.
@@ -1427,6 +1507,9 @@ impl App {
                     if b.on_hover_text(if fs { "Leave full screen (Esc)" } else { "Full screen (F11)" }).clicked() {
                         self.set_fullscreen(ui.ctx(), !fs);
                     }
+                    if self.autoplay.offering() {
+                        offer = self.next_episode_offer(ui, btn);
+                    }
                 }
                 _ => {
                     ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -1468,7 +1551,70 @@ impl App {
                     p.toggle_pause();
                 }
             }
+            match offer {
+                Some(true) => {
+                    self.autoplay.accept();
+                    self.play_next_episode();
+                }
+                Some(false) => self.autoplay.dismiss(),
+                None => {}
+            }
         });
+    }
+
+    /// The "Next episode in N" button (with a countdown line) and a Cancel
+    /// button over the video's bottom right, above the control buttons
+    /// (`controls` = the fullscreen button). White on black, shapes and plain
+    /// text only. Returns Some(true) = play now, Some(false) = cancel.
+    fn next_episode_offer(&self, ui: &egui::Ui, controls: egui::Rect) -> Option<bool> {
+        let left = self.autoplay.remaining(Instant::now());
+        let next = egui::Rect::from_min_max(
+            egui::pos2(controls.right() - 220.0, controls.top() - 52.0),
+            egui::pos2(controls.right(), controls.top() - 10.0),
+        );
+        let cancel = egui::Rect::from_min_size(next.left_top() - egui::vec2(98.0, 0.0), egui::vec2(90.0, next.height()));
+        let n_resp = ui.interact(next, egui::Id::unique("next_episode_btn"), egui::Sense::click());
+        let c_resp = ui.interact(cancel, egui::Id::unique("next_episode_cancel"), egui::Sense::click());
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(15.0);
+        // Play now: a triangle, the text, and a line that runs down with the countdown.
+        let a = if n_resp.hovered() { 240 } else { 210 };
+        painter.rect_filled(next, 6.0, egui::Color32::from_black_alpha(a));
+        painter.rect_stroke(next, 6.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(a - 60)), egui::StrokeKind::Inside);
+        let c = next.left_center() + egui::vec2(20.0, 0.0);
+        painter.add(egui::Shape::convex_polygon(
+            vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(-5.0, 8.0), c + egui::vec2(7.0, 0.0)],
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+        painter.text(
+            next.left_center() + egui::vec2(38.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            format!("Next episode in {}", left.ceil() as u64),
+            font.clone(),
+            egui::Color32::WHITE,
+        );
+        let frac = (left / OFFER_SECS).clamp(0.0, 1.0) as f32;
+        let y = next.bottom() - 4.0;
+        let (x0, x1) = (next.left() + 8.0, next.right() - 8.0);
+        painter.line_segment(
+            [egui::pos2(x0, y), egui::pos2(x0 + (x1 - x0) * frac, y)],
+            egui::Stroke::new(2.0, egui::Color32::from_white_alpha(200)),
+        );
+        // Cancel.
+        let ca = if c_resp.hovered() { 240 } else { 210 };
+        painter.rect_filled(cancel, 6.0, egui::Color32::from_black_alpha(ca));
+        painter.text(cancel.center(), egui::Align2::CENTER_CENTER, "Cancel", font, egui::Color32::from_white_alpha(ca - 20));
+        if n_resp.hovered() || c_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if n_resp.on_hover_text("Play the next episode now (Enter)").clicked() {
+            Some(true)
+        } else if c_resp.on_hover_text("Keep watching (Esc)").clicked() {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     fn browse(&mut self, ui: &mut egui::Ui) {
@@ -1662,11 +1808,16 @@ impl eframe::App for App {
         self.poll_background();
         self.titles.poll();
         self.previews.poll(&ctx);
-        if let Ok(p) = &mut self.player {
-            p.update();
-            if p.status() == Status::Finished {
-                self.on_finished();
+        let finished = match &mut self.player {
+            Ok(p) => {
+                p.update();
+                p.status() == Status::Finished
             }
+            Err(_) => false,
+        };
+        // A finished episode with a next one (offer not dismissed) goes on to it.
+        if !self.update_autoplay(finished) && finished {
+            self.on_finished();
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             // Safety net: if teardown after the window closes ever blocks,
@@ -1723,6 +1874,10 @@ impl eframe::App for App {
         if let Some(w) = self.zap.wait(Instant::now()) {
             // Fire the pending zap without waiting for input.
             ctx.request_repaint_after(w);
+        }
+        if self.autoplay.offering() {
+            // The countdown of the "Next episode" offer.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         if busy || player_tick.is_some() {
             ctx.request_repaint_after(player_tick.unwrap_or(Duration::from_millis(100)));

@@ -14,16 +14,33 @@ pub fn next_episode(lib: &Library, entry: usize, hidden: &HashSet<String>) -> Op
     if hidden.contains(&lib.entry(entry).group) {
         return None;
     }
-    let show = lib
-        .shows()
-        .iter()
-        .position(|s| s.name != UNSORTED && s.seasons.iter().any(|se| se.episodes.contains(&entry)))?;
+    let show = show_of(lib, entry)?;
     let rows = episode_rows(lib, show, hidden);
     let at = rows.iter().position(|r| *r == EpisodeRow::Episode(entry))?;
     rows[at + 1..].iter().find_map(|r| match r {
         EpisodeRow::Episode(e) => Some(*e),
         EpisodeRow::Season(_) => None,
     })
+}
+
+/// The show (index in `Library::shows`) that lists episode `entry`, never
+/// `(Unsorted)`.
+pub fn show_of(lib: &Library, entry: usize) -> Option<usize> {
+    lib.shows()
+        .iter()
+        .position(|s| s.name != UNSORTED && s.seasons.iter().any(|se| se.episodes.contains(&entry)))
+}
+
+/// The episodes of `show` in visible groups, in row order (the Up/Down list
+/// of a `Playback` that plays one of them).
+pub fn show_episodes(lib: &Library, show: usize, hidden: &HashSet<String>) -> Vec<usize> {
+    episode_rows(lib, show, hidden)
+        .into_iter()
+        .filter_map(|r| match r {
+            EpisodeRow::Episode(e) => Some(e),
+            EpisodeRow::Season(_) => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -61,6 +78,16 @@ mod tests {
     #[test]
     fn movie_entry_is_none() {
         assert_eq!(next_episode(&vod_lib(), 0, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn show_of_and_its_episodes() {
+        let lib = vod_lib();
+        let show = show_of(&lib, 4).unwrap();
+        assert_eq!(lib.shows()[show].name, "Quiet Harbor");
+        assert_eq!(show_episodes(&lib, show, &HashSet::new()), vec![4, 3, 5]);
+        assert_eq!(show_of(&lib, 7), None, "(Unsorted) is no show");
+        assert_eq!(show_of(&lib, 0), None);
     }
 
     #[test]
