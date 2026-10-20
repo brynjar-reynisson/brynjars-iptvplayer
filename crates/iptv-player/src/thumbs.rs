@@ -1,9 +1,11 @@
 //! Seek-bar preview frames: a worker thread that owns a second invisible mpv
 //! ([`ThumbMpv`]) on the playing movie/episode and answers "frame near time
-//! T" requests, newest request first. The source is opened on demand and
-//! closed when playback changes, so the extra provider connection only exists
-//! while the user hovers the seek bar. Never logs or stores the URL anywhere
-//! but in the command it sends to the worker.
+//! T" requests, newest request first. The same worker runs the tail scan for
+//! "Next episode" (credits detection) on that connection. The source is
+//! opened on demand (first seek-bar hover / arrow-key seek, or a tail scan)
+//! and stays open until playback changes (reset), so the extra provider
+//! connection exists from then until the next video or stop. Never logs or
+//! stores the URL anywhere but in the command it sends to the worker.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -55,6 +57,28 @@ fn run_scan(
         out.push((t, take(t)));
     }
     Some(out)
+}
+
+/// Whether the newest Want is served before the scan resumes: only when the
+/// scan was interrupted and a Want came in since (a Want queued together with
+/// the scan waits for it to finish).
+fn serve_want_first(scan_interrupted: bool, want_since_interrupt: bool) -> bool {
+    scan_interrupted && want_since_interrupt
+}
+
+/// Takes the frame for `want` if it belongs to the open source and replies.
+fn answer_want(want: Option<(u64, i64)>, mpv: &Option<(u64, ThumbMpv)>, send: &impl Fn(Reply)) {
+    if let (Some((gen, bucket)), Some((open_gen, m))) = (want, mpv) {
+        if gen == *open_gen {
+            match m.frame_at(bucket_secs(bucket), SEEK_TIMEOUT) {
+                Ok(thumb) => send(Reply::Frame { gen, bucket, thumb }),
+                Err(e) => {
+                    eprintln!("thumbnails: {e}");
+                    send(Reply::Failed { gen, bucket });
+                }
+            }
+        }
+    }
 }
 
 enum Cmd {
@@ -136,6 +160,8 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
     let mut pending: VecDeque<Cmd> = VecDeque::new();
     let mut want: Option<(u64, i64)> = None;
     let mut scan: Option<ScanJob> = None;
+    // The scan stopped early because a command came in.
+    let mut interrupted = false;
     loop {
         // Handle a burst of commands at once: opens/closes in order, only the
         // newest Want and the newest Scan.
@@ -147,6 +173,7 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
             }
             burst.extend(rx.try_iter());
         }
+        let mut want_arrived = false;
         for cmd in burst {
             match cmd {
                 Cmd::Open { gen, url } => {
@@ -161,7 +188,10 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                         }
                     }
                 }
-                Cmd::Want { gen, bucket } => want = Some((gen, bucket)),
+                Cmd::Want { gen, bucket } => {
+                    want = Some((gen, bucket));
+                    want_arrived = true;
+                }
                 Cmd::Scan { gen, times } => scan = Some(ScanJob { gen, times, memo: HashMap::new() }),
                 Cmd::Close => {
                     want = None;
@@ -170,8 +200,14 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                 }
             }
         }
-        // The scan goes first; any command arriving meanwhile interrupts it
-        // (frames taken so far are kept) and is handled before it resumes.
+        // A Want that interrupted the scan is served at once (one frame); the
+        // scan then resumes where it was (frames taken so far are memoised).
+        if serve_want_first(std::mem::take(&mut interrupted), want_arrived) {
+            answer_want(want.take(), &mpv, &send);
+            continue;
+        }
+        // Otherwise the scan goes first; any command arriving meanwhile
+        // interrupts it and is handled before it resumes.
         if let Some(job) = &mut scan {
             match &mpv {
                 Some((open_gen, m)) if *open_gen == job.gen => {
@@ -199,30 +235,31 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                             send(Reply::Scanned { gen: *gen, samples });
                             scan = None;
                         }
-                        None => continue,
+                        None => {
+                            interrupted = true;
+                            continue;
+                        }
                     }
                 }
                 // No source for this scan (closed, failed to open, or another video).
                 _ => scan = None,
             }
         }
-        if let (Some((gen, bucket)), Some((open_gen, m))) = (want.take(), &mpv) {
-            if gen == *open_gen {
-                match m.frame_at(bucket_secs(bucket), SEEK_TIMEOUT) {
-                    Ok(thumb) => send(Reply::Frame { gen, bucket, thumb }),
-                    Err(e) => {
-                        eprintln!("thumbnails: {e}");
-                        send(Reply::Failed { gen, bucket });
-                    }
-                }
-            }
-        }
+        answer_want(want.take(), &mpv, &send);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_want_that_interrupts_a_scan_is_served_before_it_resumes() {
+        assert!(serve_want_first(true, true), "interrupting Want: served at once");
+        assert!(!serve_want_first(false, true), "Want queued with the scan: after the scan");
+        assert!(!serve_want_first(true, false), "interrupted by something else: scan resumes");
+        assert!(!serve_want_first(false, false));
+    }
 
     #[test]
     fn scan_collects_in_order() {
