@@ -33,7 +33,7 @@ use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
-use crate::state::next::{next_episode, show_episodes, show_of, NextCache};
+use crate::state::next::{next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -609,7 +609,7 @@ impl App {
             .is_some_and(|pb| !pb.is_live() && self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some())
     }
 
-    /// The ">>" button or N: skip to the next episode now, independent of
+    /// The ">>" button or Shift+Right: skip to the next episode now, independent of
     /// `autoplay_next` and the offer. The skipped episode keeps its position.
     fn skip_to_next_episode(&mut self) {
         eprintln!("autoplay: next episode button clicked");
@@ -1044,6 +1044,21 @@ impl App {
         } else {
             (up, down, enter)
         };
+        // Shift+Right = the ">>" button. Consumed first: the Right handlers
+        // below ignore extra Shift and would otherwise seek / act as Enter.
+        // Shift+Left is left alone (still seeks back like Left).
+        let has_next = self.next_available();
+        match shift_right(typing, self.focused_tab.is_some(), self.sub_menu, has_next) {
+            ShiftRight::Ignore => {}
+            ShiftRight::Swallow => {
+                ctx.input_mut(|i| i.consume_key(M::SHIFT, Key::ArrowRight));
+            }
+            ShiftRight::PlayNext => {
+                if ctx.input_mut(|i| i.consume_key(M::SHIFT, Key::ArrowRight)) {
+                    self.skip_to_next_episode();
+                }
+            }
+        }
         // Left/Right step through the playing movie/episode (before the
         // browse keys below, which would otherwise take them).
         if self.playback.as_ref().is_some_and(|p| !p.is_live()) && !typing && !self.sub_menu && self.focused_tab.is_none() {
@@ -1071,15 +1086,6 @@ impl App {
         let enter = enter || right;
         // C opens/closes the subtitle menu (movies and episodes only).
         let vod_playing = self.playback.as_ref().is_some_and(|p| !p.is_live());
-        // N = the ">>" button (only when it is offered: an episode with a next one).
-        let next_key = !typing
-            && !self.sub_menu
-            && self.focused_tab.is_none()
-            && self.next_available()
-            && ctx.input_mut(|i| i.consume_key(M::NONE, Key::N));
-        if next_key {
-            self.skip_to_next_episode();
-        }
         let (fav, space, slash, back, sub_key) = if typing {
             (false, false, false, false, false)
         } else {
@@ -1610,7 +1616,7 @@ impl App {
                                 egui::Stroke::NONE,
                             ));
                         }
-                        if n_resp.on_hover_text("Next episode (N)").clicked() {
+                        if n_resp.on_hover_text("Next episode (Shift+Right)").clicked() {
                             next_clicked = true;
                         }
                     }

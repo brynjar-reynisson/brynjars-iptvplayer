@@ -59,4 +59,4 @@ Known gaps and ideas that were found during implementation and review but not do
 - Per-country ordering or hiding of live channels.
 - Audio-track selection UI (mpv defaults are used now).
 - A UI switch for `autoplay_next` (settings.json only for now).
-- A "previous episode" button/key to match the **>>** next-episode button.
+- A "previous episode" button to match the **>>** next-episode button (Shift+Right); Shift+Left would be its natural key, but it currently seeks back 10 s like Left.

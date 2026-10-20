@@ -9,6 +9,31 @@ use iptv::series::UNSORTED;
 
 use super::vod::{episode_rows, EpisodeRow, Hidden};
 
+/// What a Shift+Right press does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShiftRight {
+    /// Not ours (typing, a tab button has focus, the subtitle menu is open):
+    /// leave the key event alone.
+    Ignore,
+    /// Consumed, nothing happens (no next episode, live, nothing playing): it
+    /// must not fall through to the Right-arrow seek or browse handlers, which
+    /// ignore extra Shift.
+    Swallow,
+    /// Consumed: start the next episode (like the ">>" button).
+    PlayNext,
+}
+
+/// Shift+Right = next episode, with the guards of the other player keys.
+pub fn shift_right(typing: bool, tab_focused: bool, sub_menu: bool, has_next: bool) -> ShiftRight {
+    if typing || tab_focused || sub_menu {
+        ShiftRight::Ignore
+    } else if has_next {
+        ShiftRight::PlayNext
+    } else {
+        ShiftRight::Swallow
+    }
+}
+
 /// Playing entry, library, hidden groups.
 type CacheKey = (Option<usize>, Weak<Library>, Weak<HashSet<String>>);
 
@@ -195,6 +220,15 @@ mod tests {
         let h: Hidden = Arc::new(hide(&["Series: B"]));
         assert_eq!(c.get(&lib, Some(0), &h), Some(2));
         assert_eq!(c.computed(), 2);
+    }
+
+    #[test]
+    fn shift_right_decision() {
+        assert_eq!(shift_right(false, false, false, true), ShiftRight::PlayNext);
+        assert_eq!(shift_right(false, false, false, false), ShiftRight::Swallow, "last episode / live");
+        assert_eq!(shift_right(true, false, false, true), ShiftRight::Ignore, "typing");
+        assert_eq!(shift_right(false, true, false, true), ShiftRight::Ignore, "tab button focused");
+        assert_eq!(shift_right(false, false, true, true), ShiftRight::Ignore, "subtitle menu open");
     }
 
     #[test]

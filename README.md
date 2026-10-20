@@ -87,7 +87,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   scenes follow the credits (or the check is not possible), the next episode starts only
   when the file ends. Turn it off with `"autoplay_next": false` in `settings.json`.
   Movies, live TV and unsorted episodes are not affected.
-- A **>>** button (left of **CC**, also the **N** key) skips to the next episode at any time
+- A **>>** button (left of **CC**, also **Shift+Right**) skips to the next episode at any time
   while an episode with a next one plays, whether autoplay is on or not. The skipped episode
   keeps its place, so you can resume it later. It is hidden on the last episode and when the
   video panel is too narrow.
