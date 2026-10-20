@@ -19,6 +19,14 @@ struct SettingsFile {
     hidden_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     sub_prefs: BTreeMap<String, SubChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    autoplay_next: Option<bool>,
+}
+
+struct Parsed {
+    hidden_groups: Vec<String>,
+    sub_prefs: BTreeMap<String, SubChoice>,
+    autoplay_next: Option<bool>,
 }
 
 /// Most shows with a remembered subtitle choice.
@@ -34,6 +42,8 @@ pub struct Settings {
     pub hidden_groups: Vec<String>,
     /// Subtitle choice per show (key: lowercased show name).
     sub_prefs: BTreeMap<String, SubChoice>,
+    /// Hand-edited `autoplay_next`; `None` = not in the file (default true).
+    autoplay_next: Option<bool>,
     /// Set when an unreadable settings.json could not be moved aside; `save`
     /// then refuses so the original is never overwritten.
     blocked: Option<String>,
@@ -43,7 +53,7 @@ pub fn path_in(dir: &Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-fn parse(bytes: &[u8]) -> Option<(Vec<String>, BTreeMap<String, SubChoice>)> {
+fn parse(bytes: &[u8]) -> Option<Parsed> {
     let f: SettingsFile = serde_json::from_slice(bytes).ok()?;
     if f.version != FORMAT_VERSION {
         return None;
@@ -51,7 +61,7 @@ fn parse(bytes: &[u8]) -> Option<(Vec<String>, BTreeMap<String, SubChoice>)> {
     let mut g = f.hidden_groups;
     g.sort();
     g.dedup();
-    Some((g, f.sub_prefs))
+    Some(Parsed { hidden_groups: g, sub_prefs: f.sub_prefs, autoplay_next: f.autoplay_next })
 }
 
 impl Settings {
@@ -63,14 +73,15 @@ impl Settings {
 
     fn load_with(dir: &Path, mover: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Settings {
         let path = path_in(dir);
-        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), sub_prefs: BTreeMap::new(), blocked: None };
+        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), sub_prefs: BTreeMap::new(), autoplay_next: None, blocked: None };
         let unreadable = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return s,
             Err(_) => true,
             Ok(bytes) => match parse(&bytes) {
-                Some((g, prefs)) => {
-                    s.hidden_groups = g;
-                    s.sub_prefs = prefs;
+                Some(p) => {
+                    s.hidden_groups = p.hidden_groups;
+                    s.sub_prefs = p.sub_prefs;
+                    s.autoplay_next = p.autoplay_next;
                     false
                 }
                 None => true,
@@ -103,6 +114,12 @@ impl Settings {
         }
     }
 
+    /// Play the next episode when one finishes (hand-edited `autoplay_next`
+    /// in settings.json; default true).
+    pub fn autoplay_next(&self) -> bool {
+        self.autoplay_next.unwrap_or(true)
+    }
+
     pub fn sub_pref(&self, show: &str) -> Option<&SubChoice> {
         self.sub_prefs.get(&show.to_lowercase())
     }
@@ -126,6 +143,7 @@ impl Settings {
             version: FORMAT_VERSION,
             hidden_groups: self.hidden_groups.clone(),
             sub_prefs: self.sub_prefs.clone(),
+            autoplay_next: self.autoplay_next,
         })
         .context("serializing settings")?;
         crate::fsutil::atomic_write(&path, &json).with_context(|| format!("writing {}", path.display()))
@@ -216,6 +234,34 @@ mod tests {
         let err = s.save().unwrap_err().to_string();
         assert!(err.contains("settings.json"), "{err}");
         assert_eq!(std::fs::read(&p).unwrap(), b"{oops");
+    }
+
+    #[test]
+    fn autoplay_next_defaults_to_true() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(Settings::load(d.path()).autoplay_next());
+    }
+
+    #[test]
+    fn autoplay_next_false_roundtrips_and_is_kept_when_saving_other_changes() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.json");
+        std::fs::write(&p, br#"{"version":1,"autoplay_next":false}"#).unwrap();
+        let mut s = Settings::load(d.path());
+        assert!(!s.autoplay_next());
+        s.set_sub_pref("Show", SubChoice::Off);
+        s.save().unwrap();
+        assert!(!Settings::load(d.path()).autoplay_next());
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["autoplay_next"], false);
+
+        std::fs::write(&p, br#"{"version":1}"#).unwrap();
+        let mut s = Settings::load(d.path());
+        s.set_sub_pref("Show", SubChoice::Off);
+        s.save().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert!(v.get("autoplay_next").is_none());
+        assert!(Settings::load(d.path()).autoplay_next());
     }
 
     #[test]
