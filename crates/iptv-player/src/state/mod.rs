@@ -5,6 +5,7 @@ pub mod data;
 pub mod favs;
 pub mod live;
 pub mod nav;
+pub mod next;
 pub mod playback;
 pub mod seek;
 pub mod titles;
