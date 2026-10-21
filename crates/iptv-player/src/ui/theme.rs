@@ -11,7 +11,6 @@ pub fn apply(ctx: &egui::Context, theme: iptv::theme::Theme) {
     if theme == iptv::theme::Theme::Standard {
         return; // egui's defaults
     }
-    ctx.set_theme(egui::Theme::Dark);
     let mut v = egui::Visuals::dark();
     v.override_text_color = Some(WHITE);
     v.panel_fill = BLACK;
@@ -45,5 +44,8 @@ pub fn apply(ctx: &egui::Context, theme: iptv::theme::Theme) {
     w.open.weak_bg_fill = GREY;
     w.open.bg_stroke = Stroke::new(1.0, WHITE);
     w.open.fg_stroke = Stroke::new(1.0, WHITE);
-    ctx.set_visuals(v);
+    // Same look for both OS themes, and no forced window theme: forcing it left the
+    // title bar buttons white on a light title bar (invisible) at times.
+    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+    ctx.set_visuals_of(egui::Theme::Light, v);
 }

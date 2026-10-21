@@ -14,6 +14,6 @@ user_agent = "VLC/3.0.20 LibVLC/3.0.20"
 # Applies after the next refresh (F5) or restart.
 # top_countries = "Iceland, United Kingdom"
 
-# Optional: look of the app. "black" (default) = black background, white text; "standard" = the
-# plain dark look. Applies after a restart.
-# theme = "black"
+# Optional: look of the app, applied after a restart. The default is "black" (black background,
+# white text). Set theme = "standard" for the plain dark look instead.
+# theme = "standard"

@@ -93,6 +93,7 @@ pub const SETTINGS: &[Section] = &[
             row("playlist_url", "Your M3U playlist address. Required (the app asks for it at startup while empty), keep it private"),
             row("user_agent", "Sent on the playlist download and every stream. Default VLC/3.0.20 LibVLC/3.0.20"),
             row("top_countries", "Live countries listed first, comma separated, e.g. \"Iceland, United Kingdom\" (after F5 or restart)"),
+            row("theme", "\"black\" (default: black background, white text) or \"standard\" (egui dark look); after a restart"),
         ],
     },
     Section {

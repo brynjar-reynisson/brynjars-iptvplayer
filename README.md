@@ -32,6 +32,9 @@ until you pick something else.
    - Optional: `top_countries = "Iceland, United Kingdom"` lists those live countries first, in that
      order (comma-separated). The rest are alphabetical, with "Other" last. Applies after
      the next refresh (F5) or restart. The old single `top_country` key still works.
+   - Optional: `theme = "standard"` switches from the default black look (black background, white
+     text) to the plain dark look. Applies after a restart. Read by `iptv::theme::load`, so it
+     also works before a playlist URL is set.
    - The first download can take a long time while the provider generates the file.
    - A changed `user_agent` applies to the next refresh (F5). Streams pick it up after
      a restart.
