@@ -2,7 +2,8 @@
 # config.example.toml (reference only: the app creates config.toml itself on
 # first start and asks for the playlist URL). Usage (from anywhere):
 #   powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 [-Out <dir>]
-# Default output: <repo>\dist\iptv-player (gitignored).
+# Default output: <repo>\dist\iptv-player (gitignored), plus the distributable
+# <repo>\dist\iptv-player.zip (exe + DLL only; upload this to GitHub releases).
 param(
     [string]$Out = ""
 )
@@ -25,5 +26,10 @@ New-Item -ItemType Directory -Force $Out | Out-Null
 Copy-Item (Join-Path $repo "target\release\iptv-player.exe") $Out -Force
 Copy-Item $dll $Out -Force
 Copy-Item (Join-Path $repo "config.example.toml") $Out -Force
+# The distributable: just the exe and the DLL, next to the release folder.
+$zip = Join-Path (Split-Path -Parent $Out) "iptv-player.zip"
+if (Test-Path $zip) { Remove-Item $zip -Force }
+Compress-Archive -Path (Join-Path $Out "iptv-player.exe"), (Join-Path $Out "libmpv-2.dll") -DestinationPath $zip
 Write-Host "Release folder: $Out"
+Write-Host "Zip: $zip"
 Write-Host "Next: start iptv-player.exe there; it creates config.toml and asks for the playlist URL."
