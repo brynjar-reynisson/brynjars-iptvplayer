@@ -1778,7 +1778,7 @@ impl App {
                     }
                     bar_job = bar_rect.map(|bar| (bar, p.position()));
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
-                    let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 38.0), egui::vec2(32.0, 26.0));
+                    let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 32.0), egui::vec2(32.0, 26.0));
                     // Subtitle button ("CC"), movies and episodes only, left of the play/pause button.
                     if !pb.is_live() {
                         let sbtn = btn.translate(egui::vec2(-76.0, 0.0));
