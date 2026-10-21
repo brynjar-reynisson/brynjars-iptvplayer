@@ -76,7 +76,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   under it: pick the country row for all its channels or a group row for just that group.
 - **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's
   bottom right (or **F11** / **Alt+Enter**) makes the player fill the whole screen, without
-  the channel list. **Esc** goes back to how it was before. In full screen the mouse cursor hides after 3 seconds without movement and returns as soon as you move it. Otherwise **Esc** leaves the filter box, or stops
+  the channel list. **Esc** goes back to how it was before. In full screen the mouse cursor hides after 3 seconds without movement and returns as soon as you move it. The channel or episode title at the top left also fades out after 5 seconds in full screen, and shows again when you move the mouse or switch channel. Otherwise **Esc** leaves the filter box, or stops
   playback and leaves the player view. **F5** refreshes the playlist.
 - **Ctrl+F** or **/** focuses the channel filter (on Movies/Series, the search box).
 - A play/pause button sits left of the full-screen button and shows the action a click

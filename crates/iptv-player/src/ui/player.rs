@@ -220,8 +220,9 @@ impl Player {
         }
     }
 
-    /// Draw the video into `rect` with the overlay (channel name + status).
-    pub fn show(&self, ui: &egui::Ui, rect: egui::Rect, title: &str) {
+    /// Draw the video into `rect` with the overlay (channel name + status; the
+    /// name only when `show_title`).
+    pub fn show(&self, ui: &egui::Ui, rect: egui::Rect, title: &str, show_title: bool) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
         let renderer = self.renderer.clone();
@@ -231,7 +232,10 @@ impl Player {
                 renderer.paint_callback(&info, p);
             })),
         });
-        let mut lines = vec![title.to_string()];
+        let mut lines = Vec::new();
+        if show_title {
+            lines.push(title.to_string());
+        }
         let status = status_text(self.sup.status(), self.sup.next_retry_in(Instant::now()));
         if !status.is_empty() {
             lines.push(status);
@@ -241,7 +245,7 @@ impl Player {
         }
         let mut pos = rect.left_top() + egui::vec2(12.0, 12.0);
         for (i, text) in lines.into_iter().enumerate() {
-            let size = if i == 0 { 16.0 } else { 18.0 };
+            let size = if show_title && i == 0 { 16.0 } else { 18.0 };
             let galley = painter.layout_no_wrap(text, egui::FontId::proportional(size), egui::Color32::WHITE);
             let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
             painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(180));

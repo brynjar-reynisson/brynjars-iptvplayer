@@ -169,6 +169,10 @@ struct App {
     /// Last mouse movement/click (the cursor hides in fullscreen after `cursor::HIDE_AFTER`).
     cursor_moved: Instant,
     cursor_hidden: bool,
+    was_fullscreen: bool,
+    /// Title overlay text and when it last changed (fullscreen shows it again then).
+    shown_title: String,
+    title_changed: Instant,
     /// Seek bar state (movies/episodes).
     seek: SeekState,
     /// Preview frames above the seek bar.
@@ -300,6 +304,9 @@ impl App {
             activity: None,
             cursor_moved: Instant::now(),
             cursor_hidden: false,
+            was_fullscreen: false,
+            shown_title: String::new(),
+            title_changed: Instant::now(),
             seek: SeekState::default(),
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
@@ -912,9 +919,11 @@ impl App {
         let moved = ctx.input(|i| {
             i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed() || i.smooth_scroll_delta != egui::Vec2::ZERO
         });
-        if moved {
+        // Entering fullscreen counts as activity (cursor and title show first).
+        if moved || (fullscreen && !self.was_fullscreen) {
             self.cursor_moved = Instant::now();
         }
+        self.was_fullscreen = fullscreen;
         let still = self.cursor_moved.elapsed();
         let hide = cursor::hidden(fullscreen, still);
         if hide != self.cursor_hidden {
@@ -923,6 +932,9 @@ impl App {
         }
         if fullscreen && !hide {
             ctx.request_repaint_after(cursor::HIDE_AFTER.saturating_sub(still));
+        }
+        if fullscreen && cursor::title_visible(true, still) {
+            ctx.request_repaint_after(cursor::TITLE_SHOW.saturating_sub(still));
         }
     }
 
@@ -1745,7 +1757,17 @@ impl App {
                     if let Some(next) = self.zap.pending() {
                         title = format!("{title}  →  {}…", next.name());
                     }
-                    p.show(ui, rect, &title);
+                    if title != self.shown_title {
+                        self.shown_title = title.clone();
+                        self.title_changed = Instant::now();
+                    }
+                    let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    let since = self.cursor_moved.elapsed().min(self.title_changed.elapsed());
+                    let show_title = cursor::title_visible(fs, since);
+                    if fs && show_title {
+                        ui.ctx().request_repaint_after(cursor::TITLE_SHOW.saturating_sub(since));
+                    }
+                    p.show(ui, rect, &title, show_title);
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
                         toggle_fs = true;
