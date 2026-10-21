@@ -3,6 +3,7 @@
 
 pub mod autoplay;
 pub mod credits;
+pub mod cursor;
 pub mod data;
 pub mod favs;
 pub mod help;

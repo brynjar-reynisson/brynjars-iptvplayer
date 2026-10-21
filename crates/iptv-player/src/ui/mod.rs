@@ -37,6 +37,7 @@ use iptv::supervisor::Status;
 use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
+use crate::state::cursor;
 use crate::state::help::HelpTab;
 use crate::state::live::LiveBrowser;
 use crate::state::next::{continue_target, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
@@ -165,6 +166,9 @@ struct App {
     fs_return_view: Option<View>,
     /// Last mouse move over the video or key press (shows the seek bar for `TIME_SHOW`).
     activity: Option<Instant>,
+    /// Last mouse movement/click (the cursor hides in fullscreen after `cursor::HIDE_AFTER`).
+    cursor_moved: Instant,
+    cursor_hidden: bool,
     /// Seek bar state (movies/episodes).
     seek: SeekState,
     /// Preview frames above the seek bar.
@@ -294,6 +298,8 @@ impl App {
             top_countries,
             fs_return_view: None,
             activity: None,
+            cursor_moved: Instant::now(),
+            cursor_hidden: false,
             seek: SeekState::default(),
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
@@ -896,6 +902,27 @@ impl App {
             }
         } else if let Some(v) = self.fs_return_view.take() {
             self.view = v;
+        }
+    }
+
+    /// Hides the mouse cursor in fullscreen after `cursor::HIDE_AFTER` without
+    /// movement; any movement, click or scroll shows it again at once.
+    fn update_cursor(&mut self, ctx: &egui::Context) {
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let moved = ctx.input(|i| {
+            i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed() || i.smooth_scroll_delta != egui::Vec2::ZERO
+        });
+        if moved {
+            self.cursor_moved = Instant::now();
+        }
+        let still = self.cursor_moved.elapsed();
+        let hide = cursor::hidden(fullscreen, still);
+        if hide != self.cursor_hidden {
+            self.cursor_hidden = hide;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!hide));
+        }
+        if fullscreen && !hide {
+            ctx.request_repaint_after(cursor::HIDE_AFTER.saturating_sub(still));
         }
     }
 
@@ -2227,6 +2254,7 @@ impl eframe::App for App {
         if self.positions_saved.elapsed() >= POSITION_SAVE_EVERY {
             self.save_position();
         }
+        self.update_cursor(&ctx);
         self.handle_keys(&ctx);
         self.fire_zap();
 
