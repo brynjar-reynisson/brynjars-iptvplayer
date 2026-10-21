@@ -1,4 +1,5 @@
 pub mod config;
+pub mod theme;
 pub mod redact;
 pub mod playlist;
 pub mod library;

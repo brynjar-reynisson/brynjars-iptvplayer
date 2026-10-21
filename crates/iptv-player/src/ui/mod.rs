@@ -14,6 +14,7 @@ pub mod live;
 pub mod player;
 pub mod previews;
 pub mod setup;
+pub mod theme;
 pub mod vod;
 
 use std::collections::HashSet;
@@ -269,6 +270,7 @@ impl App {
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
         let (user_agent, top_countries) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
+        theme::apply(&cc.egui_ctx, iptv::theme::load(&opts.data_dir));
         let player = Player::new(cc, &user_agent).map_err(|e| safe_text(&format!("{e:#}")));
         if let Err(e) = &player {
             eprintln!("player unavailable: {e}");
