@@ -42,7 +42,7 @@ only files needed at runtime.
 
 ### Data directory
 
-`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `episode-titles.json` (cached episode titles) and `settings.json` (hidden
+`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `recent-series.json` (last 10 series watched), `episode-titles.json` (cached episode titles) and `settings.json` (hidden
 groups, subtitle choices, autoplay) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 
@@ -100,6 +100,14 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   something else). Positions are saved every 15 s in `positions.json`. Anything watched to
   within the last minute (or 95 %) counts as finished and starts over, as does anything
   stopped in the first 15 s. Live channels are never remembered.
+- Recently watched series: under an empty Series search box the last 10 series you started are
+  listed, newest first (stored in `recent-series.json`; the list goes away while you type).
+  Click or **Enter** (Up/Down move) opens that show on the episode you were at, without playing it.
+  The button right of the tabs, with a play triangle and the most recent show's name (also
+  **Shift+P**, not while typing), opens that show and plays: the episode you left, resumed where
+  you stopped, or the next one when that episode had reached its credits (or finished) and there
+  is a next one. Exiting the player leaves you in the show's episode list. Credits are only
+  detected while `autoplay_next` is on.
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups
   from the results.
 - The status overlay shows what is happening while a stream is not playing:

@@ -526,6 +526,15 @@ impl SeriesBrowser {
         }
     }
 
+    /// Open `show` with the cursor on `entry` (when it is listed).
+    pub fn open_show(&mut self, lib: &Library, show: usize, entry: Option<usize>, hidden: &HashSet<String>) {
+        let mut o = OpenShow::new(lib, show, hidden);
+        if let Some(e) = entry {
+            o.select_entry(e);
+        }
+        self.open = Some(o);
+    }
+
     /// Back from the episodes to the show list (the show stays selected).
     pub fn back(&mut self) -> bool {
         self.open.take().is_some()

@@ -9,6 +9,8 @@ use eframe::egui;
 use iptv::favorites::Favorites;
 use iptv::library::Library;
 use iptv::playlist::favorite_key;
+use iptv::recent_series::Recent;
+use iptv::series::episode_label;
 
 use super::live::{list, row, ListView, RowAction, RowLook};
 use crate::state::nav::ChannelList;
@@ -155,6 +157,32 @@ pub fn shows(ui: &mut egui::Ui, lib: &Library, l: &ChannelList, view: &mut ListV
         let n: usize = s.seasons.iter().map(|x| x.episodes.len()).sum();
         let text = format!("{}  ({n} episode{})", s.name, if n == 1 { "" } else { "s" });
         row(ui, RowLook { text: &text, selected: l.cursor() == Some(i), playing: false, star: false, greyed: false })
+    })
+}
+
+/// Recently watched shows (newest first) under an empty search box: show name
+/// and the episode it stopped at. Shown rows only need names, so a show that
+/// left the playlist is still listed (opening it says so).
+pub fn recent(
+    ui: &mut egui::Ui,
+    lib: &Library,
+    items: &[Recent],
+    cursor: Option<usize>,
+    view: &mut ListView,
+    scroll_to: Option<usize>,
+) -> Option<RowAction> {
+    ui.strong("Recently watched");
+    list(ui, "recent", items.len(), view, scroll_to, |ui, i| {
+        let r = &items[i];
+        let label = lib
+            .find_by_key(&r.key)
+            .and_then(|e| episode_label(&lib.entry(e).name))
+            .and_then(|l| l.split(" - ").next().map(str::to_string));
+        let text = match label {
+            Some(l) => format!("{}  ({l})", r.show),
+            None => r.show.clone(),
+        };
+        row(ui, RowLook { text: &text, selected: cursor == Some(i), playing: false, star: false, greyed: false })
     })
 }
 

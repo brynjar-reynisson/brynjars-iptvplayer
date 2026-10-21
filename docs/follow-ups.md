@@ -52,6 +52,8 @@ Known gaps and ideas that were found during implementation and review but not do
 - **Library ready time** from cache was measured at 0.43–0.48 s in the last run (earlier runs under load showed 1.0–1.3 s, still on a background thread so the window is usable within ~0.1–0.5 s). A lazily built search index (`OnceLock`) or one concatenated string with offsets would cut build time and memory further.
 - **Narrow video panel.** The **>>** next-episode button hides itself when it does not fit, but the fullscreen, play/pause and CC buttons are always drawn and get clipped at the panel's left edge when it is very narrow (seen at ~100 px wide).
 
+- **Recent series, manual checks still to do** (2026-10-21): the continue button/Shift+P/list were only unit-tested (record, resolve, quarantine); try it in the real app: button next to the tabs, Shift+P, list under the search box, continue after credits, a show that left the playlist. Credits are only flagged while `autoplay_next` is on (the offer/scan decides); with it off only a finished episode counts. A focused continue button plus Enter is not specially handled.
+
 ## Ideas (not requested)
 
 - Show watched/resumable marks (and the saved position) in the movie and episode lists.

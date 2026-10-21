@@ -25,6 +25,7 @@ use iptv::fetch::{self, RefreshEvent, RefreshOptions, Refresher, Source};
 use iptv::library::{Library, SearchScope};
 use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
+use iptv::recent_series::RecentSeries;
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
@@ -33,7 +34,7 @@ use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::live::LiveBrowser;
-use crate::state::next::{next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
+use crate::state::next::{continue_target, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -92,6 +93,18 @@ enum View {
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(15);
 
 /// `h:mm:ss` / `m:ss` for a position in seconds.
+/// Show name and favorite key of the episode `pb` plays, for the recent-series
+/// history; `None` for live, movies and `(Unsorted)` episodes.
+fn recent_id(pb: &Playback) -> Option<(String, String)> {
+    let e = pb.entry_index().filter(|_| !pb.is_live())?;
+    let lib = pb.library();
+    if lib.entry(e).kind != Kind::Series {
+        return None;
+    }
+    let show = show_of(lib, e)?;
+    Some((lib.shows()[show].name.clone(), pb.key().to_string()))
+}
+
 fn clock(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 {
@@ -166,6 +179,12 @@ struct App {
     positions: Positions,
     /// Last time the playing position was written to disk.
     positions_saved: Instant,
+    /// The last series watched (`recent-series.json`): the list under the
+    /// Series search box and the continue button.
+    recent: RecentSeries,
+    /// Selected row of that list (keyboard).
+    recent_cursor: Option<usize>,
+    recent_view: ListView,
     data: DataState,
     cache_rx: Option<Receiver<CacheResult>>,
     refresher: Option<Refresher>,
@@ -231,6 +250,7 @@ impl App {
         }
         let favs = Favorites::load(&opts.data_dir);
         let positions = Positions::load(&opts.data_dir);
+        let recent = RecentSeries::load(&opts.data_dir);
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
         let user_agent_for_previews = user_agent.clone();
@@ -256,6 +276,9 @@ impl App {
             sub_cursor: 0,
             positions,
             positions_saved: Instant::now(),
+            recent,
+            recent_cursor: None,
+            recent_view: ListView::default(),
             data,
             cache_rx: None,
             refresher: None,
@@ -527,7 +550,67 @@ impl App {
         self.autoplay.arm(next, enabled);
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
+        if let Some((show, key)) = recent_id(&pb) {
+            self.recent.touch(&show, &key);
+            self.save_recent();
+        }
         self.playback = Some(pb);
+    }
+
+    /// The playing episode reached its credits (or finished): the continue
+    /// button then goes on to the next episode.
+    fn mark_credits(&mut self, pb: &Playback) {
+        if let Some((show, key)) = recent_id(pb) {
+            self.recent.mark_credits(&show, &key);
+            self.save_recent();
+        }
+    }
+
+    fn save_recent(&mut self) {
+        if let Err(e) = self.recent.save_if_dirty() {
+            eprintln!("could not save recent series: {}", safe_text(&format!("{e:#}")));
+        }
+    }
+
+    /// Shown rows of the recent-series list: nothing typed in the Series search box.
+    fn recent_listed(&self) -> bool {
+        self.tab == Tab::Series
+            && self.view == View::Browse
+            && self.series.open().is_none()
+            && self.series.search.query().trim().is_empty()
+            && !self.recent.items().is_empty()
+    }
+
+    /// Open recent show `i` at its recorded episode (no playback).
+    fn open_recent(&mut self, i: usize) {
+        let (Some(lib), Some(mut r)) = (self.shown_lib.clone(), self.recent.items().get(i).cloned()) else { return };
+        r.credits = false; // the recorded episode itself, not the one after it
+        match continue_target(&lib, &r, &self.hidden) {
+            Some(t) => {
+                self.series.open_show(&lib, t.show, Some(t.entry), &self.hidden);
+                self.scroll_to = self.vod_cursor();
+            }
+            None => self.message = Some(format!("{} is not in the current playlist.", r.show)),
+        }
+    }
+
+    /// The continue button / Shift+P: open the most recent show at the
+    /// episode to continue with (the next one after the credits) and play it.
+    fn continue_recent(&mut self) {
+        let (Some(lib), Some(r)) = (self.shown_lib.clone(), self.recent.latest().cloned()) else { return };
+        let Some(t) = continue_target(&lib, &r, &self.hidden) else {
+            self.message = Some(format!("{} is not in the current playlist.", r.show));
+            return;
+        };
+        self.tab = Tab::Series;
+        self.view = View::Browse;
+        self.series.open_show(&lib, t.show, Some(t.entry), &self.hidden);
+        self.scroll_to = self.vod_cursor();
+        if self.playing_entry() != Some(t.entry) {
+            self.play_from(show_episodes(&lib, t.show, &self.hidden), t.entry, Tab::Series);
+        } else {
+            self.zap.cancel();
+        }
     }
 
     /// Per frame: drive the "Next episode" offer (tail scan, countdown).
@@ -571,9 +654,17 @@ impl App {
                 }
                 false
             }
-            Step::PlayNext => self.play_next_episode(true),
+            Step::PlayNext => {
+                if let Some(pb) = self.playback.clone() {
+                    self.mark_credits(&pb);
+                }
+                self.play_next_episode(true)
+            }
             Step::Offer => {
                 eprintln!("autoplay: offer shown at {:.1} s", position.map_or(0.0, |(p, _)| p));
+                if let Some(pb) = self.playback.clone() {
+                    self.mark_credits(&pb);
+                }
                 false
             }
             Step::Nothing => false,
@@ -776,6 +867,7 @@ impl App {
             return;
         }
         self.positions.forget(pb.key());
+        self.mark_credits(&pb);
         self.stop();
         self.message = Some(format!("Finished: {}", pb.name()));
         let e = pb.entry_index().filter(|_| self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)));
@@ -833,6 +925,17 @@ impl App {
                 self.scroll_to = self.vod_cursor();
                 return;
             }
+            Tab::Series if self.recent_listed() => {
+                let n = self.recent.items().len() as i32;
+                let next = match self.recent_cursor {
+                    Some(c) => (c as i32 + delta).rem_euclid(n),
+                    None if delta >= 0 => 0,
+                    None => n - 1,
+                };
+                self.recent_cursor = Some(next as usize);
+                self.scroll_to = self.recent_cursor;
+                return;
+            }
             Tab::Series => {
                 let _ = match self.series.open_mut() {
                     Some(o) => o.step(delta),
@@ -878,6 +981,11 @@ impl App {
             Tab::Movies if self.movies.list().cursor().is_none() => {
                 self.movies.list_mut().step(1);
                 self.scroll_to = self.vod_cursor();
+                return;
+            }
+            Tab::Series if self.recent_listed() => {
+                // Nothing selected: the most recent show.
+                self.open_recent(self.recent_cursor.unwrap_or(0));
                 return;
             }
             Tab::Series if self.series.open().is_none() => {
@@ -1059,6 +1167,10 @@ impl App {
                 }
             }
         }
+        // Shift+P = the continue button (not while typing or in the subtitle menu).
+        if !typing && !self.sub_menu && self.view == View::Browse && ctx.input_mut(|i| i.consume_key(M::SHIFT, Key::P)) {
+            self.continue_recent();
+        }
         // Left/Right step through the playing movie/episode (before the
         // browse keys below, which would otherwise take them).
         if self.playback.as_ref().is_some_and(|p| !p.is_live()) && !typing && !self.sub_menu && self.focused_tab.is_none() {
@@ -1226,6 +1338,7 @@ impl App {
                         self.tab = t;
                     }
                 }
+                self.continue_button(ui);
                 ui.separator();
                 let running = matches!(self.data.refresh(), RefreshState::Running { .. });
                 if ui.add_enabled(!running, egui::Button::new("Refresh")).on_hover_text("F5").clicked() {
@@ -1259,6 +1372,27 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Play triangle + the name of the most recent show, right of the tabs.
+    /// The triangle is a shape: the default fonts lack the symbol glyph.
+    fn continue_button(&mut self, ui: &mut egui::Ui) {
+        let Some(show) = self.recent.latest().map(|r| r.show.clone()) else { return };
+        let name = if show.chars().count() > 28 {
+            format!("{}…", show.chars().take(27).collect::<String>())
+        } else {
+            show.clone()
+        };
+        let r = ui
+            .add_enabled(self.shown_lib.is_some(), egui::Button::new(format!("      {name}")))
+            .on_hover_text(format!("Continue {show} (Shift+P)"));
+        let c = egui::pos2(r.rect.left() + 14.0, r.rect.center().y);
+        let color = if r.enabled() { egui::Color32::from_rgb(40, 170, 90) } else { ui.visuals().weak_text_color() };
+        let pts = vec![c + egui::vec2(-4.0, -6.0), c + egui::vec2(6.0, 0.0), c + egui::vec2(-4.0, 6.0)];
+        ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+        if r.clicked() {
+            self.continue_recent();
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1913,11 +2047,19 @@ impl App {
                         };
                         let all_hidden = vis.is_some_and(|v| v.1 == 0) && !lib.shows().is_empty();
                         vod::result_note(ui, s.query(), s.searching(), s.list().len(), &hint, all_hidden);
-                        let a = vod::shows(ui, &lib, self.series.search.list(), &mut self.show_view, scroll_to);
-                        if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
-                            self.series.search.list_mut().set_cursor(i);
-                            if self.series.open_selected(&lib, &self.hidden) {
-                                self.scroll_to = self.vod_cursor();
+                        if self.recent_listed() {
+                            let a = vod::recent(ui, &lib, self.recent.items(), self.recent_cursor, &mut self.recent_view, scroll_to);
+                            if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
+                                self.recent_cursor = Some(i);
+                                self.open_recent(i);
+                            }
+                        } else {
+                            let a = vod::shows(ui, &lib, self.series.search.list(), &mut self.show_view, scroll_to);
+                            if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
+                                self.series.search.list_mut().set_cursor(i);
+                                if self.series.open_selected(&lib, &self.hidden) {
+                                    self.scroll_to = self.vod_cursor();
+                                }
                             }
                         }
                         if let Some(vod::GroupAction::Set(g, h)) = toggled {

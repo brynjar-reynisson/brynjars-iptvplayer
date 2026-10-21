@@ -5,6 +5,7 @@ use std::sync::{Arc, Weak};
 
 use iptv::library::Library;
 use iptv::playlist::Kind;
+use iptv::recent_series::Recent;
 use iptv::series::UNSORTED;
 
 use super::vod::{episode_rows, EpisodeRow, Hidden};
@@ -109,14 +110,68 @@ pub fn show_episodes(lib: &Library, show: usize, hidden: &HashSet<String>) -> Ve
         .collect()
 }
 
+/// What the "continue" button plays: `show` (index in `Library::shows`) and
+/// the episode `entry` to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueTarget {
+    pub show: usize,
+    pub entry: usize,
+}
+
+/// Resolve a recent-series record against `lib`: the recorded episode, or the
+/// one after it when it reached its credits (the last episode stays itself).
+/// `None` when the show or the episode is not (visibly) in the playlist.
+pub fn continue_target(lib: &Library, recent: &Recent, hidden: &HashSet<String>) -> Option<ContinueTarget> {
+    let show = lib.shows().iter().position(|s| s.name == recent.show && s.name != UNSORTED)?;
+    let entry = lib.find_by_key(&recent.key)?;
+    if !show_episodes(lib, show, hidden).contains(&entry) {
+        return None;
+    }
+    let entry = if recent.credits { next_episode(lib, entry, hidden).unwrap_or(entry) } else { entry };
+    Some(ContinueTarget { show, entry })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::vod::tests::{vod, vod_lib};
     use super::*;
-    use iptv::playlist::Kind;
+    use iptv::playlist::{favorite_key, Kind};
 
     fn hide(g: &[&str]) -> HashSet<String> {
         g.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn recent(lib: &Library, show: &str, entry: usize, credits: bool) -> Recent {
+        Recent { show: show.into(), key: favorite_key(lib.entry(entry)), credits }
+    }
+
+    #[test]
+    fn continue_resumes_the_recorded_episode() {
+        let lib = vod_lib();
+        let t = continue_target(&lib, &recent(&lib, "Quiet Harbor", 4, false), &HashSet::new()).unwrap();
+        assert_eq!(t.entry, 4);
+        assert_eq!(lib.shows()[t.show].name, "Quiet Harbor");
+    }
+
+    #[test]
+    fn continue_after_credits_plays_the_next_episode_or_stays_on_the_last() {
+        let lib = vod_lib();
+        let h = HashSet::new();
+        assert_eq!(continue_target(&lib, &recent(&lib, "Quiet Harbor", 4, true), &h).unwrap().entry, 3);
+        assert_eq!(continue_target(&lib, &recent(&lib, "Quiet Harbor", 3, true), &h).unwrap().entry, 5, "next season");
+        assert_eq!(continue_target(&lib, &recent(&lib, "Quiet Harbor", 5, true), &h).unwrap().entry, 5);
+    }
+
+    #[test]
+    fn continue_is_none_when_show_or_episode_is_gone_or_hidden() {
+        let lib = vod_lib();
+        let h = HashSet::new();
+        assert!(continue_target(&lib, &recent(&lib, "No Such Show", 4, false), &h).is_none());
+        let mut gone = recent(&lib, "Quiet Harbor", 4, false);
+        gone.key = "series:999".into();
+        assert!(continue_target(&lib, &gone, &h).is_none());
+        assert!(continue_target(&lib, &recent(&lib, "Quiet Harbor", 4, false), &hide(&["Series: Testland"])).is_none());
+        assert!(continue_target(&lib, &recent(&lib, "(Unsorted)", 7, false), &h).is_none());
     }
 
     // vod_lib: Quiet Harbor S01E01 = 4, S01E02 = 3, S02E01 = 5; 7 is (Unsorted); 0 is a movie.

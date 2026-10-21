@@ -12,3 +12,4 @@ pub mod subtitles;
 pub mod positions;
 pub mod episode_titles;
 pub mod supervisor;
+pub mod recent_series;
