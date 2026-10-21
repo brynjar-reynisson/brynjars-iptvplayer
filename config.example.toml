@@ -1,9 +1,13 @@
-playlist_url = "http://example.invalid/get.php?username=USER&password=PASS&type=m3u_plus"
+# Your IPTV provider's playlist address (an M3U link, usually with your account
+# name and password in it). Keep this file private. Nothing can be played
+# without it: the app asks for it at startup while it is empty.
+playlist_url = ""
 
-# Optional: User-Agent sent on the playlist download and on every stream
-# request. Some providers reject requests without a known player User-Agent
-# (e.g. "server returned HTTP 454"). Empty or missing = "VLC/3.0.20 LibVLC/3.0.20".
-# user_agent = "VLC/3.0.20 LibVLC/3.0.20"
+# User-Agent sent on the playlist download and on every stream request. Some
+# providers reject requests without a known player User-Agent (e.g. "server
+# returned HTTP 454"). Change it only if your provider needs another one.
+# Empty or missing = "VLC/3.0.20 LibVLC/3.0.20".
+user_agent = "VLC/3.0.20 LibVLC/3.0.20"
 
 # Optional: live countries to list first, comma-separated, in this order
 # (e.g. "Iceland, United Kingdom"). The other countries are alphabetical, with "Other" last.

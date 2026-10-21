@@ -16,11 +16,16 @@ until you pick something else.
    are gitignored. You need mpv 0.38 or later.
 3. **Build**: `cargo build --release`. The build script copies `libmpv-2.dll` next to
    `target/release/iptv-player.exe`.
-4. **Config**: copy `config.example.toml` to `config.toml` beside the exe (or in the data
-   dir, see below) and set `playlist_url` to your provider's M3U URL. `config.toml` holds
-   your credentials. It is gitignored, so never commit it.
-   - Optional: `user_agent = "..."` sets the User-Agent sent with the playlist download
-     and every stream request. If it is missing or empty, the app sends
+4. **Config**: the first start creates `config.toml` beside the exe (or in the data dir, see
+   below) with the default values (the text of `config.example.toml`), and a dialog asks for
+   your provider's M3U URL: paste it and press Enter (or **Save and load**). **Quit** closes
+   the app, since nothing can be played without it. The dialog appears whenever `playlist_url`
+   is empty (or still the example address), and the URL is written into `config.toml`, which
+   keeps the rest of the file as it is. You can also edit the file by hand. `config.toml`
+   holds your credentials. It is gitignored, so never commit it. With `--playlist-file`
+   no `config.toml` is created and no dialog appears.
+   - `user_agent = "..."` (written with the default value) sets the User-Agent sent with the
+     playlist download and every stream request. If it is missing or empty, the app sends
      `VLC/3.0.20 LibVLC/3.0.20`. Some providers block requests that have no known
      player User-Agent. If a refresh fails with "server returned HTTP 454 (blocked?
      check user_agent in config.toml)", try another value.
@@ -36,9 +41,9 @@ until you pick something else.
 
 `powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 [-Out <dir>]` builds
 the release binary and writes a self-contained folder (default `dist\iptv-player\`, which
-is gitignored) with `iptv-player.exe`, `libmpv-2.dll` and `config.example.toml`. Copy the
-example to `config.toml` there and the folder runs on its own. The exe and the DLL are the
-only files needed at runtime.
+is gitignored) with `iptv-player.exe`, `libmpv-2.dll` and `config.example.toml`. The folder
+runs on its own: the first start creates `config.toml` and asks for the playlist URL. The exe
+and the DLL are the only files needed at runtime (`config.example.toml` is just a reference).
 
 ### Data directory
 

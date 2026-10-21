@@ -13,6 +13,7 @@ pub mod help;
 pub mod live;
 pub mod player;
 pub mod previews;
+pub mod setup;
 pub mod vod;
 
 use std::collections::HashSet;
@@ -176,6 +177,8 @@ struct App {
     next_cache: NextCache,
     /// The help card is open (on this tab).
     help: Option<HelpTab>,
+    /// Modal asking for the playlist URL while `config.toml` has none.
+    url_prompt: Option<setup::UrlPrompt>,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -249,6 +252,20 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
         fonts::install_fallbacks(&cc.egui_ctx);
+        // First run: write a default config.toml (never over an existing one;
+        // not with --playlist-file, which needs no config).
+        let create_note = if opts.playlist_file.is_none() {
+            iptv::config::ensure_default(&opts.data_dir)
+                .err()
+                .map(|e| format!("Could not create config.toml: {}", e.kind()))
+        } else {
+            None
+        };
+        let url_prompt = if opts.playlist_file.is_none() {
+            setup::Problem::of(&opts.data_dir).map(|p| setup::UrlPrompt::new(p, create_note))
+        } else {
+            None
+        };
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
         let (user_agent, top_countries) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
@@ -281,6 +298,7 @@ impl App {
             autoplay: Autoplay::new(),
             next_cache: NextCache::default(),
             help: None,
+            url_prompt,
             sub_menu: false,
             sub_cursor: 0,
             sub_follow: false,
@@ -361,6 +379,41 @@ impl App {
                                 top_countries: self.top_countries.clone(),
                             }));
                     }
+                }
+            }
+        }
+    }
+
+    /// Draws the playlist URL prompt (if open) and acts on its buttons.
+    fn url_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.url_prompt else { return };
+        let outcome = setup::show(ctx, prompt, &self.data_dir.join("config.toml"));
+        let save = match outcome {
+            setup::Outcome::None => return,
+            setup::Outcome::Quit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            setup::Outcome::Save(text) => Some(text),
+            setup::Outcome::Reload => None,
+        };
+        if let Some(text) = save {
+            if let Err(e) = iptv::config::set_playlist_url(&self.data_dir, &text) {
+                if let Some(p) = &mut self.url_prompt {
+                    p.set_error(safe_text(&format!("{e:#}")));
+                }
+                return;
+            }
+        }
+        // Saved (or reloaded): close when the config now loads, else show why not.
+        match setup::Problem::of(&self.data_dir) {
+            None => {
+                self.url_prompt = None;
+                self.request_refresh(false);
+            }
+            Some(problem) => {
+                if let Some(p) = &mut self.url_prompt {
+                    p.set_problem(problem);
                 }
             }
         }
@@ -1121,6 +1174,10 @@ impl App {
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
             self.activity = Some(Instant::now());
         }
+        // The playlist URL prompt is modal: no shortcut works behind it.
+        if self.url_prompt.is_some() {
+            return;
+        }
         let focused = [filter_id(), vod::movie_search_id(), vod::series_search_id()]
             .into_iter()
             .find(|id| ctx.memory(|m| m.has_focus(*id)));
@@ -1505,17 +1562,9 @@ impl App {
                         _ => ui.label("Loading…"),
                     };
                 }
-                Phase::NoConfig { config_path, detail } => {
-                    ui.heading("No playlist configured");
-                    ui.add_space(8.0);
-                    ui.label(format!("Create the file\n{}\nwith this content:", config_path.display()));
-                    ui.code("playlist_url = \"http://<your provider>/get.php?...\"");
-                    ui.label("(see config.example.toml), then press Refresh (F5).");
-                    ui.add_space(8.0);
-                    ui.weak(detail);
-                    if ui.button("Refresh (F5)").clicked() {
-                        self.request_refresh(false);
-                    }
+                // The URL prompt (a modal over this screen) does the asking.
+                Phase::NoConfig { .. } => {
+                    ui.weak("Waiting for the playlist URL…");
                 }
                 Phase::RefreshFailed { msg, can_force } => {
                     ui.heading("Could not load the playlist");
@@ -2198,6 +2247,7 @@ impl eframe::App for App {
                 self.help = None;
             }
         }
+        self.url_prompt_ui(&ctx);
 
         let spent = frame_start.elapsed();
         if spent > SLOW_FRAME {

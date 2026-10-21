@@ -6,6 +6,29 @@ use std::path::{Path, PathBuf};
 /// UA is accepted.
 pub const DEFAULT_USER_AGENT: &str = "VLC/3.0.20 LibVLC/3.0.20";
 
+/// The `config.toml` written on first run (same text as `config.example.toml`,
+/// empty `playlist_url`).
+pub const DEFAULT_CONFIG: &str = include_str!("../../../config.example.toml");
+
+/// Host of the placeholder URL older example files shipped with: counts as "not set".
+const PLACEHOLDER_HOST: &str = "example.invalid";
+
+/// `config.toml` parses but has no usable `playlist_url` (missing, blank or the
+/// example placeholder). The app answers this with the URL prompt; any other
+/// load error is a broken file. Never carries the URL.
+#[derive(Debug)]
+pub struct UrlUnset {
+    path: PathBuf,
+}
+
+impl std::fmt::Display for UrlUnset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is missing the required field `playlist_url`", self.path.display())
+    }
+}
+
+impl std::error::Error for UrlUnset {}
+
 #[derive(Clone)]
 pub struct Config {
     pub playlist_url: String,
@@ -71,8 +94,8 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
     let value: toml::Value = toml::from_str(&text)
         .map_err(|_| anyhow::anyhow!("{} is not valid TOML", path.display()))?;
     let playlist_url = match value.get("playlist_url").and_then(|v| v.as_str()) {
-        Some(u) if !u.trim().is_empty() => u.to_string(),
-        _ => anyhow::bail!("{} is missing the required field `playlist_url`", path.display()),
+        Some(u) if !u.trim().is_empty() && !is_placeholder(u) => u.to_string(),
+        _ => return Err(UrlUnset { path }.into()),
     };
     let user_agent = parse_user_agent(value.get("user_agent"), &path)?;
     let top_countries = {
@@ -90,6 +113,87 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
         }
     };
     Ok(Config { playlist_url, user_agent, top_countries })
+}
+
+fn is_placeholder(url: &str) -> bool {
+    url.to_ascii_lowercase().contains(PLACEHOLDER_HOST)
+}
+
+/// Writes the default `config.toml` into `dir` if there is none (never
+/// overwrites). Returns whether it was created.
+pub fn ensure_default(dir: &Path) -> std::io::Result<bool> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("config.toml")) {
+        Ok(mut f) => {
+            f.write_all(DEFAULT_CONFIG.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Checks a pasted playlist URL: trimmed, `http(s)://` plus a host, no
+/// whitespace or control characters. The error text never contains the input.
+pub fn validate_playlist_url(input: &str) -> Result<String, &'static str> {
+    let url = input.trim();
+    if url.is_empty() {
+        return Err("Paste the playlist URL from your provider.");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("The URL must not contain spaces or line breaks.");
+    }
+    let lower = url.to_ascii_lowercase();
+    let rest = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"));
+    match rest {
+        Some(r) if r.chars().next().is_some_and(|c| c.is_alphanumeric()) => {}
+        _ => return Err("The URL must start with http:// or https://."),
+    }
+    if is_placeholder(url) {
+        return Err("That is the example address; use the URL from your provider.");
+    }
+    Ok(url.to_string())
+}
+
+/// Sets `playlist_url` in `dir/config.toml`, changing only that line (comments
+/// and the other keys stay; a missing file is created from the default).
+/// Errors name the file, never the URL.
+pub fn set_playlist_url(dir: &Path, url: &str) -> anyhow::Result<()> {
+    let url = validate_playlist_url(url).map_err(|m| anyhow::anyhow!("{m}"))?;
+    let path = dir.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+        Err(e) => anyhow::bail!("cannot read {}: {}", path.display(), e.kind()),
+    };
+    let value = toml::Value::String(url).to_string();
+    let mut out = String::with_capacity(text.len() + value.len() + 20);
+    let mut done = false;
+    for line in text.split_inclusive('\n') {
+        let is_key = line
+            .trim_start()
+            .strip_prefix("playlist_url")
+            .is_some_and(|r| r.trim_start().starts_with('='));
+        if is_key && !done {
+            let eol = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            out.push_str(&format!("playlist_url = {value}{eol}"));
+            done = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !done {
+        out.insert_str(0, &format!("playlist_url = {value}\n"));
+    }
+    crate::fsutil::atomic_write(&path, out.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", path.display(), e.kind()))
 }
 
 #[cfg(test)]
@@ -179,5 +283,97 @@ mod tests {
         let err = format!("{:#}", load(d.path()).unwrap_err());
         assert!(err.contains("playlist_url"), "{err}");
         assert!(!err.contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn default_config_parses_with_empty_url_and_default_agent() {
+        let v: toml::Value = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(v.get("playlist_url").and_then(|u| u.as_str()), Some(""));
+        assert_eq!(v.get("user_agent").and_then(|u| u.as_str()), Some(DEFAULT_USER_AGENT));
+        assert!(v.get("top_countries").is_none());
+    }
+
+    #[test]
+    fn ensure_default_creates_once_and_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("nested");
+        assert!(ensure_default(&dir).unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("config.toml")).unwrap(), DEFAULT_CONFIG);
+        std::fs::write(dir.join("config.toml"), "playlist_url = \"http://h/x\"\n").unwrap();
+        assert!(!ensure_default(&dir).unwrap());
+        assert_eq!(load(&dir).unwrap().playlist_url, "http://h/x");
+    }
+
+    #[test]
+    fn blank_and_placeholder_urls_are_unset() {
+        let d = tempfile::tempdir().unwrap();
+        let bodies = [
+            "playlist_url = \"\"\n",
+            "playlist_url = \"  \"\n",
+            "playlist_url = \"http://example.invalid/get.php?username=USER&password=PASS\"\n",
+            "x = 1\n",
+        ];
+        for body in bodies {
+            std::fs::write(d.path().join("config.toml"), body).unwrap();
+            let err = load(d.path()).unwrap_err();
+            assert!(err.downcast_ref::<UrlUnset>().is_some(), "{body}");
+        }
+        // A broken file is not "unset".
+        std::fs::write(d.path().join("config.toml"), "playlist_url = [").unwrap();
+        assert!(load(d.path()).unwrap_err().downcast_ref::<UrlUnset>().is_none());
+        std::fs::write(d.path().join("config.toml"), "playlist_url = \"http://h/x\"\nuser_agent = 5\n").unwrap();
+        assert!(load(d.path()).unwrap_err().downcast_ref::<UrlUnset>().is_none());
+    }
+
+    #[test]
+    fn validate_playlist_url_cases() {
+        let ok = validate_playlist_url("  http://h.example/get.php?username=u&password=p \n").unwrap();
+        assert_eq!(ok, "http://h.example/get.php?username=u&password=p");
+        assert!(validate_playlist_url("HTTPS://h.example/x").is_ok());
+        for bad in ["", "   ", "h.example/x", "ftp://h/x", "http://", "http:// h/x", "http://h/a b", "http://example.invalid/x"] {
+            assert!(validate_playlist_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_playlist_url_changes_only_that_line() {
+        let d = tempfile::tempdir().unwrap();
+        ensure_default(d.path()).unwrap();
+        set_playlist_url(d.path(), "http://h.example/get.php?username=u&password=p").unwrap();
+        let text = std::fs::read_to_string(d.path().join("config.toml")).unwrap();
+        let want = DEFAULT_CONFIG.replacen(
+            "playlist_url = \"\"",
+            "playlist_url = \"http://h.example/get.php?username=u&password=p\"",
+            1,
+        );
+        assert_eq!(text, want);
+        let c = load(d.path()).unwrap();
+        assert_eq!(c.playlist_url, "http://h.example/get.php?username=u&password=p");
+        assert_eq!(c.user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn set_playlist_url_handles_crlf_missing_key_and_missing_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "# note\r\nplaylist_url   =  \"\"\r\nuser_agent = \"X/1\"\r\n").unwrap();
+        set_playlist_url(d.path(), "http://h.example/a").unwrap();
+        let want = "# note\r\nplaylist_url = \"http://h.example/a\"\r\nuser_agent = \"X/1\"\r\n";
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
+        std::fs::write(&p, "user_agent = \"X/1\"\n").unwrap();
+        set_playlist_url(d.path(), "http://h.example/b").unwrap();
+        let c = load(d.path()).unwrap();
+        assert_eq!((c.playlist_url.as_str(), c.user_agent.as_str()), ("http://h.example/b", "X/1"));
+        std::fs::remove_file(&p).unwrap();
+        set_playlist_url(d.path(), "http://h.example/c").unwrap();
+        assert_eq!(load(d.path()).unwrap().playlist_url, "http://h.example/c");
+    }
+
+    #[test]
+    fn set_playlist_url_rejects_bad_input_without_echoing_it() {
+        let d = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", set_playlist_url(d.path(), "nonsense SECRET").unwrap_err());
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(!d.path().join("config.toml").exists());
     }
 }

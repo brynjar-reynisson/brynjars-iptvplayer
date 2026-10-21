@@ -1,6 +1,6 @@
 # Build a self-contained release folder: iptv-player.exe + libmpv-2.dll +
-# config.example.toml (copy it to config.toml beside the exe and set
-# playlist_url). Usage (from anywhere):
+# config.example.toml (reference only: the app creates config.toml itself on
+# first start and asks for the playlist URL). Usage (from anywhere):
 #   powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 [-Out <dir>]
 # Default output: <repo>\dist\iptv-player (gitignored).
 param(
@@ -26,4 +26,4 @@ Copy-Item (Join-Path $repo "target\release\iptv-player.exe") $Out -Force
 Copy-Item $dll $Out -Force
 Copy-Item (Join-Path $repo "config.example.toml") $Out -Force
 Write-Host "Release folder: $Out"
-Write-Host "Next: copy config.example.toml to config.toml there and set playlist_url."
+Write-Host "Next: start iptv-player.exe there; it creates config.toml and asks for the playlist URL."
