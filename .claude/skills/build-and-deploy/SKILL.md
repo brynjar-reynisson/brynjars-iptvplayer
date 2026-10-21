@@ -9,8 +9,12 @@ The user runs the app from `dist\iptv-player\iptv-player.exe` (a pinned taskbar 
 
 ## Steps
 
-1. **Check whether the app is running.** `Get-Process iptv-player -ErrorAction SilentlyContinue`. A running exe is locked and the copy would fail.
-   - If it is running, tell the user and ask before closing it: they may be watching something. Only stop it (`Stop-Process -Name iptv-player`) after they say yes. Never kill it unasked.
+1. **Check whether the app is running from `dist\`.** Only a copy started from `dist\iptv-player\` locks the files; copies running elsewhere (e.g. an unzipped test copy) are fine:
+   ```powershell
+   $dist = (Resolve-Path dist\iptv-player).Path
+   Get-Process iptv-player -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dist\*" }
+   ```
+   - If one is listed, tell the user and ask before closing it: they may be watching something. Only stop it (`Stop-Process -Id <id>`) after they say yes. Never kill it unasked, and never touch other copies.
 2. **Make sure the tests still pass** unless the user said to skip them: `cargo test --workspace` (cargo is in `%USERPROFILE%\.cargo\bin`). Stop and report if anything fails. Do not deploy a failing build.
 3. **Build and copy:**
    ```powershell
