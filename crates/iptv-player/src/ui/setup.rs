@@ -97,7 +97,6 @@ pub fn show(ctx: &egui::Context, p: &mut UrlPrompt, config_path: &Path) -> Outco
                 if let Some(n) = &p.note {
                     ui.weak(n);
                 }
-                ui.weak(format!("It is saved in {}", config_path.display()));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can_save = !p.text.trim().is_empty();
