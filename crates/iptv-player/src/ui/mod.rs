@@ -1203,6 +1203,14 @@ impl App {
         if self.help.is_some() {
             if f1 || question || ctx.input_mut(|i| i.consume_key(M::NONE, Key::Escape)) {
                 self.help = None;
+            } else if let Some(tab) = self.help {
+                // Tab / Shift+Tab switch the card's tabs (`help::show` keeps egui's
+                // own Tab focus movement away from the widgets behind it).
+                let next = ctx.input_mut(|i| i.consume_key(M::NONE, Key::Tab));
+                let prev = ctx.input_mut(|i| i.consume_key(M::SHIFT, Key::Tab));
+                if next || prev {
+                    self.help = Some(tab.cycle(next));
+                }
             }
             return;
         }
