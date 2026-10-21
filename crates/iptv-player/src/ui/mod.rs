@@ -44,7 +44,7 @@ use crate::state::next::{continue_target, next_episode, shift_right, show_episod
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
-    visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
+    playing_title, visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::seek::{self, SeekState};
@@ -1753,7 +1753,11 @@ impl App {
                     };
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
                     let gone = if pb.in_playlist() { "" } else { "  (not in playlist)" };
-                    let mut title = format!("{}{fav}{gone}", pb.name());
+                    let base = pb
+                        .entry_index()
+                        .and_then(|e| playing_title(pb.library(), e, |show| self.titles.get(show)))
+                        .unwrap_or_else(|| pb.name().to_string());
+                    let mut title = format!("{base}{fav}{gone}");
                     if let Some(next) = self.zap.pending() {
                         title = format!("{title}  →  {}…", next.name());
                     }
@@ -1764,6 +1768,8 @@ impl App {
                     let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
                     let since = self.cursor_moved.elapsed().min(self.title_changed.elapsed());
                     let show_title = cursor::title_visible(fs, since);
+                    // In fullscreen the buttons go with the title (the subtitle menu keeps them).
+                    let chrome = show_title || self.sub_menu;
                     if fs && show_title {
                         ui.ctx().request_repaint_after(cursor::TITLE_SHOW.saturating_sub(since));
                     }
@@ -1780,7 +1786,7 @@ impl App {
                     // Fullscreen button: a square outline (no symbol fonts), bottom right.
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 32.0), egui::vec2(32.0, 26.0));
                     // Subtitle button ("CC"), movies and episodes only, left of the play/pause button.
-                    if !pb.is_live() {
+                    if chrome && !pb.is_live() {
                         let sbtn = btn.translate(egui::vec2(-76.0, 0.0));
                         let s_resp = ui.interact(sbtn, egui::Id::unique("sub_btn"), egui::Sense::click());
                         let tracks = if self.sub_menu || s_resp.hovered() { p.sub_tracks() } else { Vec::new() };
@@ -1876,34 +1882,37 @@ impl App {
                         }
                     }
                     // Play/pause button, left of it: shows the action a click performs.
-                    let pbtn = btn.translate(egui::vec2(-38.0, 0.0));
-                    let pb_resp = ui.interact(pbtn, egui::Id::unique("pause_btn"), egui::Sense::click());
-                    let paused = p.paused();
-                    let pa = if pb_resp.hovered() { 230 } else { 140 };
-                    let pp = ui.painter_at(rect);
-                    pp.rect_filled(pbtn, 4.0, egui::Color32::from_black_alpha(pa / 2));
-                    let white = egui::Color32::from_white_alpha(pa);
-                    let c = pbtn.center();
-                    if paused {
-                        pp.add(egui::Shape::convex_polygon(
-                            vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(-5.0, 8.0), c + egui::vec2(7.0, 0.0)],
-                            white,
-                            egui::Stroke::NONE,
-                        ));
-                    } else {
-                        for dx in [-6.0, 2.0] {
-                            pp.rect_filled(egui::Rect::from_min_size(c + egui::vec2(dx, -8.0), egui::vec2(4.0, 16.0)), 0.0, white);
+                    if chrome {
+                        let pbtn = btn.translate(egui::vec2(-38.0, 0.0));
+                        let pb_resp = ui.interact(pbtn, egui::Id::unique("pause_btn"), egui::Sense::click());
+                        let paused = p.paused();
+                        let pa = if pb_resp.hovered() { 230 } else { 140 };
+                        let pp = ui.painter_at(rect);
+                        pp.rect_filled(pbtn, 4.0, egui::Color32::from_black_alpha(pa / 2));
+                        let white = egui::Color32::from_white_alpha(pa);
+                        let c = pbtn.center();
+                        if paused {
+                            pp.add(egui::Shape::convex_polygon(
+                                vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(-5.0, 8.0), c + egui::vec2(7.0, 0.0)],
+                                white,
+                                egui::Stroke::NONE,
+                            ));
+                        } else {
+                            for dx in [-6.0, 2.0] {
+                                pp.rect_filled(egui::Rect::from_min_size(c + egui::vec2(dx, -8.0), egui::vec2(4.0, 16.0)), 0.0, white);
+                            }
                         }
-                    }
-                    if pb_resp.on_hover_text(if paused { "Play (Space)" } else { "Pause (Space)" }).clicked() {
-                        toggle_pause = true;
+                        if pb_resp.on_hover_text(if paused { "Play (Space)" } else { "Pause (Space)" }).clicked() {
+                            toggle_pause = true;
+                        }
                     }
                     // Next episode button (">>" as two triangles), left of "CC":
                     // episodes with a next one only; hidden when it would not fit
                     // inside the video rect.
                     let nbtn = btn.translate(egui::vec2(-114.0, 0.0));
                     let fits = nbtn.left() >= rect.left() + 4.0 && nbtn.top() >= rect.top() + 4.0;
-                    if fits
+                    if chrome
+                        && fits
                         && !pb.is_live()
                         && self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some()
                     {
@@ -1924,19 +1933,21 @@ impl App {
                             next_clicked = true;
                         }
                     }
-                    let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
-                    let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-                    let alpha = if b.hovered() { 230 } else { 140 };
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(btn, 4.0, egui::Color32::from_black_alpha(alpha / 2));
-                    painter.rect_stroke(
-                        btn.shrink2(egui::vec2(8.0, 6.0)),
-                        1.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_white_alpha(alpha)),
-                        egui::StrokeKind::Inside,
-                    );
-                    if b.on_hover_text(if fs { "Leave full screen (Esc)" } else { "Full screen (F11)" }).clicked() {
-                        self.set_fullscreen(ui.ctx(), !fs);
+                    if chrome {
+                        let b = ui.interact(btn, egui::Id::unique("fullscreen_btn"), egui::Sense::click());
+                        let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        let alpha = if b.hovered() { 230 } else { 140 };
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(btn, 4.0, egui::Color32::from_black_alpha(alpha / 2));
+                        painter.rect_stroke(
+                            btn.shrink2(egui::vec2(8.0, 6.0)),
+                            1.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_white_alpha(alpha)),
+                            egui::StrokeKind::Inside,
+                        );
+                        if b.on_hover_text(if fs { "Leave full screen (Esc)" } else { "Full screen (F11)" }).clicked() {
+                            self.set_fullscreen(ui.ctx(), !fs);
+                        }
                     }
                     if self.autoplay.offering() {
                         offer = self.next_episode_offer(ui, btn);
@@ -2308,6 +2319,14 @@ impl eframe::App for App {
         // path that opens a show (click, Enter, rebase).
         if let Some(o) = self.series.open() {
             self.titles.request(&o.name);
+        }
+        // The playing episode's show too (its overlay title includes the episode name).
+        let playing_show = self.playback.as_ref().and_then(|pb| {
+            let e = pb.entry_index()?;
+            show_of(pb.library(), e).map(|s| pb.library().shows()[s].name.clone())
+        });
+        if let Some(name) = playing_show {
+            self.titles.request(&name);
         }
 
         if let Some(tab) = &mut self.help {

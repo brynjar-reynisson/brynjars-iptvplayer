@@ -209,6 +209,20 @@ pub fn episode_text(lib: &Library, show: usize, entry: usize, titles: Option<&Ti
     label
 }
 
+/// Overlay title of a playing sorted episode: `Show  ·  S01E02 - Title` (the
+/// title once `get_titles` has it). `None` for live, movies, `(Unsorted)` and
+/// entries that are not in a show; callers then use the entry name.
+pub fn playing_title(
+    lib: &Library,
+    entry: usize,
+    get_titles: impl Fn(&str) -> Option<Arc<Titles>>,
+) -> Option<String> {
+    let show = super::next::show_of(lib, entry)?;
+    let name = &lib.shows()[show].name;
+    let titles = get_titles(name);
+    Some(format!("{name}  ·  {}", episode_text(lib, show, entry, titles.as_deref())))
+}
+
 // ---- background search ----------------------------------------------------
 
 pub struct SearchRequest {
@@ -794,6 +808,17 @@ pub(crate) mod tests {
         let t = titles_for(1, 2, "The Visit");
         assert_eq!(episode_text(&lib, qh, 3, Some(&t)), "S01E02 - The Visit");
         assert_eq!(episode_text(&lib, qh, 5, Some(&t)), "S02E01", "no title for that episode");
+    }
+
+    #[test]
+    fn playing_title_names_show_and_episode() {
+        let lib = vod_lib();
+        let t = Arc::new(titles_for(1, 2, "The Visit"));
+        let with = |_: &str| Some(t.clone());
+        assert_eq!(playing_title(&lib, 3, with).unwrap(), "Quiet Harbor  ·  S01E02 - The Visit");
+        assert_eq!(playing_title(&lib, 3, |_| None).unwrap(), "Quiet Harbor  ·  S01E02");
+        assert_eq!(playing_title(&lib, 7, |_| None), None, "unsorted keeps the entry name");
+        assert_eq!(playing_title(&lib, 0, |_| None), None, "not an episode");
     }
 
     #[test]
