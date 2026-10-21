@@ -19,6 +19,13 @@ impl HelpTab {
         }
     }
 
+    /// The tab after (`forward`) or before this one, wrapping (Tab / Shift+Tab).
+    pub fn cycle(self, forward: bool) -> HelpTab {
+        let n = Self::ALL.len();
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    }
+
     pub fn sections(self) -> &'static [Section] {
         match self {
             HelpTab::Keys => KEYS,
@@ -46,7 +53,7 @@ pub const KEYS: &[Section] = &[
     Section {
         title: "Everywhere",
         rows: &[
-            row("F1  ?", "Show / hide this help (? when not typing)"),
+            row("F1  ?", "Show / hide this help (? when not typing); Tab / Shift+Tab switch its tabs"),
             row("F5", "Refresh the playlist"),
             row("Ctrl+F  /", "Focus the channel filter (Movies/Series: the search box)"),
             row("F11  Alt+Enter", "Full screen on / off"),
@@ -117,6 +124,14 @@ pub const SETTINGS: &[Section] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_wraps_both_ways() {
+        assert_eq!(HelpTab::Keys.cycle(true), HelpTab::Settings);
+        assert_eq!(HelpTab::Settings.cycle(true), HelpTab::Keys);
+        assert_eq!(HelpTab::Keys.cycle(false), HelpTab::Settings);
+        assert_eq!(HelpTab::Settings.cycle(false), HelpTab::Keys);
+    }
 
     #[test]
     fn every_section_has_rows_and_text() {

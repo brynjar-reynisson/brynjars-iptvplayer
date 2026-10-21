@@ -60,7 +60,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 
 - **Help:** the **?** button at the right of the top bar (or **F1**, or **?** when not typing)
   opens a card listing the keyboard shortcuts per screen (Keys tab) and the configuration
-  options, flags and data folder (Settings tab). Playback continues underneath. **Esc**, **F1**,
+  options, flags and data folder (Settings tab). Playback continues underneath. **Tab** / **Shift+Tab** switch between the tabs. **Esc**, **F1**,
   **?** or a click outside close it.
 - Tabs: **Live** (countries A-Z, then channels), **Favorites**, **Movies**, **Series**
   (show, then seasons, then episodes).

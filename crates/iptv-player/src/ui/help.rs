@@ -5,6 +5,10 @@ use eframe::egui;
 
 use crate::state::help::HelpTab;
 
+fn focus_id() -> egui::Id {
+    egui::Id::unique("help_focus")
+}
+
 /// Draws the card; returns false when it should close (click outside, X).
 pub fn show(ctx: &egui::Context, tab: &mut HelpTab) -> bool {
     let mut open = true;
@@ -30,6 +34,20 @@ pub fn show(ctx: &egui::Context, tab: &mut HelpTab) -> bool {
         .fixed_size([width, height])
         .open(&mut open)
         .show(ctx, |ui| {
+            // Keyboard focus lives on the card and keeps Tab: egui would otherwise
+            // move focus between the widgets behind it. `App::handle_keys` reads Tab.
+            let anchor = ui.interact(
+                egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(1.0, 1.0)),
+                focus_id(),
+                egui::Sense::focusable_noninteractive(),
+            );
+            ctx.memory_mut(|m| {
+                m.request_focus(anchor.id);
+                m.set_focus_lock_filter(
+                    anchor.id,
+                    egui::EventFilter { tab: true, horizontal_arrows: false, vertical_arrows: false, escape: false },
+                );
+            });
             ui.horizontal(|ui| {
                 for t in HelpTab::ALL {
                     if ui.selectable_label(*tab == t, t.label()).clicked() {
@@ -55,4 +73,46 @@ pub fn show(ctx: &egui::Context, tab: &mut HelpTab) -> bool {
         });
     let _ = win;
     open && !backdrop_clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tab_event(shift: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE },
+        }
+    }
+
+    /// Tab must not move keyboard focus to the widgets behind the card.
+    #[test]
+    fn tab_keeps_focus_on_the_card() {
+        let ctx = egui::Context::default();
+        let mut tab = HelpTab::Keys;
+        let behind = std::cell::Cell::new(None);
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let mut out = ctx.run_pass(input, |ctx| {
+                egui::Area::new(egui::Id::unique("behind_area")).show(ctx, |ui| {
+                    behind.set(Some(ui.button("behind").id));
+                });
+                show(ctx, &mut tab);
+            });
+            out.textures_delta.clear();
+        };
+        frame(vec![]);
+        frame(vec![]);
+        assert!(ctx.memory(|m| m.has_focus(focus_id())));
+        for shift in [false, true, false] {
+            frame(vec![tab_event(shift)]);
+            frame(vec![]);
+            assert!(ctx.memory(|m| m.has_focus(focus_id())), "focus left the card");
+            assert!(!ctx.memory(|m| m.has_focus(behind.get().unwrap())));
+        }
+    }
 }
