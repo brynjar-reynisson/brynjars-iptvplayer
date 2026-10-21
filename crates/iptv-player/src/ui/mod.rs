@@ -9,6 +9,7 @@
 //! there (no zap), click/Enter play at once, as VOD.
 
 pub mod fonts;
+pub mod help;
 pub mod live;
 pub mod player;
 pub mod previews;
@@ -34,6 +35,7 @@ use iptv::supervisor::Status;
 use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
 use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
+use crate::state::help::HelpTab;
 use crate::state::live::LiveBrowser;
 use crate::state::next::{continue_target, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
@@ -172,6 +174,8 @@ struct App {
     /// Next episode of the playing one, for the ">>" button (cached: the
     /// lookup scans every show).
     next_cache: NextCache,
+    /// The help card is open (on this tab).
+    help: Option<HelpTab>,
     /// The subtitle menu above the video is open.
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
@@ -276,6 +280,7 @@ impl App {
             key_seek: None,
             autoplay: Autoplay::new(),
             next_cache: NextCache::default(),
+            help: None,
             sub_menu: false,
             sub_cursor: 0,
             sub_follow: false,
@@ -1102,6 +1107,15 @@ impl App {
 
     // ---- input -------------------------------------------------------------
 
+    fn open_help(&mut self, ctx: &egui::Context) {
+        // Drop keyboard focus from the text boxes so typing does not land in them.
+        for id in [filter_id(), vod::movie_search_id(), vod::series_search_id()] {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+        self.sub_menu = false;
+        self.help = Some(HelpTab::Keys);
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers as M};
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
@@ -1110,6 +1124,27 @@ impl App {
         let focused = [filter_id(), vod::movie_search_id(), vod::series_search_id()]
             .into_iter()
             .find(|id| ctx.memory(|m| m.has_focus(*id)));
+        // Help card: F1 or ? (not while typing) toggles it. While open it owns
+        // the keyboard: Esc/F1/? close it, nothing else reaches the app.
+        let question = ctx.input_mut(|i| {
+            let q = i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"));
+            if q {
+                // Shift+/ would otherwise also count as the "/" filter key.
+                i.consume_key(M::SHIFT, Key::Slash);
+            }
+            q
+        });
+        let f1 = ctx.input_mut(|i| i.consume_key(M::NONE, Key::F1));
+        if self.help.is_some() {
+            if f1 || question || ctx.input_mut(|i| i.consume_key(M::NONE, Key::Escape)) {
+                self.help = None;
+            }
+            return;
+        }
+        if f1 || (question && focused.is_none() && !ctx.egui_wants_keyboard_input()) {
+            self.open_help(ctx);
+            return;
+        }
         // F11 / Alt+Enter: before plain Enter is consumed below.
         let toggle_fs = ctx.input_mut(|i| i.consume_key(M::NONE, Key::F11) | i.consume_key(M::ALT, Key::Enter));
         let (up, down, enter, esc, f5, ctrl_f) = ctx.input_mut(|i| {
@@ -1376,6 +1411,9 @@ impl App {
                     if r.changed() {
                         self.set_filter(text);
                     }
+                }
+                if ui.button("?").on_hover_text("Keyboard shortcuts and settings (F1)").clicked() {
+                    self.open_help(ui.ctx());
                 }
             });
         });
@@ -2153,6 +2191,12 @@ impl eframe::App for App {
         // path that opens a show (click, Enter, rebase).
         if let Some(o) = self.series.open() {
             self.titles.request(&o.name);
+        }
+
+        if let Some(tab) = &mut self.help {
+            if !help::show(&ctx, tab) {
+                self.help = None;
+            }
         }
 
         let spent = frame_start.elapsed();

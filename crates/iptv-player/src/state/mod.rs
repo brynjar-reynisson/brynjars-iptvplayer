@@ -5,6 +5,7 @@ pub mod autoplay;
 pub mod credits;
 pub mod data;
 pub mod favs;
+pub mod help;
 pub mod live;
 pub mod nav;
 pub mod next;
