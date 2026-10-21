@@ -13,7 +13,7 @@ Rust Windows desktop IPTV player (browse + play in one window, with persistent s
 
 ## Build / run
 - Toolchain: Rust stable, MSVC (`rustup default stable-x86_64-pc-windows-msvc`; needs VS Build Tools with the C++ workload). Run cargo from a normal shell with `%USERPROFILE%\.cargo\bin` on PATH.
-- User docs: `README.md` (setup, keys, flags, known limitations). Release folder: `scripts/package-release.ps1 [-Out <dir>]` builds release and copies `iptv-player.exe` + `libmpv-2.dll` + `config.example.toml` to `dist/iptv-player/` (gitignored). Verified: that folder runs standalone (exe + DLL + `config.toml`, PATH reduced to System32; data dir = exe folder).
+- User docs: `README.md` (setup, keys, flags, known limitations). Release folder: `scripts/package-release.ps1 [-Out <dir>]` builds release and copies `iptv-player.exe` + `libmpv-2.dll` + `config.example.toml` + `LICENSE` to `dist/iptv-player/` and zips exe + DLL + LICENSE to `dist/iptv-player.zip` (gitignored). Verified: that folder runs standalone (exe + DLL + `config.toml`, PATH reduced to System32; data dir = exe folder).
 - Line endings: `.gitattributes` has `* text=auto eol=lf`. Some files are committed with CRLF (e.g. `mpv_backend.rs`, `cache.rs`, `redact.rs`, `series.rs`, the spec); git leaves CRLF blobs alone under `text=auto`, so keep each file's existing endings when editing (Git Bash `sed -i` strips CR: avoid it on CRLF files) and do not mass-renormalise.
 - Workspace: `crates/iptv` (library: parsing, config, redaction, ...) and `crates/iptv-player` (egui binary).
 - Series: `iptv::series` groups Kind::Series entries into shows/seasons (strips 2-letter language prefixes like `NC - `/`SE:`/`Vod:`, keeps year in show name, unparsed go to `(Unsorted)`); exposed via `Library::shows()`.

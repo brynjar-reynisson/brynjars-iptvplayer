@@ -42,7 +42,7 @@ until you pick something else.
 `powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 [-Out <dir>]` builds
 the release binary and writes a self-contained folder (default `dist\iptv-player\`, which
 is gitignored) with `iptv-player.exe`, `libmpv-2.dll` and `config.example.toml`. The folder
-runs on its own, and `dist\iptv-player.zip` (exe + DLL only) is the file to hand out or upload
+runs on its own, and `dist\iptv-player.zip` (exe + DLL + LICENSE) is the file to hand out or upload
 to a GitHub release: unzip it anywhere and start the exe. The first start creates `config.toml`
 and asks for the playlist URL. The exe
 and the DLL are the only files needed at runtime (`config.example.toml` is just a reference).
