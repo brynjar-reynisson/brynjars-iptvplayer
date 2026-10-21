@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 iptv = { path = "../iptv" }
 anyhow = "1"
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "wayland", "x11"] }
 libmpv2-sys = "4.0.1"
 png = "0.18"
 
