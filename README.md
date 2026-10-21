@@ -181,3 +181,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   bar opens it again).
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.
+
+## License
+
+MIT, see `LICENSE`. The release zip also contains `libmpv-2.dll` (mpv), which has its own license terms (LGPL/GPL, depending on the build): see <https://mpv.io/>.
