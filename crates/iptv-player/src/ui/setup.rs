@@ -29,7 +29,7 @@ impl Problem {
 /// What the user did this frame.
 pub enum Outcome {
     None,
-    /// "Save and load" with the (unvalidated) text.
+    /// "Save" with the (unvalidated) text.
     Save(String),
     /// Broken file: read it again.
     Reload,
@@ -101,7 +101,7 @@ pub fn show(ctx: &egui::Context, p: &mut UrlPrompt, config_path: &Path) -> Outco
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can_save = !p.text.trim().is_empty();
-                    if ui.add_enabled(can_save, egui::Button::new("Save and load")).clicked() || (enter && can_save) {
+                    if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() || (enter && can_save) {
                         out = Outcome::Save(p.text.clone());
                     }
                     if ui.button("Quit").clicked() {
