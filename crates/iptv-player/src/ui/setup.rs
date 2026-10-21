@@ -76,7 +76,7 @@ pub fn show(ctx: &egui::Context, p: &mut UrlPrompt, config_path: &Path) -> Outco
             Problem::Unset => {
                 ui.heading("Playlist URL needed");
                 ui.add_space(6.0);
-                ui.label("Paste the M3U playlist URL from your IPTV provider. Without it nothing can be played.");
+                ui.label("Paste the M3U playlist URL from your IPTV provider. Without it, there is nothing to play.");
                 ui.add_space(8.0);
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut p.text)

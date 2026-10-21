@@ -19,7 +19,7 @@ until you pick something else.
 4. **Config**: the first start creates `config.toml` beside the exe (or in the data dir, see
    below) with the default values (the text of `config.example.toml`), and a dialog asks for
    your provider's M3U URL: paste it and press Enter (or **Save**). **Quit** closes
-   the app, since nothing can be played without it. The dialog appears whenever `playlist_url`
+   the app, since there is nothing to play without it (a cached playlist is ignored until a URL is saved). The dialog appears whenever `playlist_url`
    is empty (or still the example address), and the URL is written into `config.toml`, which
    keeps the rest of the file as it is. You can also edit the file by hand. `config.toml`
    holds your credentials. It is gitignored, so never commit it. With `--playlist-file`

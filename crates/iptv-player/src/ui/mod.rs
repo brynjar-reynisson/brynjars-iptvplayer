@@ -359,6 +359,14 @@ impl App {
         for a in actions {
             match a {
                 Action::LoadCache => {
+                    // No usable playlist URL: a cached library would be misleading
+                    // behind the prompt. Treat it as "no cache"; saving the URL
+                    // starts a normal refresh.
+                    if self.url_prompt.is_some() {
+                        let a = self.data.on_cache_loaded(None, SystemTime::now());
+                        self.run_actions(a);
+                        continue;
+                    }
                     let (tx, rx) = channel();
                     let dir = self.data_dir.clone();
                     let ctx = self.ctx.clone();
