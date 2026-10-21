@@ -8,6 +8,7 @@
 //! searches run on a `SearchWorker` thread; Up/Down only move the cursor
 //! there (no zap), click/Enter play at once, as VOD.
 
+pub mod fonts;
 pub mod live;
 pub mod player;
 pub mod previews;
@@ -92,7 +93,6 @@ enum View {
 /// How often the position of a playing movie/episode is written to disk.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(15);
 
-/// `h:mm:ss` / `m:ss` for a position in seconds.
 /// Show name and favorite key of the episode `pb` plays, for the recent-series
 /// history; `None` for live, movies and `(Unsorted)` episodes.
 fn recent_id(pb: &Playback) -> Option<(String, String)> {
@@ -105,6 +105,7 @@ fn recent_id(pb: &Playback) -> Option<(String, String)> {
     Some((lib.shows()[show].name.clone(), pb.key().to_string()))
 }
 
+/// `h:mm:ss` / `m:ss` for a position in seconds.
 fn clock(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 {
@@ -175,6 +176,8 @@ struct App {
     sub_menu: bool,
     /// Highlighted row of the subtitle menu (0 = Off, then the tracks).
     sub_cursor: usize,
+    /// Scroll the subtitle menu to `sub_cursor` on the next draw (keyboard moves).
+    sub_follow: bool,
     /// Where movies/episodes stopped (`positions.json`), for resuming.
     positions: Positions,
     /// Last time the playing position was written to disk.
@@ -241,6 +244,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> App {
+        fonts::install_fallbacks(&cc.egui_ctx);
         let (source, status) = resolve_source(&opts.data_dir, &opts.playlist_file);
         let (user_agent, top_countries) = configured_prefs(&opts.data_dir);
         let (data, actions) = DataState::new(status);
@@ -274,6 +278,7 @@ impl App {
             next_cache: NextCache::default(),
             sub_menu: false,
             sub_cursor: 0,
+            sub_follow: false,
             positions,
             positions_saved: Instant::now(),
             recent,
@@ -739,6 +744,7 @@ impl App {
         if self.sub_menu {
             let current = self.player.as_ref().ok().and_then(Player::current_sub);
             self.sub_cursor = self.sub_rows().iter().position(|r| *r == current).unwrap_or(0);
+            self.sub_follow = true;
         }
     }
 
@@ -753,6 +759,7 @@ impl App {
         let rows = self.sub_rows();
         let n = rows.len();
         self.sub_cursor = self.sub_cursor.min(n - 1);
+        self.sub_follow |= up || down;
         if up {
             self.sub_cursor = (self.sub_cursor + n - 1) % n;
         }
@@ -1646,6 +1653,7 @@ impl App {
                             toggle_sub = true;
                         }
                         if self.sub_menu {
+                            let follow = std::mem::take(&mut self.sub_follow);
                             let area = egui::Area::new(egui::Id::unique("sub_menu"))
                                 .order(egui::Order::Foreground)
                                 .pivot(egui::Align2::RIGHT_BOTTOM)
@@ -1657,6 +1665,10 @@ impl App {
                                         .corner_radius(6.0)
                                         .inner_margin(6.0)
                                         .show(ui, |ui| {
+                                          // Many tracks: scroll inside the space above the button
+                                          // instead of growing over the controls.
+                                          let max_h = (sbtn.top() - rect.top() - 30.0).max(104.0);
+                                          egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
                                             let labels: Vec<(Option<i64>, String)> =
                                                 std::iter::once((None, "Off".to_string()))
                                                     .chain(tracks.iter().map(|t| (Some(t.id), subtitles::label(t))))
@@ -1669,6 +1681,9 @@ impl App {
                                                 }
                                                 if i == self.sub_cursor {
                                                     ui.painter().rect_filled(row, 4.0, egui::Color32::from_white_alpha(45));
+                                                    if follow {
+                                                        resp.scroll_to_me(None);
+                                                    }
                                                 }
                                                 ui.painter().text(
                                                     row.left_center() + egui::vec2(8.0, 0.0),
@@ -1695,6 +1710,7 @@ impl App {
                                                         .color(egui::Color32::from_white_alpha(150)),
                                                 );
                                             }
+                                          });
                                         });
                                 });
                             let outside = ui.ctx().input(|i| i.pointer.any_pressed())
