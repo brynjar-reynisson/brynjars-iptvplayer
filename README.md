@@ -111,13 +111,13 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   first scene after the intro (also **Enter** in the full player view or full screen; in the
   list view Enter keeps its usual meaning); **Esc** or **Cancel** hides it for that episode. The
   intro is found by comparing small frames of the episode's first 4 minutes with another
-  episode of the same show (the next one, else the previous one), over an extra provider
-  connection while it scans, opened right after the episode starts. The first time for a show
-  both episodes are scanned (about a minute or two, so the button can come late or after the
-  intro has already ended); the result is kept per show in `intros.json`, so later episodes only
-  scan themselves (about a minute). Shows without a repeating intro, a
-  failed scan or a refused connection just give no button. Movies, live TV and unsorted
-  episodes are never scanned.
+  episode of the same show (the next one, else the previous one), over up to 4 extra provider
+  connections in parallel while it scans, opened right after the episode starts. The first time
+  for a show both episodes are scanned (about 30 s, so the button can come a little late); the
+  intro part is kept per show in `intros.json`, so later episodes only scan themselves (about
+  15 s). Shows without a repeating intro, a failed scan or refused connections just give no
+  button. Movies, live TV, unsorted episodes and episodes resumed after their first 4 minutes
+  are never scanned.
 - Episode titles: when you open a show, titles (`S01E02 - Title`) are looked up on TVmaze
   (needs internet; only the show name is sent) and cached in `episode-titles.json` beside the
   other data files (kept 30 days; not-found results 1 day). Obscure or Nordic shows may not be
@@ -159,12 +159,14 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   saves the frames that the "Next episode" credits check looked at, as PNG files under
   `scan-frames/<episode>-<time>/` in the data directory (named `NN_<seconds>s_<L>.png`,
   L = C credits, B black, K card such as an end logo, X content), and prints that folder. Useful for tuning the check
-  on real shows; delete the folder when done. For series episodes it also saves the first
-  5 minutes, one frame per second, under `scan-frames/<episode> head-<time>/` (intro material).
+  on real shows; delete the folder when done. The Skip intro scans also save their frames,
+  under `scan-frames/<episode> intro-<time>/` (`intro-ref` for the other episode compared with),
+  named `<seconds>s_<L>.png`.
 - `cargo run --release -p iptv-player --example intro_check -- --data-dir <dir> --name <text>
-  --ref <text>` scans two cached episodes headlessly and prints the intro span the Skip intro
-  matcher finds; `--example head_frames` saves the first minutes of one entry as PNG files.
-  Both use one provider connection at a time (close the app first) and never print a URL.
+  --ref <text>` scans two cached episodes headlessly (4 parallel connections, like the app) and
+  prints the intro span the Skip intro matcher finds and how long it took; `--example head_frames`
+  saves the first minutes of one entry as PNG files over one connection. Close the app first;
+  neither prints a URL.
 - `--playlist-file <path.m3u>` parses a local M3U file instead of downloading
   `playlist_url` (no `config.toml` needed). F5 reads the file again.
 - Startup timings and slow frames (> 25 ms) are printed to stderr.
@@ -202,8 +204,10 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   bar opens it again).
 - Skip intro: only intros that look the same in two episodes are found (not cold opens later
   than ~4 minutes, nor intros that change every episode), and frames come from keyframes, so
-  the jump can land a second or two off. The scan uses its own provider connection while it
-  runs, next to the playing stream (and the preview connection if the seek bar is hovered).
+  the jump can land a second or two off. The scan uses up to 4 provider connections of its own
+  while it runs, next to the playing stream (and the preview connection if the seek bar is
+  hovered); a provider with a low connection limit may refuse some (the others carry on) or all
+  of them (no button).
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.
 
