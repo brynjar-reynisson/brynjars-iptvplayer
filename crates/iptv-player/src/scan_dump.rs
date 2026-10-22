@@ -68,6 +68,19 @@ pub fn encode_png(thumb: &Thumb) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// File name of a head-scan frame: the time zero-padded (the folder sorts in
+/// time order) and the letter, e.g. `0094s_X.png`.
+pub fn head_file_name(secs: f64, kind: FrameKind) -> String {
+    format!("{secs:04.0}s_{}.png", kind_letter(Some(kind)))
+}
+
+/// Saves one head-scan frame into `dir` (created if needed). Error text only.
+pub fn write_head_frame(dir: &Path, secs: f64, kind: FrameKind, thumb: &Thumb) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let png = encode_png(thumb)?;
+    std::fs::write(dir.join(head_file_name(secs, kind)), png).map_err(|e| e.to_string())
+}
+
 /// Writes every sample that has a frame in `frames` (keyed by the time's
 /// bits) into `dir`, numbered in time order. Returns how many were written
 /// and the first error (its text only: no path). Never panics on I/O errors.
@@ -146,6 +159,7 @@ mod tests {
         assert_eq!(kind_letter(Some(FrameKind::Content)), 'X');
         assert_eq!(kind_letter(Some(FrameKind::Card)), 'K');
         assert_eq!(file_name(51, 3558.0, FrameKind::Card), "51_3558s_K.png");
+        assert_eq!(head_file_name(94.0, FrameKind::Content), "0094s_X.png");
     }
 
     #[test]

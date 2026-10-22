@@ -292,11 +292,20 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                         memo,
                         |t| match m.frame_at(t, SEEK_TIMEOUT) {
                             Ok(th) => {
-                                let kind = classify(&th.rgba, th.width, th.height);
-                                if dump.is_some() {
-                                    frames.insert(t.to_bits(), th);
+                                let frame_kind = classify(&th.rgba, th.width, th.height);
+                                match (&*dump, *kind) {
+                                    // A head scan is slow and may be cut short: save each frame at once.
+                                    (Some(dir), ScanKind::Head) => {
+                                        if let Err(e) = scan_dump::write_head_frame(dir, t, frame_kind, &th) {
+                                            eprintln!("head scan: could not save frame: {e}");
+                                        }
+                                    }
+                                    (Some(_), ScanKind::Tail) => {
+                                        frames.insert(t.to_bits(), th);
+                                    }
+                                    _ => {}
                                 }
-                                Some(kind)
+                                Some(frame_kind)
                             }
                             Err(e) => {
                                 eprintln!("tail scan: {e}");
@@ -320,7 +329,7 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                                     continue;
                                 }
                             }
-                            if let Some(dir) = dump {
+                            if let (Some(dir), ScanKind::Tail) = (&*dump, *kind) {
                                 let (_, err) = scan_dump::write_frames(dir, &samples, frames);
                                 if let Some(e) = err {
                                     eprintln!("tail scan: could not save frames: {e}");
