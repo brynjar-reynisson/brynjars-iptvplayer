@@ -1,3 +1,4 @@
+pub mod intro_scan;
 pub mod mpv_backend;
 pub mod scan_dump;
 pub mod state;
