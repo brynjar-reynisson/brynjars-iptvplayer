@@ -5,6 +5,9 @@ pub const INTRO_STEP_SECS: f64 = 4.0;
 pub const INTRO_SCAN_SECS: f64 = 240.0;
 pub const MIN_INTRO_SECS: f64 = 20.0;
 pub const MATCH_DIST: f64 = 12.0;
+/// Frames whose brightest and darkest cell differ by less than this are flat
+/// (black cards; a 16x9 average erases even small text on them).
+pub const BLANK_RANGE: u8 = 24;
 
 const COLS: usize = 16;
 const ROWS: usize = 9;
@@ -73,6 +76,13 @@ pub fn is_informative(fp: &Fingerprint) -> bool {
     let min = *fp.0.iter().min().unwrap_or(&0) as f64;
     let max = *fp.0.iter().max().unwrap_or(&0) as f64;
     mean(fp) >= 20.0 && max - min >= 24.0
+}
+
+/// A flat frame (a black or plain card): `max - min < BLANK_RANGE`.
+pub fn is_blank(fp: &Fingerprint) -> bool {
+    let min = *fp.0.iter().min().unwrap_or(&0);
+    let max = *fp.0.iter().max().unwrap_or(&0);
+    max - min < BLANK_RANGE
 }
 
 /// Mean absolute difference.
@@ -204,6 +214,21 @@ pub fn find_intro_pair(
 
 #[cfg(test)]
 mod tests {
+    fn with_range(base: u8, range: u8) -> Fingerprint {
+        let mut a = [base; 144];
+        a[0] = base.saturating_add(range);
+        Fingerprint(a)
+    }
+
+    #[test]
+    fn blank_is_a_flat_frame() {
+        assert!(is_blank(&with_range(0, 3)));
+        assert!(is_blank(&with_range(0, 23)));
+        assert!(!is_blank(&with_range(0, 24)));
+        assert!(!is_blank(&with_range(10, 81)));
+        assert!(!is_blank(&with_range(10, 102)));
+    }
+
     use super::*;
 
     /// Pseudo-random bytes per seed: different seeds differ by far more than

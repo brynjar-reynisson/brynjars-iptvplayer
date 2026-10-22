@@ -1,8 +1,6 @@
 //! Skip-intro flow (pure). See the module tests for the sequence.
 
-use iptv::intro::{find_intro, find_intro_pair, scan_times, Prints, INTRO_STEP_SECS};
-
-use super::credits::FrameKind;
+use iptv::intro::{find_intro, find_intro_pair, is_blank, scan_times, Prints, INTRO_STEP_SECS};
 
 pub const REFINE_SECS: f64 = 24.0;
 pub const MAX_EXTEND_SECS: f64 = 20.0;
@@ -46,18 +44,19 @@ pub fn intro_window(mut prints: Prints, start: f64, end: f64) -> Prints {
     prints
 }
 
-/// Where to jump to: the first content frame after the intro's end card
-/// (black/card/credits), if within `MAX_EXTEND_SECS` of `span_end`; else `span_end`.
-pub fn skip_target(span_end: f64, kinds: &[(f64, Option<FrameKind>)]) -> f64 {
+/// Where to jump to: the first non-blank frame after the intro's end card
+/// (a run of blank frames), if within `MAX_EXTEND_SECS` of `span_end`; else
+/// `span_end`. Based on the fingerprints (flat = card), not the credits
+/// classifier: a dim opening shot reads as "credits" but is not a card.
+pub fn skip_target(span_end: f64, prints: &Prints) -> f64 {
     let from = span_end - INTRO_STEP_SECS / 2.0;
     let mut card = false;
-    for &(t, k) in kinds.iter().filter(|(t, _)| *t >= from) {
-        match k {
-            Some(FrameKind::Content) if card => {
-                return if t - span_end <= MAX_EXTEND_SECS { t } else { span_end };
-            }
-            Some(FrameKind::Black | FrameKind::Card | FrameKind::Credits) => card = true,
-            _ => {}
+    for (t, fp) in prints.iter().filter(|(t, _)| *t >= from) {
+        let Some(fp) = fp else { continue };
+        if is_blank(fp) {
+            card = true;
+        } else if card {
+            return if *t - span_end <= MAX_EXTEND_SECS { *t } else { span_end };
         }
     }
     span_end
@@ -188,7 +187,7 @@ impl SkipIntro {
         Action::None
     }
 
-    pub fn on_result(&mut self, job: u64, prints: Prints, kinds: Vec<(f64, Option<FrameKind>)>, duration: f64) -> Action {
+    pub fn on_result(&mut self, job: u64, prints: Prints, duration: f64) -> Action {
         let which = match self.phase {
             Phase::Scanning { job: j, which } if j == job => which,
             _ => return Action::None,
@@ -221,7 +220,7 @@ impl SkipIntro {
             }
             Which::Refine => {
                 let (start, end) = self.span.unwrap_or((0.0, 0.0));
-                self.phase = Phase::Ready { start, target: skip_target(end, &kinds), done: false };
+                self.phase = Phase::Ready { start, target: skip_target(end, &prints), done: false };
                 Action::None
             }
         }
@@ -324,9 +323,24 @@ mod tests {
         }
     }
 
-    use FrameKind::{Black, Card, Content, Credits};
-    fn kinds(v: &[(f64, FrameKind)]) -> Vec<(f64, Option<FrameKind>)> {
-        v.iter().map(|&(t, k)| (t, Some(k))).collect()
+    /// Blank (flat) and non-blank (range 81) frames, like the real E04 data.
+    fn flat() -> Option<Fingerprint> {
+        let mut a = [0u8; 144];
+        a[1] = 3;
+        Some(Fingerprint(a))
+    }
+    fn busy() -> Option<Fingerprint> {
+        let mut a = [18u8; 144];
+        a[1] = 99;
+        a[2] = 18;
+        Some(Fingerprint(a))
+    }
+    /// One print per entry: `b` busy, `.` blank, `x` failed; 1 s apart from `start`.
+    fn seq(start: f64, pat: &str) -> Prints {
+        pat.chars()
+            .enumerate()
+            .map(|(i, c)| (start + i as f64, match c { 'b' => busy(), '.' => flat(), _ => None }))
+            .collect()
     }
 
     #[test]
@@ -363,7 +377,7 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(Some(episode(20, 150, 40)), false);
         let job = job_of(&s.update(Some(2700.0)));
-        let a = s.on_result(job, episode(20, 100, 40), vec![], 2700.0);
+        let a = s.on_result(job, episode(20, 100, 40), 2700.0);
         match a {
             Action::Scan { which: Which::Refine, times, job: j } => {
                 assert_ne!(j, job);
@@ -378,7 +392,7 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(Some(unrelated(200)), false);
         let job = job_of(&s.update(Some(2700.0)));
-        assert_eq!(s.on_result(job, unrelated(100), vec![], 2700.0), Action::None);
+        assert_eq!(s.on_result(job, unrelated(100), 2700.0), Action::None);
         assert_eq!(s.state_name(), "off");
     }
 
@@ -387,14 +401,14 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(None, true);
         let own_job = job_of(&s.update(Some(2700.0)));
-        let a = s.on_result(own_job, episode(20, 100, 40), vec![], 2700.0);
+        let a = s.on_result(own_job, episode(20, 100, 40), 2700.0);
         let (ref_job, times) = match a {
             Action::Scan { job, which: Which::Reference, times } => (job, times),
             other => panic!("{other:?}"),
         };
         assert_eq!(times, scan_times(2700.0));
         let reference = episode(20, 150, 40);
-        let a = s.on_result(ref_job, reference.clone(), vec![], 2700.0);
+        let a = s.on_result(ref_job, reference.clone(), 2700.0);
         // Only the reference's intro (12..90) plus REF_MARGIN_SECS: 4..96.
         let window: Prints = reference.iter().filter(|(t, _)| (4.0..=98.0).contains(t)).cloned().collect();
         assert_eq!(window.first().map(|p| p.0), Some(4.0));
@@ -412,11 +426,11 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(None, true);
         let own_job = job_of(&s.update(Some(2700.0)));
-        let ref_job = job_of(&s.on_result(own_job, episode(20, 100, 40), vec![], 2700.0));
+        let ref_job = job_of(&s.on_result(own_job, episode(20, 100, 40), 2700.0));
         // The neighbour's intro starts 20 s later (5 more black frames).
         let mut reference: Prints = (0..5).map(|i| (i as f64 * 4.0, Some(black()))).collect();
         reference.extend(episode(20, 150, 40).into_iter().map(|(t, f)| (t + 20.0, f)));
-        let Action::SaveReference(saved) = s.on_result(ref_job, reference, vec![], 2700.0) else { panic!() };
+        let Action::SaveReference(saved) = s.on_result(ref_job, reference, 2700.0) else { panic!() };
         // Reference span 32..110 -> window 24..118: samples 24..116.
         let times: Vec<f64> = saved.iter().map(|p| p.0).collect();
         assert_eq!(times.first(), Some(&24.0));
@@ -431,14 +445,14 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(None, true);
         let j = job_of(&s.update(Some(2700.0)));
-        let j = job_of(&s.on_result(j, episode(20, 100, 60), vec![], 2700.0));
-        let Action::SaveReference(stored) = s.on_result(j, e05.clone(), vec![], 2700.0) else { panic!() };
+        let j = job_of(&s.on_result(j, episode(20, 100, 60), 2700.0));
+        let Action::SaveReference(stored) = s.on_result(j, e05.clone(), 2700.0) else { panic!() };
         // Now E05 itself plays.
         let mut s = SkipIntro::new();
         s.arm(Some(stored), false);
         let j = job_of(&s.update(Some(2700.0)));
-        let refine = job_of(&s.on_result(j, e05, vec![], 2700.0));
-        s.on_result(refine, vec![], vec![], 2700.0);
+        let refine = job_of(&s.on_result(j, e05, 2700.0));
+        s.on_result(refine, seq(88.0, "bb.....bbbb"), 2700.0);
         let (start, end) = s.span().unwrap();
         assert_eq!(start, START);
         assert!(end >= END && end <= END + REF_MARGIN_SECS, "end {end}");
@@ -449,8 +463,8 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(None, true);
         let j = job_of(&s.update(Some(2700.0)));
-        let j = job_of(&s.on_result(j, unrelated(100), vec![], 2700.0));
-        assert_eq!(s.on_result(j, unrelated(200), vec![], 2700.0), Action::None);
+        let j = job_of(&s.on_result(j, unrelated(100), 2700.0));
+        assert_eq!(s.on_result(j, unrelated(200), 2700.0), Action::None);
         assert_eq!(s.state_name(), "off");
         assert_eq!(s.update(Some(2700.0)), Action::None);
     }
@@ -460,13 +474,13 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(Some(episode(20, 150, 40)), false);
         let job = job_of(&s.update(Some(2700.0)));
-        assert_eq!(s.on_result(job + 99, episode(20, 100, 40), vec![], 2700.0), Action::None);
+        assert_eq!(s.on_result(job + 99, episode(20, 100, 40), 2700.0), Action::None);
         assert_eq!(s.state_name(), "scanning");
         s.on_failed(job + 99);
         assert_eq!(s.state_name(), "scanning");
-        let refine = job_of(&s.on_result(job, episode(20, 100, 40), vec![], 2700.0));
+        let refine = job_of(&s.on_result(job, episode(20, 100, 40), 2700.0));
         // the Own job is stale now
-        assert_eq!(s.on_result(job, episode(20, 100, 40), vec![], 2700.0), Action::None);
+        assert_eq!(s.on_result(job, episode(20, 100, 40), 2700.0), Action::None);
         s.on_failed(job);
         assert_eq!(s.state_name(), "scanning");
         s.on_failed(refine);
@@ -477,9 +491,9 @@ mod tests {
         let mut s = SkipIntro::new();
         s.arm(Some(episode(20, 150, 40)), false);
         let job = job_of(&s.update(Some(2700.0)));
-        let refine = job_of(&s.on_result(job, episode(20, 100, 40), vec![], 2700.0));
-        let k = kinds(&[(88.0, Content), (90.0, Black), (92.0, Black), (95.0, Content)]);
-        assert_eq!(s.on_result(refine, vec![], k, 2700.0), Action::None);
+        let refine = job_of(&s.on_result(job, episode(20, 100, 40), 2700.0));
+        // intro tail 88-89, card 90-94, first scene from 95
+        assert_eq!(s.on_result(refine, seq(88.0, "bb.....bbbb"), 2700.0), Action::None);
         s
     }
 
@@ -512,28 +526,45 @@ mod tests {
     }
 
     #[test]
-    fn skip_target_card_then_content_gives_that_content_time() {
-        let k = kinds(&[(88.0, Content), (90.0, Black), (91.0, Card), (93.0, Content), (94.0, Content)]);
-        assert_eq!(skip_target(90.0, &k), 93.0);
+    fn skip_target_is_the_first_non_blank_frame_after_the_card() {
+        // E04-like: intro tail, 5 flat frames, then a dim shot, then brighter.
+        let p = seq(86.0, "bbbb.....bbbbbbb");
+        assert_eq!(skip_target(90.0, &p), 95.0);
     }
 
     #[test]
     fn skip_target_no_card_gives_span_end() {
-        let k = kinds(&[(88.0, Content), (90.0, Content), (95.0, Content)]);
-        assert_eq!(skip_target(90.0, &k), 90.0);
-        assert_eq!(skip_target(90.0, &[]), 90.0);
+        assert_eq!(skip_target(90.0, &seq(86.0, "bbbbbbbbbb")), 90.0);
+        assert_eq!(skip_target(90.0, &Vec::new()), 90.0);
+        // a card but nothing after it
+        assert_eq!(skip_target(90.0, &seq(86.0, "bbbb....")), 90.0);
     }
 
     #[test]
-    fn skip_target_content_beyond_the_cap_gives_span_end() {
-        let k = kinds(&[(90.0, Credits), (100.0, Black), (111.0, Content)]);
-        assert_eq!(skip_target(90.0, &k), 90.0);
+    fn skip_target_card_beyond_the_cap_gives_span_end() {
+        let p = seq(88.0, &format!("bb{}b", ".".repeat(25)));
+        assert_eq!(skip_target(90.0, &p), 90.0);
     }
 
     #[test]
-    fn skip_target_leading_intro_content_before_the_card_is_skipped() {
-        let k = kinds(&[(10.0, Content), (88.0, Content), (89.0, Content), (91.0, Black), (92.0, Content)]);
-        assert_eq!(skip_target(90.0, &k), 92.0);
+    fn skip_target_ignores_failed_frames() {
+        let p = seq(86.0, "bbbb.x.xbbb");
+        assert_eq!(skip_target(90.0, &p), 94.0);
+        // a failed frame alone is not a card
+        assert_eq!(skip_target(90.0, &seq(86.0, "bbbbxbbb")), 90.0);
+    }
+
+    #[test]
+    fn skip_target_longer_card_like_e03() {
+        let p = seq(86.0, &format!("bbbb{}bbb", ".".repeat(12)));
+        assert_eq!(skip_target(90.0, &p), 102.0);
+    }
+
+    #[test]
+    fn skip_target_frames_before_the_span_end_are_ignored() {
+        // a blank frame well before span_end (earlier black in the intro) is no card
+        let p = seq(60.0, ".bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(skip_target(90.0, &p), 90.0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iptv::intro::{find_intro, find_intro_pair, scan_times, INTRO_SCAN_SECS};
-use iptv_player::state::skip_intro::intro_window;
+use iptv_player::state::skip_intro::{intro_window, refine_times, skip_target};
 use iptv_player::intro_scan::{IntroScanner, JobResult};
 use iptv_player::scan_dump::kind_letter;
 
@@ -60,6 +60,10 @@ fn main() -> anyhow::Result<()> {
     match find_intro_pair(&ra.prints, &rb.prints) {
         Some((a, b)) => {
             println!("intro span in A: {:.1} .. {:.1} s", a.start, a.end);
+            // The skip target: a 1 s refine scan of A from the span end.
+            let rr = run(&scanner, 3, &ea.url, refine_times(a.end, 3000.0))?;
+            println!("refine frames: {}", rr.kinds.iter().map(|(_, k)| kind_letter(*k)).collect::<String>());
+            println!("skip target in A: {:.1} s (span end {:.1} s)", skip_target(a.end, &rr.prints), a.end);
             println!("intro span in B: {:.1} .. {:.1} s", b.start, b.end);
             // What the app stores for B, and what B later finds against it.
             let stored = intro_window(rb.prints.clone(), b.start, b.end);

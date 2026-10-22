@@ -100,7 +100,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   The countdown waits while the video is paused, buffering or reconnecting. The credits
   are found by looking ahead at the last 8 minutes over the preview connection; if real
   scenes follow the credits (or the check is not possible), the next episode starts only
-  when the file ends. Turn it off with `"autoplay_next": false` in `settings.json`.
+  when the file ends. The next episode always starts at 0 (its saved resume point, if any, is
+  dropped); the **>>** button below keeps resuming. Turn it off with `"autoplay_next": false` in `settings.json`.
   Movies, live TV and unsorted episodes are not affected.
 - A **>>** button (left of **CC**, also **Shift+Right**) skips to the next episode at any time
   while an episode with a next one plays, whether autoplay is on or not. The skipped episode

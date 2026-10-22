@@ -143,8 +143,26 @@ pub fn continue_target(lib: &Library, recent: &Recent, hidden: &HashSet<String>)
     Some(ContinueTarget { show, entry })
 }
 
+/// Where a video starts: its saved position, unless it starts `fresh` (autoplay
+/// or the accepted offer moving on to the next episode: begins at 0).
+pub fn resume_for_start(saved: Option<f64>, fresh: bool) -> Option<f64> {
+    if fresh {
+        None
+    } else {
+        saved
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_start_ignores_the_saved_position() {
+        assert_eq!(resume_for_start(Some(42.0), true), None);
+        assert_eq!(resume_for_start(Some(42.0), false), Some(42.0));
+        assert_eq!(resume_for_start(None, false), None);
+        assert_eq!(resume_for_start(None, true), None);
+    }
+
     use super::super::vod::tests::{vod, vod_lib};
     use super::*;
     use iptv::playlist::{favorite_key, Kind};

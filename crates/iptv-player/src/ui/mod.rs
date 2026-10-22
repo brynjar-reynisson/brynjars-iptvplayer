@@ -42,7 +42,7 @@ use crate::state::help::HelpTab;
 use crate::state::live::LiveBrowser;
 use crate::intro_scan::IntroScanner;
 use crate::state::next::{
-    continue_target, neighbour_episode, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight,
+    continue_target, neighbour_episode, next_episode, resume_for_start, shift_right, show_episodes, show_of, NextCache, ShiftRight,
 };
 use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
 use iptv::intro::INTRO_SCAN_SECS;
@@ -655,9 +655,19 @@ impl App {
     /// Load `pb` now (click/Enter, or a zap that became due). Cancels any
     /// pending zap.
     fn start(&mut self, pb: Playback) {
+        self.start_with(pb, false);
+    }
+
+    /// [`App::start`]; `fresh` = begin at 0 and forget the saved position
+    /// (autoplay / accepted offer: it is superseded).
+    fn start_with(&mut self, pb: Playback, fresh: bool) {
         self.zap.cancel();
         self.save_position();
-        let resume = if pb.is_live() { None } else { self.positions.resume_for(pb.key()) };
+        let saved = if pb.is_live() { None } else { self.positions.resume_for(pb.key()) };
+        let resume = resume_for_start(saved, fresh);
+        if fresh && saved.is_some() {
+            self.positions.forget(pb.key());
+        }
         match &mut self.player {
             Ok(p) => {
                 p.play_from(pb.url(), pb.is_live(), resume);
@@ -851,7 +861,7 @@ impl App {
             if r.error.is_some() {
                 self.skip_intro.on_failed(r.job);
             } else {
-                actions.push(self.skip_intro.on_result(r.job, r.prints, r.kinds, duration.unwrap_or(0.0)));
+                actions.push(self.skip_intro.on_result(r.job, r.prints, duration.unwrap_or(0.0)));
             }
         }
         actions.push(self.skip_intro.update(duration));
@@ -971,7 +981,7 @@ impl App {
         let show = show_of(&lib, next).ok_or(NextFail::NoShow)?;
         let old_key = pb.key().to_string();
         let list = show_episodes(&lib, show, &self.hidden);
-        self.start(Playback::new(lib.clone(), list, next, Tab::Series));
+        self.start_with(Playback::new(lib.clone(), list, next, Tab::Series), finished);
         if finished {
             self.positions.forget(&old_key);
             if let Err(e) = self.positions.save_if_dirty() {
