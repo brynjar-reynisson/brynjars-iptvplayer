@@ -181,6 +181,8 @@ struct App {
     key_seek: Option<Instant>,
     /// "Next episode" offer / autoplay of the playing episode.
     autoplay: Autoplay,
+    /// `--console`: the intro capture of the playing episode was requested.
+    head_scan_started: bool,
     /// Next episode of the playing one, for the ">>" button (cached: the
     /// lookup scans every show).
     next_cache: NextCache,
@@ -311,6 +313,7 @@ impl App {
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
             autoplay: Autoplay::new(),
+            head_scan_started: false,
             next_cache: NextCache::default(),
             help: None,
             url_prompt,
@@ -617,6 +620,7 @@ impl App {
         self.sub_menu = false;
         self.seek.reset();
         self.previews.reset();
+        self.head_scan_started = false;
         // Episodes with a next episode get the "Next episode" offer.
         let next = pb
             .entry_index()
@@ -697,6 +701,30 @@ impl App {
         } else {
             self.zap.cancel();
         }
+    }
+
+    /// `--console`: once the duration of a playing series episode is known,
+    /// save its first `HEAD_SCAN_SECS` as one frame per `HEAD_STEP_SECS` under
+    /// `<data dir>/scan-frames/<episode> head-<unix secs>/` (intro detection
+    /// material). Once per start.
+    fn update_head_capture(&mut self) {
+        if !self.console || self.head_scan_started {
+            return;
+        }
+        let Ok(p) = &self.player else { return };
+        let Some(pb) = &self.playback else { return };
+        let is_episode = pb.entry_index().is_some_and(|e| !pb.is_live() && pb.library().entry(e).kind == Kind::Series);
+        let Some(duration) = p.position().and_then(|(_, d)| d).filter(|_| is_episode) else { return };
+        self.head_scan_started = true;
+        let times = crate::state::credits::head_scan_times(duration);
+        if times.is_empty() {
+            return;
+        }
+        let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let dir = crate::scan_dump::dump_dir(&self.data_dir, &format!("{} head", pb.name()), unix);
+        eprintln!("head scan requested ({} frames)", times.len());
+        let url = pb.url().to_string();
+        self.previews.start_head_scan(&url, times, duration, dir);
     }
 
     /// Per frame: drive the "Next episode" offer (tail scan, countdown).
@@ -2273,6 +2301,7 @@ impl eframe::App for App {
             Err(_) => false,
         };
         // A finished episode with a next one (offer not dismissed) goes on to it.
+        self.update_head_capture();
         if !self.update_autoplay(finished) && finished {
             self.on_finished();
         }
