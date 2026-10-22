@@ -116,11 +116,23 @@ fn recent_id(pb: &Playback) -> Option<(String, String)> {
     Some((lib.shows()[show].name.clone(), pb.key().to_string()))
 }
 
+/// Set from `--console`: the exit notice is printed only then.
+static CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--console`: the shell printed its prompt long before our output, so
+/// without a last line the terminal looks hung after the window closed.
+fn exit_notice() {
+    if CONSOLE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("iptv-player: exited. Press Enter for a prompt.");
+    }
+}
+
 /// Ends the process at once without running any exit handlers.
 /// `std::process::exit` (ExitProcess) runs DLL detach code, which can block
 /// behind a libmpv thread stuck in a network call (a terminal then waits for
 /// Ctrl+C even though the window is gone); TerminateProcess cannot block.
 fn hard_exit() -> ! {
+    exit_notice();
     #[cfg(windows)]
     {
         extern "system" {
@@ -411,7 +423,10 @@ impl App {
             show_view: ListView::default(),
             episode_view: ListView::default(),
             t0: opts.t0,
-            console: opts.console,
+            console: {
+                CONSOLE.store(opts.console, std::sync::atomic::Ordering::Relaxed);
+                opts.console
+            },
             first_frame: false,
             ready_logged: false,
         };
@@ -2638,6 +2653,7 @@ impl eframe::App for App {
         }
         // Nothing left to save (favorites/settings are written on change);
         // skip the remaining teardown (mpv core destroy, worker threads).
+        exit_notice();
         std::process::exit(0);
     }
 }

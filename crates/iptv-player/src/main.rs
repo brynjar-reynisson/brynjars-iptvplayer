@@ -50,6 +50,7 @@ fn main() -> anyhow::Result<()> {
     let console = std::env::args().any(|a| a == "--console");
     if console {
         attach_parent_console();
+        eprintln!("iptv-player: running. Output appears below your prompt; close the window to quit.");
     }
     let mut data_dir = None;
     let mut playlist_file = None;
