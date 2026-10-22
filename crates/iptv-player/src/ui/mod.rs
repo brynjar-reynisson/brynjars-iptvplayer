@@ -110,6 +110,24 @@ fn recent_id(pb: &Playback) -> Option<(String, String)> {
     Some((lib.shows()[show].name.clone(), pb.key().to_string()))
 }
 
+/// Ends the process at once without running any exit handlers.
+/// `std::process::exit` (ExitProcess) runs DLL detach code, which can block
+/// behind a libmpv thread stuck in a network call (a terminal then waits for
+/// Ctrl+C even though the window is gone); TerminateProcess cannot block.
+fn hard_exit() -> ! {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn TerminateProcess(process: isize, exit_code: u32) -> i32;
+        }
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    std::process::exit(0)
+}
+
 /// `h:mm:ss` / `m:ss` for a position in seconds.
 fn clock(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -2310,7 +2328,7 @@ impl eframe::App for App {
             // end the process instead of leaving it lingering.
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_secs(5));
-                std::process::exit(0);
+                hard_exit();
             });
         }
         if self.positions_saved.elapsed() >= POSITION_SAVE_EVERY {
@@ -2393,7 +2411,7 @@ impl eframe::App for App {
         // a watchdog ends the process.
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(3));
-            std::process::exit(0);
+            hard_exit();
         });
         self.save_position();
         if let Ok(p) = &mut self.player {
