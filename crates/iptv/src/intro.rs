@@ -110,8 +110,9 @@ pub fn scan_times(duration: f64) -> Vec<f64> {
 
 const TIME_TOL: f64 = 0.5;
 
-fn at(list: &[(f64, Option<Fingerprint>)], t: f64) -> Option<&Option<Fingerprint>> {
-    list.iter().find(|(rt, _)| (rt - t).abs() < TIME_TOL).map(|(_, f)| f)
+/// The sample of `list` at time `t` (within `TIME_TOL`): its exact time and print.
+fn at(list: &[(f64, Option<Fingerprint>)], t: f64) -> Option<(f64, &Option<Fingerprint>)> {
+    list.iter().find(|(rt, _)| (rt - t).abs() < TIME_TOL).map(|(rt, f)| (*rt, f))
 }
 
 /// The intro span in `own`'s timeline: the longest run of frames that look the
@@ -120,6 +121,16 @@ pub fn find_intro(
     own: &[(f64, Option<Fingerprint>)],
     reference: &[(f64, Option<Fingerprint>)],
 ) -> Option<Span> {
+    find_intro_pair(own, reference).map(|p| p.0)
+}
+
+/// [`find_intro`] plus the same intro in `reference`'s timeline: (own span,
+/// reference span). The reference span runs from the first matched reference
+/// time to the last matched reference time + `INTRO_STEP_SECS / 2`.
+pub fn find_intro_pair(
+    own: &[(f64, Option<Fingerprint>)],
+    reference: &[(f64, Option<Fingerprint>)],
+) -> Option<(Span, Span)> {
     let mut offsets: Vec<f64> = Vec::new();
     for (ot, _) in own {
         for (rt, _) in reference {
@@ -129,11 +140,13 @@ pub fn find_intro(
     offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     offsets.dedup_by(|a, b| (*a - *b).abs() < TIME_TOL);
 
-    type Best = Option<(f64, f64, f64)>; // (secs, first, last)
-    fn finish(run: &mut Option<(f64, f64)>, best: &mut Best) {
+    /// First and last matched (own time, reference time).
+    type Run = Option<((f64, f64), (f64, f64))>;
+    type Best = Option<(f64, (f64, f64), (f64, f64))>; // (secs, first, last)
+    fn finish(run: &mut Run, best: &mut Best) {
         if let Some((first, last)) = run.take() {
-            let secs = last - first + INTRO_STEP_SECS;
-            if best.map_or(true, |b| secs > b.0) {
+            let secs = last.0 - first.0 + INTRO_STEP_SECS;
+            if best.is_none_or(|b| secs > b.0) {
                 *best = Some((secs, first, last));
             }
         }
@@ -141,10 +154,10 @@ pub fn find_intro(
 
     let mut best: Best = None;
     for d in offsets {
-        let mut run: Option<(f64, f64)> = None; // first, last matched
+        let mut run: Run = None;
         let mut gap = false;
         for (t, mine) in own {
-            let Some(theirs) = at(reference, t + d) else {
+            let Some((rt, theirs)) = at(reference, t + d) else {
                 // no reference sample at this time: the run is over
                 finish(&mut run, &mut best);
                 gap = false;
@@ -155,8 +168,8 @@ pub fn find_intro(
             match (inf_m, inf_r) {
                 (Some(a), Some(b)) if distance(a, b) < MATCH_DIST => {
                     run = Some(match run {
-                        Some((first, _)) => (first, *t),
-                        None => (*t, *t),
+                        Some((first, _)) => (first, (*t, rt)),
+                        None => ((*t, rt), (*t, rt)),
                     });
                     gap = false;
                 }
@@ -182,7 +195,8 @@ pub fn find_intro(
     }
     let (secs, first, last) = best?;
     if secs >= MIN_INTRO_SECS {
-        Some(Span { start: first, end: last + INTRO_STEP_SECS / 2.0 })
+        let half = INTRO_STEP_SECS / 2.0;
+        Some((Span { start: first.0, end: last.0 + half }, Span { start: first.1, end: last.1 + half }))
     } else {
         None
     }
@@ -327,6 +341,47 @@ mod tests {
         let want = Some(Span { start: 12.0, end: 12.0 + 19.0 * 4.0 + 2.0 });
         assert_eq!(find_intro(&a, &b), want);
         assert_eq!(find_intro(&a, &c), want);
+    }
+
+    #[test]
+    fn pair_gives_the_reference_side_span_too() {
+        let own = episode(5, 20, 100, 50); // intro at 32..108
+        let reference = episode(0, 20, 150, 50); // intro at 12..88
+        let (o, r) = find_intro_pair(&own, &reference).unwrap();
+        assert_eq!(o, Span { start: 32.0, end: 32.0 + 19.0 * 4.0 + 2.0 });
+        assert_eq!(r, Span { start: 12.0, end: 12.0 + 19.0 * 4.0 + 2.0 });
+        assert_eq!(find_intro(&own, &reference), Some(o));
+        assert_eq!(find_intro_pair(&own, &episode(0, 4, 150, 50)), None);
+    }
+
+    /// Only the reference's intro part (plus a margin of `margin` samples).
+    fn intro_window(v: &Prints, span: Span, margin: f64) -> Prints {
+        v.iter().filter(|(t, _)| *t >= span.start - margin && *t <= span.end + margin).cloned().collect()
+    }
+
+    #[test]
+    fn an_episode_against_its_own_stored_intro_gives_the_intro_not_the_story() {
+        let e05 = episode(0, 20, 150, 60);
+        let e04 = episode(0, 20, 100, 60);
+        let (_, ref_span) = find_intro_pair(&e04, &e05).unwrap();
+        let stored = intro_window(&e05, ref_span, 0.0);
+        // E05 played later: it matches its own stored intro, not its whole story.
+        assert_eq!(find_intro(&e05, &stored), Some(Span { start: 12.0, end: 90.0 }));
+        // With a margin of story frames beside the intro, those match too:
+        // the span grows by at most the margin, never into the rest.
+        let stored = intro_window(&e05, ref_span, 8.0);
+        assert_eq!(find_intro(&e05, &stored), Some(Span { start: 12.0, end: 98.0 }));
+        // The whole scan stored (the old behaviour) gives the story too.
+        assert_eq!(find_intro(&e05, &e05), Some(Span { start: 12.0, end: 59.0 * 4.0 + 2.0 }));
+    }
+
+    #[test]
+    fn a_stored_intro_window_matches_a_new_episode_with_another_cold_open() {
+        let e05 = episode(0, 20, 150, 60);
+        let (_, ref_span) = find_intro_pair(&episode(0, 20, 100, 60), &e05).unwrap();
+        let stored = intro_window(&e05, ref_span, 8.0);
+        let e07 = episode(7, 20, 200, 60); // intro 28 s later
+        assert_eq!(find_intro(&e07, &stored), Some(Span { start: 40.0, end: 40.0 + 19.0 * 4.0 + 2.0 }));
     }
 
     #[test]

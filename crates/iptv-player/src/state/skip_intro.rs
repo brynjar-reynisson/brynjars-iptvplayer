@@ -1,11 +1,13 @@
 //! Skip-intro flow (pure). See the module tests for the sequence.
 
-use iptv::intro::{find_intro, scan_times, Prints, INTRO_STEP_SECS};
+use iptv::intro::{find_intro, find_intro_pair, scan_times, Prints, INTRO_STEP_SECS};
 
 use super::credits::FrameKind;
 
 pub const REFINE_SECS: f64 = 24.0;
 pub const MAX_EXTEND_SECS: f64 = 20.0;
+/// Reference samples kept around its intro span when it is stored.
+pub const REF_MARGIN_SECS: f64 = 8.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Which {
@@ -33,6 +35,15 @@ pub fn refine_times(span_end: f64, duration: f64) -> Vec<f64> {
         t += 1.0;
     }
     v
+}
+
+/// The reference samples kept as the show's reference: only its intro
+/// (`start..end`) plus `REF_MARGIN_SECS` on both sides, in time order. A whole
+/// scan would let that episode match itself beyond its intro later.
+fn intro_window(mut prints: Prints, start: f64, end: f64) -> Prints {
+    prints.retain(|(t, _)| *t >= start - REF_MARGIN_SECS && *t <= end + REF_MARGIN_SECS);
+    prints.sort_by(|a, b| a.0.total_cmp(&b.0));
+    prints
 }
 
 /// Where to jump to: the first content frame after the intro's end card
@@ -106,6 +117,7 @@ enum Phase {
 /// `arm` -> `update(duration)` asks for the Own scan -> `on_result` either asks
 /// for the Refine scan (stored reference) or for a Reference scan of the
 /// neighbour episode (first time; own prints are kept) -> `SaveReference`
+/// (the neighbour's intro window only)
 /// (the Refine scan is returned by the next `update`) -> Refine result = Ready.
 #[derive(Debug)]
 pub struct SkipIntro {
@@ -197,12 +209,12 @@ impl SkipIntro {
             }
             Which::Reference => {
                 let own = self.own.take().unwrap_or_default();
-                match find_intro(&own, &prints) {
-                    Some(span) => {
+                match find_intro_pair(&own, &prints) {
+                    Some((span, ref_span)) => {
                         // The Refine scan is queued; the next `update` returns it.
                         let scan = self.start_refine(span.start, span.end, duration);
                         self.pending = Some(scan);
-                        Action::SaveReference(prints)
+                        Action::SaveReference(intro_window(prints, ref_span.start, ref_span.end))
                     }
                     None => self.off(),
                 }
@@ -383,12 +395,53 @@ mod tests {
         assert_eq!(times, scan_times(2700.0));
         let reference = episode(20, 150, 40);
         let a = s.on_result(ref_job, reference.clone(), vec![], 2700.0);
-        assert_eq!(a, Action::SaveReference(reference));
+        // Only the reference's intro (12..90) plus REF_MARGIN_SECS: 4..96.
+        let window: Prints = reference.iter().filter(|(t, _)| (4.0..=98.0).contains(t)).cloned().collect();
+        assert_eq!(window.first().map(|p| p.0), Some(4.0));
+        assert_eq!(window.last().map(|p| p.0), Some(96.0));
+        assert_eq!(a, Action::SaveReference(window));
         match s.update(Some(2700.0)) {
             Action::Scan { which: Which::Refine, times, .. } => assert_eq!(times, refine_times(END, 2700.0)),
             other => panic!("{other:?}"),
         }
         assert_eq!(s.update(Some(2700.0)), Action::None);
+    }
+
+    #[test]
+    fn save_reference_keeps_only_the_margin_window_with_an_offset() {
+        let mut s = SkipIntro::new();
+        s.arm(None, true);
+        let own_job = job_of(&s.update(Some(2700.0)));
+        let ref_job = job_of(&s.on_result(own_job, episode(20, 100, 40), vec![], 2700.0));
+        // The neighbour's intro starts 20 s later (5 more black frames).
+        let mut reference: Prints = (0..5).map(|i| (i as f64 * 4.0, Some(black()))).collect();
+        reference.extend(episode(20, 150, 40).into_iter().map(|(t, f)| (t + 20.0, f)));
+        let Action::SaveReference(saved) = s.on_result(ref_job, reference, vec![], 2700.0) else { panic!() };
+        // Reference span 32..110 -> window 24..118: samples 24..116.
+        let times: Vec<f64> = saved.iter().map(|p| p.0).collect();
+        assert_eq!(times.first(), Some(&24.0));
+        assert_eq!(times.last(), Some(&116.0));
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn an_episode_against_its_own_stored_reference_finds_the_intro_not_the_story() {
+        // E05 was the neighbour when E04 played: its intro window was stored.
+        let e05 = episode(20, 150, 60);
+        let mut s = SkipIntro::new();
+        s.arm(None, true);
+        let j = job_of(&s.update(Some(2700.0)));
+        let j = job_of(&s.on_result(j, episode(20, 100, 60), vec![], 2700.0));
+        let Action::SaveReference(stored) = s.on_result(j, e05.clone(), vec![], 2700.0) else { panic!() };
+        // Now E05 itself plays.
+        let mut s = SkipIntro::new();
+        s.arm(Some(stored), false);
+        let j = job_of(&s.update(Some(2700.0)));
+        let refine = job_of(&s.on_result(j, e05, vec![], 2700.0));
+        s.on_result(refine, vec![], vec![], 2700.0);
+        let (start, end) = s.span().unwrap();
+        assert_eq!(start, START);
+        assert!(end >= END && end <= END + REF_MARGIN_SECS, "end {end}");
     }
 
     #[test]
