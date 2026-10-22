@@ -258,22 +258,6 @@ pub fn scan_times(duration: f64) -> Vec<f64> {
     times
 }
 
-/// How much of the start of an episode the intro capture looks at.
-pub const HEAD_SCAN_SECS: f64 = 300.0;
-/// Gap between intro capture frames (an intro can end in a ~1 s black flash).
-pub const HEAD_STEP_SECS: f64 = 1.0;
-
-/// Times (seconds) to capture for the intro: every `HEAD_STEP_SECS` from 0 up
-/// to `HEAD_SCAN_SECS`, but not past 3 s before the end of a shorter video.
-/// Empty for an unknown duration or one under 30 s.
-pub fn head_scan_times(duration: f64) -> Vec<f64> {
-    if !duration.is_finite() || duration < 30.0 {
-        return Vec::new();
-    }
-    let end = HEAD_SCAN_SECS.min(duration - 3.0);
-    (0..).map(|i| i as f64 * HEAD_STEP_SECS).take_while(|&t| t <= end).collect()
-}
-
 /// Gap between a refinement frame and the isolated Content sample it checks.
 pub const REFINE_OFFSET_SECS: f64 = 5.0;
 /// Most isolated Content samples refined per scan (those closest to the end).
@@ -920,17 +904,6 @@ mod tests {
     fn black_gap_inside_credits_is_neutral() {
         let v = s(&[Some(Content), Some(Credits), Some(Black), Some(Credits), Some(Black)]);
         assert_eq!(offer_time(&v, D), 1010.0);
-    }
-
-    #[test]
-    fn head_scan_times_cover_the_first_minutes() {
-        let t = head_scan_times(2700.0);
-        assert_eq!((t[0], t[1], *t.last().unwrap()), (0.0, 1.0, 300.0));
-        assert_eq!(t.len(), 301);
-        let short = head_scan_times(45.0);
-        assert_eq!(*short.last().unwrap(), 42.0);
-        assert!(head_scan_times(29.9).is_empty());
-        assert!(head_scan_times(f64::NAN).is_empty());
     }
 
     #[test]

@@ -123,18 +123,10 @@ fn answer_want(want: Option<(u64, i64)>, mpv: &Option<(u64, ThumbMpv)>, send: &i
     }
 }
 
-/// Which end of the video a scan looks at. A head scan (intro capture) takes
-/// exactly the asked times: no refinement pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanKind {
-    Head,
-    Tail,
-}
-
 enum Cmd {
     Open { gen: u64, url: String },
     Want { gen: u64, bucket: i64 },
-    Scan { gen: u64, kind: ScanKind, times: Vec<f64>, duration: f64, dump: Option<PathBuf> },
+    Scan { gen: u64, times: Vec<f64>, duration: f64, dump: Option<PathBuf> },
     Close,
 }
 
@@ -144,8 +136,8 @@ pub enum Reply {
     Frame { gen: u64, bucket: i64, thumb: Thumb },
     /// A frame could not be taken.
     Failed { gen: u64, bucket: i64 },
-    /// A scan finished (sent once per scan, never when it was dropped).
-    Scanned { gen: u64, kind: ScanKind, samples: Vec<Sample> },
+    /// A tail scan finished (sent once per scan, never when it was dropped).
+    Scanned { gen: u64, samples: Vec<Sample> },
     /// The source of `gen` was closed after its scan (no preview was
     /// wanted); the next request must open it again.
     Closed { gen: u64 },
@@ -155,7 +147,6 @@ pub enum Reply {
 /// scan interrupted by a newer command resumes without taking them again.
 struct ScanJob {
     gen: u64,
-    kind: ScanKind,
     times: Vec<f64>,
     duration: f64,
     /// The refinement frames were added to `times` (or there were none).
@@ -200,8 +191,8 @@ impl ThumbService {
     /// [`Reply::Scanned`] (all samples, time-sorted); dropped without a reply
     /// when the source is closed or replaced. With `dump`, the frames are
     /// saved there as PNG files before the reply.
-    pub fn scan(&self, gen: u64, kind: ScanKind, times: Vec<f64>, duration: f64, dump: Option<PathBuf>) {
-        let _ = self.tx.send(Cmd::Scan { gen, kind, times, duration, dump });
+    pub fn scan(&self, gen: u64, times: Vec<f64>, duration: f64, dump: Option<PathBuf>) {
+        let _ = self.tx.send(Cmd::Scan { gen, times, duration, dump });
     }
 
     /// Drop the source (and its connection).
@@ -256,13 +247,12 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                     want = Some((gen, bucket));
                     want_arrived = true;
                 }
-                Cmd::Scan { gen, kind, times, duration, dump } => {
+                Cmd::Scan { gen, times, duration, dump } => {
                     scan = Some(ScanJob {
                         gen,
-                        kind,
                         times,
                         duration,
-                        refined: kind == ScanKind::Head,
+                        refined: false,
                         memo: HashMap::new(),
                         dump,
                         frames: HashMap::new(),
@@ -286,26 +276,17 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
         if let Some(job) = &mut scan {
             match &mpv {
                 Some((open_gen, m)) if *open_gen == job.gen => {
-                    let ScanJob { gen, kind, times, duration, refined, memo, dump, frames } = job;
+                    let ScanJob { gen, times, duration, refined, memo, dump, frames } = job;
                     let done = run_scan(
                         times,
                         memo,
                         |t| match m.frame_at(t, SEEK_TIMEOUT) {
                             Ok(th) => {
-                                let frame_kind = classify(&th.rgba, th.width, th.height);
-                                match (&*dump, *kind) {
-                                    // A head scan is slow and may be cut short: save each frame at once.
-                                    (Some(dir), ScanKind::Head) => {
-                                        if let Err(e) = scan_dump::write_head_frame(dir, t, frame_kind, &th) {
-                                            eprintln!("head scan: could not save frame: {e}");
-                                        }
-                                    }
-                                    (Some(_), ScanKind::Tail) => {
-                                        frames.insert(t.to_bits(), th);
-                                    }
-                                    _ => {}
+                                let kind = classify(&th.rgba, th.width, th.height);
+                                if dump.is_some() {
+                                    frames.insert(t.to_bits(), th);
                                 }
-                                Some(frame_kind)
+                                Some(kind)
                             }
                             Err(e) => {
                                 eprintln!("tail scan: {e}");
@@ -329,15 +310,15 @@ fn worker(user_agent: String, rx: Receiver<Cmd>, tx: Sender<Reply>, wake: impl F
                                     continue;
                                 }
                             }
-                            if let (Some(dir), ScanKind::Tail) = (&*dump, *kind) {
+                            if let Some(dir) = dump {
                                 let (_, err) = scan_dump::write_frames(dir, &samples, frames);
                                 if let Some(e) = err {
                                     eprintln!("tail scan: could not save frames: {e}");
                                 }
                                 frames.clear();
                             }
-                            let (gen, kind) = (*gen, *kind);
-                            send(Reply::Scanned { gen, kind, samples });
+                            let gen = *gen;
+                            send(Reply::Scanned { gen, samples });
                             scan = None;
                             // Do not keep an idle second connection open.
                             let want_pending = want.is_some() || pending.iter().any(|c| matches!(c, Cmd::Want { .. }));

@@ -1,6 +1,6 @@
 //! Headless intro capture: saves the frames of the first minutes of one
-//! cached playlist entry, the same way the in-app `--console` head scan does
-//! but without playing it, so it needs no waiting:
+//! cached playlist entry (like the in-app `--console` intro scan dump, but at
+//! any times and step, and without playing it), so it needs no waiting:
 //! `cargo run --release -p iptv-player --example head_frames -- --data-dir <dir>
 //! (--key <favorite key, e.g. series:142253> | --name <text in the entry name>) --out <folder> [--from 0] [--to 300] [--step 1]`
 //! Files are `<secs>s_<letter>.png` (see `scan_dump::head_file_name`). Uses one
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let entry = lib.entry(idx);
     println!("entry: {}", entry.name);
 
-    let ua = iptv::config::load(&dir).map(|c| c.user_agent).unwrap_or_default();
+    let ua = iptv::config::load(&dir).map_or_else(|_| iptv::config::DEFAULT_USER_AGENT.to_string(), |c| c.user_agent);
     let t0 = Instant::now();
     let mpv = ThumbMpv::new(&ua, 240)?;
     mpv.open(&entry.url, Duration::from_secs(30))?;

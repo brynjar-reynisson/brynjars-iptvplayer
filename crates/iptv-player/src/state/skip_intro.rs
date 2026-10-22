@@ -40,7 +40,7 @@ pub fn refine_times(span_end: f64, duration: f64) -> Vec<f64> {
 /// The reference samples kept as the show's reference: only its intro
 /// (`start..end`) plus `REF_MARGIN_SECS` on both sides, in time order. A whole
 /// scan would let that episode match itself beyond its intro later.
-fn intro_window(mut prints: Prints, start: f64, end: f64) -> Prints {
+pub fn intro_window(mut prints: Prints, start: f64, end: f64) -> Prints {
     prints.retain(|(t, _)| *t >= start - REF_MARGIN_SECS && *t <= end + REF_MARGIN_SECS);
     prints.sort_by(|a, b| a.0.total_cmp(&b.0));
     prints

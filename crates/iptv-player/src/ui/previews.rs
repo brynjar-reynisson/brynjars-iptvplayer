@@ -8,7 +8,7 @@ use eframe::egui;
 
 use crate::scan_dump::kind_letter;
 use crate::state::credits::FrameKind;
-use crate::thumbs::{bucket_of, nearest, Reply, ScanKind, ThumbService};
+use crate::thumbs::{bucket_of, nearest, Reply, ThumbService};
 
 /// Most previews kept per video (240x135 RGBA = 130 KB each).
 const MAX_KEPT: usize = 300;
@@ -40,8 +40,6 @@ pub struct Previews {
     scan: ScanState,
     /// Folder the running scan saves its frames in (printed when it finishes).
     scan_dump: Option<PathBuf>,
-    /// Folder the running head scan saves its frames in.
-    head_dump: Option<PathBuf>,
 }
 
 impl Previews {
@@ -57,7 +55,6 @@ impl Previews {
             wanted: None,
             scan: ScanState::NotStarted,
             scan_dump: None,
-            head_dump: None,
         }
     }
 
@@ -75,7 +72,6 @@ impl Previews {
         self.wanted = None;
         self.scan = ScanState::NotStarted;
         self.scan_dump = None;
-        self.head_dump = None;
     }
 
     /// Adopt finished frames. Every frame.
@@ -83,16 +79,7 @@ impl Previews {
         for reply in self.svc.poll() {
             match reply {
                 Reply::OpenFailed { gen } if gen == self.gen => self.unavailable = true,
-                Reply::Scanned { gen, kind: ScanKind::Head, samples } if gen == self.gen => {
-                    let kinds: String = samples.iter().map(|(_, k)| kind_letter(*k)).collect();
-                    eprintln!("head scan: {} samples: {kinds}", samples.len());
-                    if let Some(dir) = self.head_dump.take() {
-                        eprintln!("head scan frames: {}", dir.display());
-                    }
-                }
-                Reply::Scanned { gen, kind: ScanKind::Tail, samples }
-                    if gen == self.gen && self.scan == ScanState::Running =>
-                {
+                Reply::Scanned { gen, samples } if gen == self.gen && self.scan == ScanState::Running => {
                     // One letter per sample (C credits, B black, K card, X content, ? no frame): tuning aid.
                     let kinds: String = samples.iter().map(|(_, k)| kind_letter(*k)).collect();
                     let from = samples.first().map_or(0.0, |s| s.0);
@@ -142,20 +129,8 @@ impl Previews {
         }
         self.ensure_open(url);
         self.scan_dump = dump.clone();
-        self.svc.scan(self.gen, ScanKind::Tail, times, duration, dump);
+        self.svc.scan(self.gen, times, duration, dump);
         self.scan = ScanState::Running;
-    }
-
-    /// Capture the frames at `times` near the start of the current video
-    /// (intro detection material) into `dump`. Independent of the tail scan's
-    /// state; a newer scan on the worker replaces it.
-    pub fn start_head_scan(&mut self, url: &str, times: Vec<f64>, duration: f64, dump: PathBuf) {
-        if self.unavailable {
-            return;
-        }
-        self.ensure_open(url);
-        self.head_dump = Some(dump.clone());
-        self.svc.scan(self.gen, ScanKind::Head, times, duration, Some(dump));
     }
 
     /// Where the tail scan of the current video stands (see [`Previews::poll`]).

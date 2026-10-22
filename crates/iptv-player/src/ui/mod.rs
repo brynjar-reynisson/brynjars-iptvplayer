@@ -45,6 +45,7 @@ use crate::state::next::{
     continue_target, neighbour_episode, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight,
 };
 use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
+use iptv::intro::INTRO_SCAN_SECS;
 use iptv::intros::Intros;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
@@ -204,9 +205,7 @@ struct App {
     key_seek: Option<Instant>,
     /// "Next episode" offer / autoplay of the playing episode.
     autoplay: Autoplay,
-    /// `--console`: the intro capture of the playing episode was requested.
-    head_scan_started: bool,
-    /// Headless scans of episode openings (own connection, one job at a time).
+    /// Headless scans of episode openings (own pool of connections, one job at a time).
     intro_scanner: IntroScanner,
     /// Per-show intro references (`intros.json`).
     intros: Intros,
@@ -215,6 +214,8 @@ struct App {
     /// URLs the intro scans open: the playing episode, its neighbour (first
     /// time for a show). Never logged.
     intro_urls: (String, Option<String>),
+    /// Display names of those two episodes (`--console` frame folders).
+    intro_names: (String, Option<String>),
     /// Show of the playing episode (key of its `intros.json` reference).
     intro_show: String,
     /// Last known duration of the playing episode (the scans' `duration`).
@@ -354,11 +355,11 @@ impl App {
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
             autoplay: Autoplay::new(),
-            head_scan_started: false,
             intro_scanner,
             intros,
             skip_intro: SkipIntro::new(),
             intro_urls: (String::new(), None),
+            intro_names: (String::new(), None),
             intro_show: String::new(),
             intro_duration: None,
             intro_logged: true,
@@ -668,7 +669,6 @@ impl App {
         self.sub_menu = false;
         self.seek.reset();
         self.previews.reset();
-        self.head_scan_started = false;
         // Episodes with a next episode get the "Next episode" offer.
         let next = pb
             .entry_index()
@@ -686,7 +686,7 @@ impl App {
             (Some(_), false) => eprintln!("autoplay: not armed: autoplay_next is off in settings.json"),
         }
         self.autoplay.arm(next, enabled);
-        self.arm_skip_intro(&pb);
+        self.arm_skip_intro(&pb, resume);
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         if let Some((show, key)) = recent_id(&pb) {
@@ -752,30 +752,6 @@ impl App {
         }
     }
 
-    /// `--console`: once the duration of a playing series episode is known,
-    /// save its first `HEAD_SCAN_SECS` as one frame per `HEAD_STEP_SECS` under
-    /// `<data dir>/scan-frames/<episode> head-<unix secs>/` (intro detection
-    /// material). Once per start.
-    fn update_head_capture(&mut self) {
-        if !self.console || self.head_scan_started {
-            return;
-        }
-        let Ok(p) = &self.player else { return };
-        let Some(pb) = &self.playback else { return };
-        let is_episode = pb.entry_index().is_some_and(|e| !pb.is_live() && pb.library().entry(e).kind == Kind::Series);
-        let Some(duration) = p.position().and_then(|(_, d)| d).filter(|_| is_episode) else { return };
-        self.head_scan_started = true;
-        let times = crate::state::credits::head_scan_times(duration);
-        if times.is_empty() {
-            return;
-        }
-        let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let dir = crate::scan_dump::dump_dir(&self.data_dir, &format!("{} head", pb.name()), unix);
-        eprintln!("head scan requested ({} frames)", times.len());
-        let url = pb.url().to_string();
-        self.previews.start_head_scan(&url, times, duration, dir);
-    }
-
     /// Per frame: drive the "Next episode" offer (tail scan, countdown).
     /// `finished` = the episode reached its end this frame. Returns true if
     /// the next episode was started.
@@ -836,11 +812,12 @@ impl App {
 
     /// A new playback: arm the "Skip intro" flow for a sorted series episode
     /// (stored reference for its show, or a neighbour episode to compare
-    /// with); live, movies and `(Unsorted)` never scan.
-    fn arm_skip_intro(&mut self, pb: &Playback) {
+    /// with); live, movies and `(Unsorted)` never scan, nor does an episode
+    /// that resumes at or after `INTRO_SCAN_SECS` (nothing could be offered).
+    fn arm_skip_intro(&mut self, pb: &Playback, resume: Option<f64>) {
         self.intro_scanner.cancel();
         self.intro_duration = None;
-        let Some((show, _)) = recent_id(pb) else {
+        let Some((show, _)) = recent_id(pb).filter(|_| resume.is_none_or(|r| r < INTRO_SCAN_SECS)) else {
             self.skip_intro.disarm();
             self.intro_logged = true;
             return;
@@ -855,6 +832,7 @@ impl App {
         );
         self.skip_intro.arm(stored, neighbour.is_some());
         self.intro_urls = (pb.url().to_string(), neighbour.map(|n| lib.entry(n).url.clone()));
+        self.intro_names = (pb.name().to_string(), neighbour.map(|n| lib.entry(n).name.clone()));
         self.intro_show = show;
         self.intro_logged = false;
     }
@@ -881,15 +859,23 @@ impl App {
             match a {
                 skip_intro::Action::None => {}
                 skip_intro::Action::Scan { job, which, times } => {
-                    let (name, url) = match which {
-                        Which::Own => ("own", Some(&self.intro_urls.0)),
-                        Which::Refine => ("refine", Some(&self.intro_urls.0)),
-                        Which::Reference => ("reference", self.intro_urls.1.as_ref()),
+                    let (name, url, episode, suffix) = match which {
+                        Which::Own => ("own", Some(&self.intro_urls.0), Some(&self.intro_names.0), "intro"),
+                        Which::Refine => ("refine", Some(&self.intro_urls.0), Some(&self.intro_names.0), "intro"),
+                        Which::Reference => {
+                            ("reference", self.intro_urls.1.as_ref(), self.intro_names.1.as_ref(), "intro-ref")
+                        }
                     };
                     match url {
                         Some(url) => {
                             eprintln!("intro: scanning {name} ({} frames)", times.len());
-                            self.intro_scanner.scan(job, url, times);
+                            // `--console`: keep the frames for tuning.
+                            let dump = episode.filter(|_| self.console).map(|ep| {
+                                let unix =
+                                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                                crate::scan_dump::suffixed_dump_dir(&self.data_dir, ep, suffix, unix)
+                            });
+                            self.intro_scanner.scan(job, url, times, dump);
                         }
                         None => self.skip_intro.on_failed(job),
                     }
@@ -2538,7 +2524,6 @@ impl eframe::App for App {
             Err(_) => false,
         };
         // A finished episode with a next one (offer not dismissed) goes on to it.
-        self.update_head_capture();
         if !self.update_autoplay(finished) && finished {
             self.on_finished();
         }

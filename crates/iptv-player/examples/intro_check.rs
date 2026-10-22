@@ -1,14 +1,16 @@
 //! Headless intro detection check on two cached playlist entries:
 //! `cargo run --release -p iptv-player --example intro_check -- --data-dir <dir>
 //! --name <text in entry A's name> --ref <text in entry B's name>`
-//! Scans both with `scan_times`, runs `find_intro` and prints the span and the
-//! per-sample letters. Uses one provider connection at a time; close the app
-//! first. Prints entry names and timings only, never a URL.
+//! Scans both with `scan_times` through the app's `IntroScanner` (a pool of up
+//! to `SCAN_SOURCES` parallel provider connections per scan), runs
+//! `find_intro_pair` and prints both spans, the per-sample letters and the
+//! timings. Close the app first. Prints entry names and timings only, never a URL.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iptv::intro::{find_intro, scan_times, INTRO_SCAN_SECS};
+use iptv::intro::{find_intro, find_intro_pair, scan_times, INTRO_SCAN_SECS};
+use iptv_player::state::skip_intro::intro_window;
 use iptv_player::intro_scan::{IntroScanner, JobResult};
 use iptv_player::scan_dump::kind_letter;
 
@@ -17,7 +19,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 }
 
 fn run(scanner: &IntroScanner, job: u64, url: &str, times: Vec<f64>) -> anyhow::Result<JobResult> {
-    scanner.scan(job, url, times);
+    scanner.scan(job, url, times, None);
     let t0 = Instant::now();
     loop {
         if let Some(r) = scanner.poll().into_iter().find(|r| r.job == job) {
@@ -46,17 +48,28 @@ fn main() -> anyhow::Result<()> {
     let (ea, eb) = (lib.entry(find(&a)?), lib.entry(find(&b)?));
     println!("A: {}\nB: {}", ea.name, eb.name);
 
-    let ua = iptv::config::load(&dir).map(|c| c.user_agent).unwrap_or_default();
+    let ua = iptv::config::load(&dir).map_or_else(|_| iptv::config::DEFAULT_USER_AGENT.to_string(), |c| c.user_agent);
     let scanner = IntroScanner::new(ua, || {});
+    let t0 = Instant::now();
     let times = scan_times(INTRO_SCAN_SECS + 3.0);
     let ra = run(&scanner, 1, &ea.url, times.clone())?;
     let rb = run(&scanner, 2, &eb.url, times)?;
 
     let letters = |r: &JobResult| r.kinds.iter().map(|(_, k)| kind_letter(*k)).collect::<String>();
     println!("A: {}\nB: {}", letters(&ra), letters(&rb));
-    match find_intro(&ra.prints, &rb.prints) {
-        Some(s) => println!("intro span in A: {:.1} .. {:.1} s", s.start, s.end),
+    match find_intro_pair(&ra.prints, &rb.prints) {
+        Some((a, b)) => {
+            println!("intro span in A: {:.1} .. {:.1} s", a.start, a.end);
+            println!("intro span in B: {:.1} .. {:.1} s", b.start, b.end);
+            // What the app stores for B, and what B later finds against it.
+            let stored = intro_window(rb.prints.clone(), b.start, b.end);
+            match find_intro(&rb.prints, &stored) {
+                Some(s) => println!("B against its stored intro ({} samples): {:.1} .. {:.1} s", stored.len(), s.start, s.end),
+                None => println!("B against its stored intro: no match"),
+            }
+        }
         None => println!("no intro found"),
     }
+    println!("whole check: {:.1} s", t0.elapsed().as_secs_f64());
     Ok(())
 }

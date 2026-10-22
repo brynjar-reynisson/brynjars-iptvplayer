@@ -1,7 +1,9 @@
 //! `--console` tuning aid: the frames of a tail scan saved as PNG files
 //! under `<data dir>/scan-frames/<episode>-<unix seconds>/`, one per sample,
 //! named `NN_<time>s_<L>.png` (L = C credits, B black, K card, X content). Written on
-//! the thumbnail worker thread; the folder name comes from the episode's
+//! the thumbnail worker thread. Intro scans save theirs as they are taken
+//! under `<episode> intro-<unix seconds>/` (`intro-ref` for the neighbour
+//! episode) as `<secs>s_<L>.png`. Folder names come from the episode's
 //! display name only (sanitised), never from the URL.
 
 use std::collections::HashMap;
@@ -44,6 +46,13 @@ pub fn sanitize_name(name: &str) -> String {
 /// Folder for the frames of one scan of `episode`.
 pub fn dump_dir(data_dir: &Path, episode: &str, unix_secs: u64) -> PathBuf {
     data_dir.join("scan-frames").join(format!("{}-{unix_secs}", sanitize_name(episode)))
+}
+
+/// Folder for the frames of one scan of `episode` with `suffix` after the
+/// (sanitised, shortened) name: `<episode> <suffix>-<unix secs>`.
+pub fn suffixed_dump_dir(data_dir: &Path, episode: &str, suffix: &str, unix_secs: u64) -> PathBuf {
+    let name = format!("{} {}", sanitize_name(episode), sanitize_name(suffix));
+    data_dir.join("scan-frames").join(format!("{name}-{unix_secs}"))
 }
 
 /// File name of the `index`-th (time-sorted) sample.
@@ -160,6 +169,16 @@ mod tests {
         assert_eq!(kind_letter(Some(FrameKind::Card)), 'K');
         assert_eq!(file_name(51, 3558.0, FrameKind::Card), "51_3558s_K.png");
         assert_eq!(head_file_name(94.0, FrameKind::Content), "0094s_X.png");
+    }
+
+    #[test]
+    fn suffixed_dump_dir_keeps_the_suffix_after_a_long_name() {
+        let root = Path::new("data").join("scan-frames");
+        let d = suffixed_dump_dir(Path::new("data"), "Show S01E01", "intro-ref", 1_700_000_000);
+        assert_eq!(d, root.join("Show S01E01 intro-ref-1700000000"));
+        let long = "x".repeat(100);
+        let d = suffixed_dump_dir(Path::new("data"), &long, "intro", 5);
+        assert_eq!(d, root.join(format!("{} intro-5", "x".repeat(60))));
     }
 
     #[test]
