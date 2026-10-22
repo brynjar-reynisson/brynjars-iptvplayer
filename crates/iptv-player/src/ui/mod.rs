@@ -123,7 +123,9 @@ static CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// without a last line the terminal looks hung after the window closed.
 fn exit_notice() {
     if CONSOLE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("iptv-player: exited. Press Enter for a prompt.");
+        // Not `eprintln!`: it panics on a broken pipe, and this runs right before the process ends.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "iptv-player: exited. Press Enter for a prompt.");
     }
 }
 
