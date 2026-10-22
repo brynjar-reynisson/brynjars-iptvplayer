@@ -312,6 +312,11 @@ pub fn refine_times(samples: &[(f64, Option<FrameKind>)], duration: f64) -> Vec<
     out
 }
 
+/// Content this close to the end of the file is a studio sting or logo after
+/// the credits (it can span two samples on the refined grid), not the show:
+/// it is neutral in [`offer_time`], so it cannot cancel the offer.
+pub const END_STING_SECS: f64 = 15.0;
+
 /// When to offer the next episode, from tail samples `(time, kind)` (`None`
 /// = that frame could not be read; any failed frame = `duration`, the real
 /// end).
@@ -333,10 +338,12 @@ pub fn offer_time(samples: &[(f64, Option<FrameKind>)], duration: f64) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
     let kinds: Vec<Option<FrameKind>> = sorted.iter().map(|s| s.1).collect();
-    // `None` = neutral (isolated Content).
+    // `None` = neutral (isolated Content, or Content in the last `END_STING_SECS`).
     let smoothed: Vec<Option<FrameKind>> = (0..kinds.len())
         .map(|i| {
-            if isolated_content(&kinds, i) {
+            if isolated_content(&kinds, i)
+                || (kinds[i] == Some(FrameKind::Content) && sorted[i].0 >= duration - END_STING_SECS)
+            {
                 None
             } else if isolated_credits(&kinds, i) {
                 Some(FrameKind::Content)
@@ -673,6 +680,47 @@ mod tests {
         // offer starts at the first credits after it.
         let v = s(&[Some(Content), Some(Credits), Some(Content), Some(Credits), Some(Credits)]);
         assert_eq!(offer_time(&v, D), 1030.0);
+    }
+
+    /// Made-up episode (duration 1000 s): show, a credits run with black and card
+    /// frames, then a two-sample sting in the last 15 s. The sting must not push
+    /// the offer to the end.
+    #[test]
+    fn sting_in_the_last_seconds_does_not_cancel_the_offer() {
+        let letters = "XXXXXXXXXXXXXXXXXXXXBKKCKKCCCCCCCXX";
+        let times: Vec<f64> = (0..letters.len())
+            .map(|i| match i {
+                33 => 985.0,
+                34 => 997.0,
+                _ => 640.0 + 10.0 * i as f64,
+            })
+            .collect();
+        let v: Vec<_> = letters
+            .chars()
+            .zip(times)
+            .map(|(c, t)| {
+                let k = match c {
+                    'C' => Credits,
+                    'B' => Black,
+                    'K' => Card,
+                    _ => Content,
+                };
+                (t, Some(k))
+            })
+            .collect();
+        assert_eq!(offer_time(&v, 1000.0), 840.0, "offer at the black frame after the show");
+    }
+
+    /// The same two Content samples 40 s from the end are real content.
+    #[test]
+    fn content_well_before_the_end_still_moves_the_offer() {
+        let v = vec![
+            (900.0, Some(Credits)),
+            (910.0, Some(Credits)),
+            (950.0, Some(Content)),
+            (960.0, Some(Content)),
+        ];
+        assert_eq!(offer_time(&v, 1000.0), 1000.0);
     }
 
     #[test]
