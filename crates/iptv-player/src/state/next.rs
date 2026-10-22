@@ -90,6 +90,18 @@ pub fn next_episode(lib: &Library, entry: usize, hidden: &HashSet<String>) -> Op
     })
 }
 
+/// Another episode of the same show to compare intros with: the next one in
+/// its visible rows (crossing seasons), else the previous one. `None` for
+/// movies, live, `(Unsorted)`, hidden groups and single-episode shows.
+pub fn neighbour_episode(lib: &Library, entry: usize, hidden: &HashSet<String>) -> Option<usize> {
+    if lib.entry(entry).kind != Kind::Series || hidden.contains(&lib.entry(entry).group) {
+        return None;
+    }
+    let eps = show_episodes(lib, show_of(lib, entry)?, hidden);
+    let at = eps.iter().position(|&e| e == entry)?;
+    eps.get(at + 1).copied().or_else(|| at.checked_sub(1).map(|p| eps[p]))
+}
+
 /// The show (index in `Library::shows`) that lists episode `entry`, never
 /// `(Unsorted)`.
 pub fn show_of(lib: &Library, entry: usize) -> Option<usize> {
@@ -284,6 +296,39 @@ mod tests {
         assert_eq!(shift_right(true, false, false, true), ShiftRight::Ignore, "typing");
         assert_eq!(shift_right(false, true, false, true), ShiftRight::Ignore, "tab button focused");
         assert_eq!(shift_right(false, false, true, true), ShiftRight::Ignore, "subtitle menu open");
+    }
+
+    #[test]
+    fn neighbour_is_the_next_episode() {
+        let lib = vod_lib();
+        assert_eq!(neighbour_episode(&lib, 4, &HashSet::new()), Some(3));
+        assert_eq!(neighbour_episode(&lib, 3, &HashSet::new()), Some(5), "crosses seasons");
+    }
+
+    #[test]
+    fn neighbour_of_the_last_episode_is_the_previous_one() {
+        let lib = vod_lib();
+        assert_eq!(neighbour_episode(&lib, 5, &HashSet::new()), Some(3));
+        let lib = Library::build(vec![
+            vod(Kind::Series, "1", "Quiet Harbor S01E01", "Series: A"),
+            vod(Kind::Series, "2", "Quiet Harbor S01E02", "Series: B"),
+            vod(Kind::Series, "3", "Quiet Harbor S01E03", "Series: A"),
+        ]);
+        assert_eq!(neighbour_episode(&lib, 2, &hide(&["Series: B"])), Some(0), "skips hidden episodes");
+        assert_eq!(neighbour_episode(&lib, 1, &hide(&["Series: B"])), None, "a hidden entry has none");
+    }
+
+    #[test]
+    fn neighbour_of_a_single_episode_show_is_none() {
+        assert_eq!(neighbour_episode(&vod_lib(), 6, &HashSet::new()), None);
+    }
+
+    #[test]
+    fn neighbour_of_a_movie_is_none() {
+        let lib = vod_lib();
+        assert_eq!(neighbour_episode(&lib, 0, &HashSet::new()), None);
+        assert_eq!(neighbour_episode(&lib, 7, &HashSet::new()), None, "(Unsorted)");
+        assert_eq!(neighbour_episode(&lib, 8, &HashSet::new()), None, "live");
     }
 
     #[test]

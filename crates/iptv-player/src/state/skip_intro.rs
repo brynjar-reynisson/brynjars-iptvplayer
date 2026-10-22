@@ -52,6 +52,46 @@ pub fn skip_target(span_end: f64, kinds: &[(f64, Option<FrameKind>)]) -> f64 {
     span_end
 }
 
+/// What an Enter/Esc press does to the "Skip intro" prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntroKey {
+    /// Not ours: the key keeps its usual meaning.
+    Ignore,
+    /// Enter: skip to the target (consumes Enter and Esc this press).
+    Accept,
+    /// Esc: hide the prompt for this episode (nothing else this press).
+    Dismiss,
+}
+
+/// When the prompt owns Enter/Esc: it shows (`offering`, no seek drag), the
+/// "Next episode" offer does not (that one wins the keys), not typing, the
+/// subtitle menu is closed. Enter only in the player view (also fullscreen)
+/// with no tab button focused; in the browse view Enter keeps its list
+/// meaning and the button is clicked instead.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyGate {
+    pub offering: bool,
+    pub next_offer: bool,
+    pub typing: bool,
+    pub sub_menu: bool,
+    pub player_view: bool,
+    pub tab_focused: bool,
+}
+
+impl KeyGate {
+    pub fn key(&self, enter: bool, esc: bool) -> IntroKey {
+        if !self.offering || self.next_offer || self.typing || self.sub_menu {
+            IntroKey::Ignore
+        } else if enter && self.player_view && !self.tab_focused {
+            IntroKey::Accept
+        } else if esc {
+            IntroKey::Dismiss
+        } else {
+            IntroKey::Ignore
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Phase {
     Off,
@@ -191,6 +231,11 @@ impl SkipIntro {
     /// Show the "Skip intro" prompt at this playback position?
     pub fn offering(&self, position: f64) -> bool {
         matches!(self.phase, Phase::Ready { start, target, done: false } if position >= start && position < target - 1.0)
+    }
+
+    /// The intro (start, end) in the playing episode once it is ready.
+    pub fn span(&self) -> Option<(f64, f64)> {
+        self.span.filter(|_| matches!(self.phase, Phase::Ready { .. }))
     }
 
     pub fn target(&self) -> Option<f64> {
@@ -436,6 +481,47 @@ mod tests {
     fn skip_target_leading_intro_content_before_the_card_is_skipped() {
         let k = kinds(&[(10.0, Content), (88.0, Content), (89.0, Content), (91.0, Black), (92.0, Content)]);
         assert_eq!(skip_target(90.0, &k), 92.0);
+    }
+
+    #[test]
+    fn span_is_known_once_ready() {
+        let mut s = SkipIntro::new();
+        assert_eq!(s.span(), None);
+        s.arm(None, true);
+        assert_eq!(s.span(), None);
+        assert_eq!(ready().span(), Some((START, END)));
+    }
+
+    fn gate() -> KeyGate {
+        KeyGate { offering: true, next_offer: false, typing: false, sub_menu: false, player_view: true, tab_focused: false }
+    }
+
+    #[test]
+    fn enter_accepts_and_esc_dismisses_in_the_player_view() {
+        assert_eq!(gate().key(true, false), IntroKey::Accept);
+        assert_eq!(gate().key(false, true), IntroKey::Dismiss);
+        assert_eq!(gate().key(true, true), IntroKey::Accept, "Enter wins, Esc is still consumed");
+        assert_eq!(gate().key(false, false), IntroKey::Ignore);
+    }
+
+    #[test]
+    fn enter_only_in_the_player_view_without_a_focused_tab_button() {
+        assert_eq!(KeyGate { player_view: false, ..gate() }.key(true, false), IntroKey::Ignore);
+        assert_eq!(KeyGate { player_view: false, ..gate() }.key(false, true), IntroKey::Dismiss, "Esc in browse");
+        assert_eq!(KeyGate { tab_focused: true, ..gate() }.key(true, false), IntroKey::Ignore);
+    }
+
+    #[test]
+    fn keys_are_not_ours_when_hidden_typing_in_the_sub_menu_or_next_offer_shows() {
+        for g in [
+            KeyGate { offering: false, ..gate() },
+            KeyGate { next_offer: true, ..gate() },
+            KeyGate { typing: true, ..gate() },
+            KeyGate { sub_menu: true, ..gate() },
+        ] {
+            assert_eq!(g.key(true, false), IntroKey::Ignore, "{g:?}");
+            assert_eq!(g.key(false, true), IntroKey::Ignore, "{g:?}");
+        }
     }
 
     #[test]

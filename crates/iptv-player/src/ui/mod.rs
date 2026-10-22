@@ -40,7 +40,12 @@ use crate::state::favs::{toggle_key, toggle_target, FavBrowser};
 use crate::state::cursor;
 use crate::state::help::HelpTab;
 use crate::state::live::LiveBrowser;
-use crate::state::next::{continue_target, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight};
+use crate::intro_scan::IntroScanner;
+use crate::state::next::{
+    continue_target, neighbour_episode, next_episode, shift_right, show_episodes, show_of, NextCache, ShiftRight,
+};
+use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
+use iptv::intros::Intros;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -201,6 +206,21 @@ struct App {
     autoplay: Autoplay,
     /// `--console`: the intro capture of the playing episode was requested.
     head_scan_started: bool,
+    /// Headless scans of episode openings (own connection, one job at a time).
+    intro_scanner: IntroScanner,
+    /// Per-show intro references (`intros.json`).
+    intros: Intros,
+    /// "Skip intro" flow of the playing episode.
+    skip_intro: SkipIntro,
+    /// URLs the intro scans open: the playing episode, its neighbour (first
+    /// time for a show). Never logged.
+    intro_urls: (String, Option<String>),
+    /// Show of the playing episode (key of its `intros.json` reference).
+    intro_show: String,
+    /// Last known duration of the playing episode (the scans' `duration`).
+    intro_duration: Option<f64>,
+    /// The intro decision of the playing episode was logged (or nothing to decide).
+    intro_logged: bool,
     /// Next episode of the playing one, for the ">>" button (cached: the
     /// lookup scans every show).
     next_cache: NextCache,
@@ -313,6 +333,9 @@ impl App {
         let search = SearchWorker::spawn(move || wake.request_repaint());
         let wake = cc.egui_ctx.clone();
         let titles = TitleLoader::new(opts.data_dir.clone(), TVMAZE_URL.to_string(), move || wake.request_repaint());
+        let wake = cc.egui_ctx.clone();
+        let intro_scanner = IntroScanner::new(user_agent.clone(), move || wake.request_repaint());
+        let intros = Intros::load(&opts.data_dir);
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             data_dir: opts.data_dir,
@@ -332,6 +355,13 @@ impl App {
             key_seek: None,
             autoplay: Autoplay::new(),
             head_scan_started: false,
+            intro_scanner,
+            intros,
+            skip_intro: SkipIntro::new(),
+            intro_urls: (String::new(), None),
+            intro_show: String::new(),
+            intro_duration: None,
+            intro_logged: true,
             next_cache: NextCache::default(),
             help: None,
             url_prompt,
@@ -656,6 +686,7 @@ impl App {
             (Some(_), false) => eprintln!("autoplay: not armed: autoplay_next is off in settings.json"),
         }
         self.autoplay.arm(next, enabled);
+        self.arm_skip_intro(&pb);
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
         if let Some((show, key)) = recent_id(&pb) {
@@ -801,6 +832,113 @@ impl App {
             }
             Step::Nothing => false,
         }
+    }
+
+    /// A new playback: arm the "Skip intro" flow for a sorted series episode
+    /// (stored reference for its show, or a neighbour episode to compare
+    /// with); live, movies and `(Unsorted)` never scan.
+    fn arm_skip_intro(&mut self, pb: &Playback) {
+        self.intro_scanner.cancel();
+        self.intro_duration = None;
+        let Some((show, _)) = recent_id(pb) else {
+            self.skip_intro.disarm();
+            self.intro_logged = true;
+            return;
+        };
+        let lib = pb.library();
+        let neighbour = pb.entry_index().and_then(|e| neighbour_episode(lib, e, &self.hidden));
+        let stored = self.intros.get(&show).cloned();
+        eprintln!(
+            "intro: armed (stored reference: {}, neighbour episode: {})",
+            if stored.is_some() { "yes" } else { "no" },
+            if neighbour.is_some() { "yes" } else { "no" }
+        );
+        self.skip_intro.arm(stored, neighbour.is_some());
+        self.intro_urls = (pb.url().to_string(), neighbour.map(|n| lib.entry(n).url.clone()));
+        self.intro_show = show;
+        self.intro_logged = false;
+    }
+
+    /// Per frame: drive the "Skip intro" flow (scan results in, next scan or
+    /// reference save out). Never logs a URL.
+    fn update_skip_intro(&mut self) {
+        let Ok(p) = &self.player else { return };
+        if let Some(d) = p.position().and_then(|(_, d)| d) {
+            self.intro_duration = Some(d);
+        }
+        // Always the playing episode's duration (also for the Reference scan).
+        let duration = self.intro_duration;
+        let mut actions = Vec::new();
+        for r in self.intro_scanner.poll() {
+            if r.error.is_some() {
+                self.skip_intro.on_failed(r.job);
+            } else {
+                actions.push(self.skip_intro.on_result(r.job, r.prints, r.kinds, duration.unwrap_or(0.0)));
+            }
+        }
+        actions.push(self.skip_intro.update(duration));
+        for a in actions {
+            match a {
+                skip_intro::Action::None => {}
+                skip_intro::Action::Scan { job, which, times } => {
+                    let (name, url) = match which {
+                        Which::Own => ("own", Some(&self.intro_urls.0)),
+                        Which::Refine => ("refine", Some(&self.intro_urls.0)),
+                        Which::Reference => ("reference", self.intro_urls.1.as_ref()),
+                    };
+                    match url {
+                        Some(url) => {
+                            eprintln!("intro: scanning {name} ({} frames)", times.len());
+                            self.intro_scanner.scan(job, url, times);
+                        }
+                        None => self.skip_intro.on_failed(job),
+                    }
+                }
+                skip_intro::Action::SaveReference(prints) => {
+                    eprintln!("intro: reference saved for the show");
+                    self.intros.put(&self.intro_show, prints);
+                    if let Err(e) = self.intros.save_if_dirty() {
+                        eprintln!("could not save intros: {}", safe_text(&format!("{e:#}")));
+                    }
+                }
+            }
+        }
+        if !self.intro_logged {
+            match (self.skip_intro.state_name(), self.skip_intro.span(), self.skip_intro.target()) {
+                ("ready", Some((s, e)), Some(t)) => {
+                    eprintln!("intro: span {s:.0}-{e:.0} s, skip to {t:.0} s");
+                    self.intro_logged = true;
+                }
+                ("off", ..) => {
+                    eprintln!("intro: none");
+                    self.intro_logged = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The "Skip intro" prompt shows now (inside the intro, no seek drag).
+    fn intro_offering(&self) -> bool {
+        let Ok(p) = &self.player else { return false };
+        let live = self.playback.as_ref().is_none_or(Playback::is_live);
+        !live && !self.seek.dragging() && p.position().is_some_and(|(pos, _)| self.skip_intro.offering(pos))
+    }
+
+    /// "Skip intro" clicked or Enter: jump to the first scene after the intro.
+    fn accept_intro(&mut self) {
+        let Some(t) = self.skip_intro.target() else { return };
+        eprintln!("intro: skipped to {t:.0} s");
+        self.skip_intro.accept();
+        if let Ok(p) = &mut self.player {
+            p.seek_to(t);
+            self.seek.sought(t, Instant::now());
+        }
+    }
+
+    fn dismiss_intro(&mut self) {
+        eprintln!("intro: prompt dismissed");
+        self.skip_intro.dismiss();
     }
 
     /// Play the episode after the playing one (autoplay, "Next episode"
@@ -994,6 +1132,9 @@ impl App {
         self.sub_menu = false;
         self.previews.reset();
         self.autoplay.disarm();
+        self.intro_scanner.cancel();
+        self.skip_intro.disarm();
+        self.intro_logged = true;
         self.view = View::Browse;
     }
 
@@ -1341,6 +1482,23 @@ impl App {
             self.autoplay.dismiss();
         }
         let (enter, esc) = if offer_enter || offer_esc { (false, false) } else { (enter, esc) };
+        // The "Skip intro" prompt: the same rules, unless the "Next episode"
+        // offer shows (that one wins the keys).
+        let intro_gate = KeyGate {
+            offering: self.intro_offering(),
+            next_offer: self.autoplay.offering(),
+            typing,
+            sub_menu: self.sub_menu,
+            player_view: self.view == View::Player,
+            tab_focused: self.focused_tab.is_some(),
+        };
+        let intro_key = intro_gate.key(enter, esc);
+        match intro_key {
+            IntroKey::Accept => self.accept_intro(),
+            IntroKey::Dismiss => self.dismiss_intro(),
+            IntroKey::Ignore => {}
+        }
+        let (enter, esc) = if intro_key == IntroKey::Ignore { (enter, esc) } else { (false, false) };
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if toggle_fs || (esc && fullscreen) {
             // Esc only leaves fullscreen; it does nothing else this press.
@@ -1782,6 +1940,8 @@ impl App {
             let mut bar_job: Option<(egui::Rect, Option<(f64, Option<f64>)>)> = None;
             // "Next episode" offer clicked: Some(true) = play now, Some(false) = cancel.
             let mut offer: Option<bool> = None;
+            // "Skip intro" clicked: Some(true) = skip, Some(false) = cancel.
+            let mut intro: Option<bool> = None;
             // ">>" (next episode) button clicked.
             let mut next_clicked = false;
             match (&self.player, &self.playback) {
@@ -1995,8 +2155,12 @@ impl App {
                             self.set_fullscreen(ui.ctx(), !fs);
                         }
                     }
-                    if self.autoplay.offering() {
+                    let next_offer = self.autoplay.offering();
+                    if next_offer {
                         offer = self.next_episode_offer(ui, btn);
+                    }
+                    if self.intro_offering() {
+                        intro = self.skip_intro_offer(ui, btn, next_offer);
                     }
                 }
                 _ => {
@@ -2049,6 +2213,12 @@ impl App {
                     eprintln!("autoplay: offer dismissed");
                     self.autoplay.dismiss();
                 }
+                None => {}
+            }
+            // Re-checked: the seek bar (drawn after the button) may have started a drag.
+            match intro.filter(|_| self.intro_offering()) {
+                Some(true) => self.accept_intro(),
+                Some(false) => self.dismiss_intro(),
                 None => {}
             }
             if next_clicked {
@@ -2106,6 +2276,55 @@ impl App {
         if n_resp.on_hover_text("Play the next episode now (Enter)").clicked() {
             Some(true)
         } else if c_resp.on_hover_text("Keep watching (Esc)").clicked() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The "Skip intro" button and a Cancel button over the video's bottom
+    /// right, above the control buttons (`controls` = the fullscreen button),
+    /// and above the "Next episode" offer when that shows too. Same look as
+    /// that offer. Returns Some(true) = skip, Some(false) = cancel.
+    fn skip_intro_offer(&self, ui: &egui::Ui, controls: egui::Rect, above_next: bool) -> Option<bool> {
+        let lift = if above_next { 52.0 } else { 0.0 };
+        let skip = egui::Rect::from_min_max(
+            egui::pos2(controls.right() - 150.0, controls.top() - 52.0 - lift),
+            egui::pos2(controls.right(), controls.top() - 10.0 - lift),
+        );
+        let cancel = egui::Rect::from_min_size(skip.left_top() - egui::vec2(98.0, 0.0), egui::vec2(90.0, skip.height()));
+        let s_resp = ui.interact(skip, egui::Id::unique("skip_intro_btn"), egui::Sense::click());
+        let c_resp = ui.interact(cancel, egui::Id::unique("skip_intro_cancel"), egui::Sense::click());
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(15.0);
+        // Skip: two triangles (">>" as shapes) and the text.
+        let a = if s_resp.hovered() { 240 } else { 210 };
+        painter.rect_filled(skip, 6.0, egui::Color32::from_black_alpha(a));
+        painter.rect_stroke(skip, 6.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(a - 60)), egui::StrokeKind::Inside);
+        let c = skip.left_center() + egui::vec2(16.0, 0.0);
+        for dx in [-6.0, 2.0] {
+            painter.add(egui::Shape::convex_polygon(
+                vec![c + egui::vec2(dx, -7.0), c + egui::vec2(dx, 7.0), c + egui::vec2(dx + 8.0, 0.0)],
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            ));
+        }
+        painter.text(
+            skip.left_center() + egui::vec2(38.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            "Skip intro",
+            font.clone(),
+            egui::Color32::WHITE,
+        );
+        let ca = if c_resp.hovered() { 240 } else { 210 };
+        painter.rect_filled(cancel, 6.0, egui::Color32::from_black_alpha(ca));
+        painter.text(cancel.center(), egui::Align2::CENTER_CENTER, "Cancel", font, egui::Color32::from_white_alpha(ca - 20));
+        if s_resp.hovered() || c_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if s_resp.on_hover_text("Skip the intro (Enter)").clicked() {
+            Some(true)
+        } else if c_resp.on_hover_text("Watch the intro (Esc)").clicked() {
             Some(false)
         } else {
             None
@@ -2323,6 +2542,7 @@ impl eframe::App for App {
         if !self.update_autoplay(finished) && finished {
             self.on_finished();
         }
+        self.update_skip_intro();
         if ctx.input(|i| i.viewport().close_requested()) {
             // Safety net: if teardown after the window closes ever blocks,
             // end the process instead of leaving it lingering.
@@ -2398,6 +2618,10 @@ impl eframe::App for App {
         if self.autoplay.offering() {
             // The countdown of the "Next episode" offer.
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.intro_offering() {
+            // The "Skip intro" prompt goes away at the end of the intro.
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
         if busy || player_tick.is_some() {
             ctx.request_repaint_after(player_tick.unwrap_or(Duration::from_millis(100)));

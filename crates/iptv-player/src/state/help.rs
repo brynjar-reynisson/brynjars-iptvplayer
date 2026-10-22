@@ -88,7 +88,10 @@ pub const KEYS: &[Section] = &[
             row("Left / Right", "Jump 10 seconds back / forward"),
             row("Shift+Right", "Next episode (the >> button)"),
             row("C", "Subtitle menu: Up/Down + Enter pick, Esc closes"),
-            row("Enter", "\"Next episode in N\" offer: play it now (Esc keeps watching)"),
+            row(
+                "Enter",
+                "\"Skip intro\" button: skip it; \"Next episode in N\" offer: play it now (Esc keeps watching)",
+            ),
         ],
     },
 ];
