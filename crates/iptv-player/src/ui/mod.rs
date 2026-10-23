@@ -32,7 +32,8 @@ use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
 use iptv::recent_series::RecentSeries;
 use iptv::recordings::{self, Recorder, Step as RecStep};
-use iptv::schedule::{Schedules, DAY_NAMES};
+use iptv::schedule::{self, Schedule, Schedules, DAY_NAMES};
+use iptv::handoff;
 use iptv::tasks;
 use iptv::settings::Settings;
 use iptv::subtitles;
@@ -313,6 +314,16 @@ struct App {
     recs_view: ListView,
     recs_reloaded: Instant,
     rec_mode: RecMode,
+    /// Id of the schedule the app itself records (it holds the provider
+    /// connection, so the headless recorder stands by; see `iptv::handoff`).
+    rec_sched: Option<String>,
+    rec_sched_beat: Instant,
+    /// Once a second: is a schedule's window open?
+    sched_check: Instant,
+    /// A schedule the app could not start recording (disk space): not retried.
+    sched_refused: Option<String>,
+    /// A popup the user must dismiss (the watched channel was changed).
+    notice: Option<String>,
     /// `schedules.json`: scheduled recordings (run by Windows Task Scheduler).
     schedules: Schedules,
     sched_form: SchedForm,
@@ -466,6 +477,11 @@ impl App {
             recs_view: ListView::default(),
             recs_reloaded: Instant::now(),
             rec_mode: RecMode::Files,
+            rec_sched: None,
+            rec_sched_beat: Instant::now(),
+            sched_check: Instant::now(),
+            sched_refused: None,
+            notice: None,
             schedules,
             sched_form: SchedForm::default(),
             task_ok: std::collections::HashMap::new(),
@@ -770,6 +786,13 @@ impl App {
     /// [`App::start`]; `fresh` = begin at 0 and forget the saved position
     /// (autoplay / accepted offer: it is superseded).
     fn start_with(&mut self, pb: Playback, fresh: bool) {
+        // One connection per account: while a schedule's window is open the
+        // app only plays (and records) the scheduled channel.
+        if let Some((s, _)) = self.active_window() {
+            if !pb.is_local() && pb.key() != s.key && self.redirect_to_schedule(&s) {
+                return;
+            }
+        }
         self.zap.cancel();
         self.save_position();
         let was_recording = self.recorder.is_some();
@@ -824,10 +847,144 @@ impl App {
         self.playback = Some(pb);
     }
 
+    // ---- scheduled recording ----------------------------------------------
+
+    /// The first enabled schedule whose window is open now, with the seconds left.
+    fn active_window(&self) -> Option<(Schedule, u64)> {
+        let now = recordings::local_now();
+        self.schedules.items().iter().find_map(|s| {
+            if s.enabled {
+                schedule::remaining_secs(s, now).map(|r| (s.clone(), r))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Switch to the scheduled channel and tell the user why. False if it
+    /// cannot be played (not in the playlist).
+    fn redirect_to_schedule(&mut self, s: &Schedule) -> bool {
+        let Some(lib) = self.shown_lib.clone() else { return false };
+        let Some(e) = lib.find_by_key(&s.key).filter(|&e| lib.entry(e).kind == Kind::Live) else { return false };
+        self.notice = Some(format!(
+            "The watched channel was changed to {} because of the recording schedule ({}).",
+            s.name,
+            s.summary()
+        ));
+        if self.live.select_entry(&lib, e) {
+            self.filter.clear();
+            self.country_scroll = self.live.row_index();
+            self.scroll_to = self.live.list().cursor();
+        }
+        self.start(Playback::new(lib, vec![e], e, Tab::Live));
+        true
+    }
+
+    /// Once a second while a schedule's window is open: keep the claim fresh,
+    /// move a conflicting playback to the scheduled channel, and record the
+    /// scheduled channel here when it plays (an idle app leaves it to the
+    /// background recorder).
+    fn update_schedule_window(&mut self) {
+        if self.sched_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.sched_check = Instant::now();
+        let Some((s, remaining)) = self.active_window() else {
+            self.sched_refused = None;
+            return;
+        };
+        if self.rec_sched.as_deref() == Some(s.id.as_str()) {
+            if self.rec_sched_beat.elapsed() >= handoff::BEAT {
+                self.rec_sched_beat = Instant::now();
+                if let Err(e) = handoff::claim(&self.data_dir, &s.id) {
+                    eprintln!("recording: could not refresh the claim: {e}");
+                }
+            }
+            return;
+        }
+        let using = self.playback.as_ref().is_some_and(|p| !p.is_local())
+            && self.player.as_ref().is_ok_and(Player::is_active);
+        if !using {
+            return;
+        }
+        let key = self.playback.as_ref().map(|p| p.key().to_string()).unwrap_or_default();
+        if key != s.key {
+            self.redirect_to_schedule(&s);
+            return;
+        }
+        if self.sched_refused.as_deref() != Some(s.id.as_str())
+            && self.player.as_ref().is_ok_and(|p| p.status() == Status::Playing)
+        {
+            self.begin_scheduled_recording(&s, remaining);
+        }
+    }
+
+    /// The app records schedule `s` (the playing channel) for `remaining` seconds.
+    fn begin_scheduled_recording(&mut self, s: &Schedule, remaining: u64) {
+        let Ok(p) = &self.player else { return };
+        let gen = p.generation();
+        if self.recorder.is_none() {
+            if let Err(e) = std::fs::create_dir_all(&self.rec_dir) {
+                self.message = Some(safe_text(&format!("Cannot create the recordings folder: {e}")));
+                self.sched_refused = Some(s.id.clone());
+                return;
+            }
+            let free = recordings::free_bytes(&self.rec_dir);
+            if let Some(why) = recordings::start_refusal(free) {
+                self.message = Some(why);
+                self.sched_refused = Some(s.id.clone());
+                return;
+            }
+            let now = Instant::now();
+            self.rec_free = free;
+            self.rec_free_at = now;
+            self.rec_gen = gen;
+            self.recorder = Some(Recorder::with_max(
+                &self.rec_dir,
+                &s.name,
+                &recordings::local_stamp(),
+                now,
+                Duration::from_secs(remaining),
+            ));
+        }
+        // (A manual recording of this channel already runs: it simply becomes the scheduled one.)
+        self.rec_sched = Some(s.id.clone());
+        self.rec_sched_beat = Instant::now();
+        if let Err(e) = handoff::claim(&self.data_dir, &s.id) {
+            eprintln!("recording: could not claim the schedule: {e}");
+        }
+        self.message = Some(format!("Recording {} for the schedule until {}", s.name, schedule::fmt_minutes(s.end)));
+        eprintln!("recording: scheduled recording taken over by the app");
+    }
+
+    /// The popup for a changed channel; OK (or Enter/Esc) closes it.
+    fn notice_ui(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.notice.clone() else { return };
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("notice")).show(ctx, |ui| {
+            ui.set_width(420.0_f32.min((ctx.content_rect().width() - 60.0).max(240.0)));
+            ui.heading("Channel changed");
+            ui.add_space(6.0);
+            ui.label(text);
+            ui.add_space(10.0);
+            close = ui.button("OK").clicked();
+        });
+        if close {
+            self.notice = None;
+        }
+    }
+
     // ---- recording ---------------------------------------------------------
 
     /// R / the record button: start recording the playing live channel, or stop.
     fn toggle_record(&mut self) {
+        if self.rec_sched.is_some() {
+            self.message = Some(
+                "A scheduled recording is running. It ends with its time window; Esc stops watching and it continues in the background."
+                    .into(),
+            );
+            return;
+        }
         if self.recorder.is_some() {
             self.stop_record(Some("Recording stopped.".into()));
             return;
@@ -866,6 +1023,10 @@ impl App {
         }
         if let Ok(p) = &mut self.player {
             p.set_stream_record(None);
+        }
+        if let Some(id) = self.rec_sched.take() {
+            // Back to the background recorder (it takes over within a second or two).
+            handoff::release(&self.data_dir, &id);
         }
         eprintln!("recording: stopped");
         self.recs_reloaded = Instant::now() - RECS_RELOAD_EVERY;
@@ -1577,7 +1738,12 @@ impl App {
         self.zap.cancel();
         self.save_position();
         if self.recorder.is_some() {
-            self.stop_record(Some("Recording stopped.".into()));
+            let msg = if self.rec_sched.is_some() {
+                "Stopped watching; the scheduled recording continues in the background."
+            } else {
+                "Recording stopped."
+            };
+            self.stop_record(Some(msg.into()));
         }
         // Stopped on purpose: a live channel is not started again next time.
         self.last_view.clear_live();
@@ -1899,6 +2065,16 @@ impl App {
         }
         // The playlist URL prompt is modal: no shortcut works behind it.
         if self.url_prompt.is_some() {
+            return;
+        }
+        // The "channel changed" popup is modal too: Enter, Esc or Space close it.
+        if self.notice.is_some() {
+            let close = ctx.input_mut(|i| {
+                i.consume_key(M::NONE, Key::Enter) | i.consume_key(M::NONE, Key::Escape) | i.consume_key(M::NONE, Key::Space)
+            });
+            if close {
+                self.notice = None;
+            }
             return;
         }
         let focused = [filter_id(), vod::movie_search_id(), vod::series_search_id()]
@@ -2773,7 +2949,8 @@ impl App {
     /// "REC 0:42:10  1.2 GB" with a red dot at the video's top right while recording.
     fn rec_badge(&self, ui: &egui::Ui, rect: egui::Rect) {
         let Some(rec) = &self.recorder else { return };
-        let mut text = format!("REC {}", clock(rec.elapsed(Instant::now()).as_secs_f64()));
+        let tag = if self.rec_sched.is_some() { "REC (scheduled)" } else { "REC" };
+        let mut text = format!("{tag} {}", clock(rec.elapsed(Instant::now()).as_secs_f64()));
         match rec.current().and_then(|p| std::fs::metadata(p).ok()) {
             Some(m) => text.push_str(&format!("  {}", format_bytes(m.len()))),
             None => text.push_str("  waiting for the stream"),
@@ -3173,6 +3350,7 @@ impl eframe::App for App {
         }
         self.update_skip_intro();
         self.update_recording();
+        self.update_schedule_window();
         if ctx.input(|i| i.viewport().close_requested()) {
             // Safety net: if teardown after the window closes ever blocks,
             // end the process instead of leaving it lingering.
@@ -3239,6 +3417,7 @@ impl eframe::App for App {
             }
         }
         self.url_prompt_ui(&ctx);
+        self.notice_ui(&ctx);
 
         let spent = frame_start.elapsed();
         if spent > SLOW_FRAME {

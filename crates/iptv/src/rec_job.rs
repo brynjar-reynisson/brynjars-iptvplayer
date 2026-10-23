@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::handoff;
 use crate::recordings::{self, Recorder, Step, StopReason};
 use crate::schedule::{self, Schedules};
 
@@ -128,8 +129,23 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
     let mut free_at = Instant::now();
     let mut failures = 0u32;
     let mut bytes_total = 0u64;
+    // The app records the channel it plays itself (one connection only): stand by.
+    let mut standby = false;
+    let mut owner_check = Instant::now();
 
     while Instant::now() < deadline {
+        if handoff::owned_by_app(data_dir, id) {
+            if !standby {
+                standby = true;
+                log.line("the app records this channel now; standing by");
+            }
+            wait(Duration::from_secs(1), deadline);
+            continue;
+        }
+        if standby {
+            standby = false;
+            log.line("the app stopped recording; taking over");
+        }
         let resp = match client.get(&url).send() {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
@@ -179,6 +195,12 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
                 Err(_) => break "the stream sent nothing for 20 s".to_string(),
             };
             let n = chunk.len();
+            if Instant::now().duration_since(owner_check) >= Duration::from_secs(1) {
+                owner_check = Instant::now();
+                if handoff::owned_by_app(data_dir, id) {
+                    break "the app took over the recording".to_string();
+                }
+            }
             let now = Instant::now();
             if now.duration_since(free_at) >= DISK_EVERY {
                 free_at = now;
@@ -216,7 +238,9 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
         }
         rec.interrupt();
         failures = if got_data { 0 } else { failures + 1 };
-        if Instant::now() < deadline {
+        if end.starts_with("the app took over") {
+            log.line(&end);
+        } else if Instant::now() < deadline {
             log.line(&format!("{end}; reconnecting"));
             wait(retry_delay(failures.max(1), None), deadline);
         }

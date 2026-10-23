@@ -4,6 +4,10 @@
 //! ffmpeg MPEG-TS server (port 8188), a schedule whose window is the current
 //! minute, runs `iptv::rec_job::run`, kills the stream once so the recorder
 //! must reconnect, and checks that two part files were written. Needs `ffmpeg`.
+//!
+//! `rec_job_demo handoff`: the "app" claims the recording for the first 15 s
+//! (`iptv::handoff`); the recorder must stand by without connecting (no file),
+//! then take over once the claim is released.
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +50,19 @@ fn main() -> anyhow::Result<()> {
     sc.add("Demo Sport", &iptv::playlist::favorite_key(&entry), 0x7f, start, (start + 1) % 1440).unwrap();
     sc.save_if_dirty()?;
 
+    let handoff = std::env::args().nth(1).as_deref() == Some("handoff");
+    let release_at = Duration::from_secs(15);
+    let t_start = Instant::now();
+    let claimer = handoff.then(|| {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            while t_start.elapsed() < release_at {
+                iptv::handoff::claim(&dir, "s1").unwrap();
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            iptv::handoff::release(&dir, "s1");
+        })
+    });
     let mut ff = spawn_ffmpeg();
     let killer = std::thread::spawn(move || {
         let t0 = Instant::now();
@@ -87,6 +104,16 @@ fn main() -> anyhow::Result<()> {
     let files = iptv::recordings::list(&iptv::recordings::dir_in(&dir));
     for f in &files {
         println!("{}  {} bytes", f.title, f.size);
+    }
+    if let Some(c) = claimer {
+        let _ = c.join();
+        let log = std::fs::read_to_string(dir.join("recorder.log"))?;
+        let first = files.iter().map(|f| f.created).min();
+        let after_release = first.is_some_and(|c| c.duration_since(std::time::SystemTime::now() - t0.elapsed()).map_or(false, |d| d >= Duration::from_secs(13)));
+        let ok = log.contains("standing by") && log.contains("taking over") && after_release && !files.is_empty();
+        println!("standby seen: {}, takeover seen: {}, first file after release: {after_release}", log.contains("standing by"), log.contains("taking over"));
+        println!("RESULT: {}", if ok { "OK" } else { "FAILED" });
+        return Ok(());
     }
     let ok = files.len() >= 2 && files.iter().all(|f| f.size > 10_000);
     println!("RESULT: {}", if ok { "OK" } else { "FAILED" });

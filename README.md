@@ -154,10 +154,18 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   needs no window and no running app: it keeps recording when you close the app, wakes the
   computer from sleep and keeps it awake while recording, and if the start was missed (computer
   off) but you log in before the end it records the rest of the window. It only runs while you are
-  logged in. It records the channel's raw stream on its own connection (so it works while you
-  watch something else if your provider allows two connections; if the account is rejected it
-  retries until the end of the window), reconnecting when the stream drops (new `... - part 2.ts`
-  file), and stops at the end time or when less than 10 GB of disk is left. Turn off/delete a
+  logged in. The recorder copies the channel's raw stream, reconnecting when the stream drops
+  (new `... - part 2.ts` file), and stops at the end time or when less than 10 GB of disk is left.
+  Providers like yours allow one connection per account (a second one makes the provider cut the
+  first, over and over), so only one of "the app" and "the recorder" ever holds it: if the app is
+  open and playing the scheduled channel when the window opens, the app records it itself (badge
+  "REC (scheduled)") and the background recorder stands by; if you close the app or press Esc, the
+  recorder takes over within a couple of seconds. If the app is playing anything else (another
+  channel or a movie), it switches to the scheduled channel and shows a popup saying so; during the
+  window anything you start is changed to the scheduled channel the same way. Playing your
+  recorded files is not affected. R and Space do not stop a scheduled recording (Esc leaves it to
+  the recorder). If the app is open but idle, the recorder records alone and a channel you start
+  playing is changed to the scheduled one. Turn off/delete a
   schedule with its buttons. What happened is in `recorder.log` in the data directory (never the
   stream URL). Add your own padding to the times (a show often overruns its advertised end). If
   you move the app folder, start it once: it re-creates the tasks for the new path. HLS

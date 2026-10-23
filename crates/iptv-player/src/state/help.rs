@@ -80,6 +80,7 @@ pub const KEYS: &[Section] = &[
             row("Up / Down", "Move the cursor"),
             row("Enter", "Play the selected recording (resumes where you stopped); on the playing one = full screen"),
             row("Delete", "Delete the selected recording: Enter confirms, Esc keeps it"),
+            row("Scheduled recording", "While a schedule's window is open the account's single connection belongs to it: the app only plays that channel (anything else you start is changed to it, with a popup) and records it itself; Esc or closing the app hands the recording to the background recorder"),
             row("Schedules", "The Schedules button on the tab: record a channel at set times on chosen weekdays, also with the app closed (Windows Task Scheduler)"),
         ],
     },
