@@ -26,6 +26,13 @@ impl RecList {
         }
     }
 
+    /// Select the first row when nothing is selected (so Enter and Delete work at once).
+    pub fn select_first_if_none(&mut self) {
+        if self.cursor.is_none() && !self.items.is_empty() {
+            self.cursor = Some(0);
+        }
+    }
+
     pub fn items(&self) -> &[Recording] {
         &self.items
     }
@@ -110,6 +117,20 @@ mod tests {
         std::fs::write(d.path().join("D.ts"), b"x").unwrap();
         l.reload(d.path());
         assert_eq!(l.current().unwrap().title, title, "same file stays selected");
+    }
+
+    #[test]
+    fn the_first_row_can_be_selected_when_nothing_is() {
+        let d = dir_with(&["A.ts", "B.ts"]);
+        let mut l = RecList::default();
+        l.select_first_if_none(); // empty list: nothing to select
+        assert!(l.cursor().is_none());
+        l.reload(d.path());
+        l.select_first_if_none();
+        assert_eq!(l.cursor(), Some(0));
+        l.step(1);
+        l.select_first_if_none();
+        assert_eq!(l.cursor(), Some(1), "an existing selection is kept");
     }
 
     #[test]

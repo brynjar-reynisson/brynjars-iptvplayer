@@ -3352,6 +3352,7 @@ impl App {
                         if ui.selectable_label(self.rec_mode == RecMode::Files, "Files").clicked() {
                             self.rec_mode = RecMode::Files;
                             self.reload_recs();
+                            self.recs.select_first_if_none();
                         }
                         if ui.selectable_label(self.rec_mode == RecMode::Schedules, "Schedules").clicked() {
                             self.rec_mode = RecMode::Schedules;
@@ -3407,6 +3408,10 @@ impl App {
                         if matches!(a, Some(RowAction::DoubleClick(_))) && self.playback.is_some() {
                             self.set_fullscreen(&ui.ctx().clone(), true);
                         }
+                    }
+                    if let Some(RowAction::Delete(i)) = a {
+                        self.recs.set_cursor(i);
+                        self.recs.ask_delete();
                     }
                     if ask {
                         self.recs.ask_delete();
@@ -3543,6 +3548,7 @@ impl eframe::App for App {
                 self.scroll_to = self.vod_cursor();
                 if self.tab == Tab::Recordings {
                     self.reload_recs();
+                    self.recs.select_first_if_none();
                     self.scroll_to = self.recs.cursor();
                 }
             }

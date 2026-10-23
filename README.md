@@ -144,8 +144,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   of disk space is left (and does not start below that), on **Esc**, when you switch channel, and
   when the app closes. Pause is off while recording (a paused player would stop reading the
   stream). The **Recordings** tab lists the files (newest first, length, size): Enter or a click
-  plays one (resumes where you stopped), **Delete** (or the Delete button) asks, then Enter
-  deletes and Esc keeps it. Files are plain MPEG-TS; other players open them too.
+  plays one (resumes where you stopped), **Delete** (or the Delete button, or the red
+  x at the end of a row, which needs no selecting first) asks, then Enter deletes and Esc keeps it. Files are plain MPEG-TS; other players open them too.
 - Scheduled recordings (e.g. a football show on Sundays 18:30-19:45): the **Schedules** button
   on the Recordings tab. The channel comes from a dropdown (the channel selected or playing in
   the Live tab, the channels of your schedules, your live favorites); for any other channel select

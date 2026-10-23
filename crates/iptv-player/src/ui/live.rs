@@ -19,6 +19,8 @@ pub enum RowAction {
     Click(usize),
     /// Double click (channel lists: play and open the full player view).
     DoubleClick(usize),
+    /// The delete "x" at the end of a row (Recordings).
+    Delete(usize),
 }
 
 /// Scroll position of one list, remembered between frames so the keyboard
@@ -156,11 +158,12 @@ pub fn recordings(
     view: &mut ListView,
     scroll_to: Option<usize>,
 ) -> Option<RowAction> {
-    list(ui, "recordings", rows.len(), view, scroll_to, |ui, i| {
+    let mut delete = None;
+    let a = list(ui, "recordings", rows.len(), view, scroll_to, |ui, i| {
         let r = &rows[i];
         let len = r.length().map_or(String::new(), |d| format!("   {}", super::clock(d.as_secs_f64())));
         let text = format!("{}{len}   {}", r.title, crate::state::format_bytes(r.size));
-        row(
+        let resp = row(
             ui,
             RowLook {
                 text: &text,
@@ -169,8 +172,27 @@ pub fn recordings(
                 star: false,
                 greyed: false,
             },
-        )
-    })
+        );
+        // A delete "x" at the right end: no need to select the row first.
+        let cell = egui::Rect::from_min_max(egui::pos2(resp.rect.right() - 24.0, resp.rect.top()), resp.rect.right_bottom());
+        let over = ui.rect_contains_pointer(cell);
+        if ui.is_rect_visible(resp.rect) {
+            let color = if over { egui::Color32::from_rgb(230, 70, 70) } else { ui.visuals().weak_text_color() };
+            let c = cell.center();
+            let stroke = egui::Stroke::new(1.8, color);
+            ui.painter().line_segment([c + egui::vec2(-4.0, -4.0), c + egui::vec2(4.0, 4.0)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, -4.0)], stroke);
+        }
+        if over && resp.clicked() {
+            delete = Some(i);
+        }
+        if over {
+            resp.on_hover_text("Delete this recording")
+        } else {
+            resp
+        }
+    });
+    delete.map(RowAction::Delete).or(a)
 }
 
 /// Country list (left panel); the selected country is followed by its
@@ -199,7 +221,7 @@ pub fn countries(
         row(ui, RowLook { text: &label, selected: is_selected, playing: false, star: false, greyed: false })
     });
     a.map(|a| match a {
-        RowAction::Click(r) | RowAction::DoubleClick(r) => at(r),
+        RowAction::Click(r) | RowAction::DoubleClick(r) | RowAction::Delete(r) => at(r),
     })
 }
 
