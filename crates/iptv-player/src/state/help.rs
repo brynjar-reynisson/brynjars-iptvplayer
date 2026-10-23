@@ -80,6 +80,7 @@ pub const KEYS: &[Section] = &[
             row("Up / Down", "Move the cursor"),
             row("Enter", "Play the selected recording (resumes where you stopped); on the playing one = full screen"),
             row("Delete", "Delete the selected recording: Enter confirms, Esc keeps it"),
+            row("Schedules", "The Schedules button on the tab: record a channel at set times on chosen weekdays, also with the app closed (Windows Task Scheduler)"),
         ],
     },
     Section {

@@ -52,7 +52,7 @@ and the DLL are the only files needed at runtime (`config.example.toml` is just 
 
 ### Data directory
 
-`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `recent-series.json` (last 10 series watched), `last-view.json` (where you left off: the next start plays that live channel, or selects that episode without playing), `episode-titles.json` (cached episode titles), `intros.json` (intro fingerprints per show, for Skip intro) and `settings.json` (hidden
+`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `recent-series.json` (last 10 series watched), `schedules.json` (scheduled recordings), `recorder.log` (what the scheduled recorder did), `recordings/` (recorded `.ts` files), `last-view.json` (where you left off: the next start plays that live channel, or selects that episode without playing), `episode-titles.json` (cached episode titles), `intros.json` (intro fingerprints per show, for Skip intro) and `settings.json` (hidden
 groups, subtitle choices, autoplay) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 
@@ -146,6 +146,22 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   stream). The **Recordings** tab lists the files (newest first, length, size): Enter or a click
   plays one (resumes where you stopped), **Delete** (or the Delete button) asks, then Enter
   deletes and Esc keeps it. Files are plain MPEG-TS; other players open them too.
+- Scheduled recordings (e.g. a football show on Sundays 18:30-19:45): the **Schedules** button
+  on the Recordings tab. Select the channel in the Live tab, press "Use selected channel", pick
+  the weekdays, type the start and end time (local time; an end before the start means the next
+  day, at most 12 hours) and press "Add schedule". Each schedule becomes a Windows Task Scheduler
+  task (folder "IPTV Player") that runs `iptv-player.exe --record <id>` at the start time. That
+  needs no window and no running app: it keeps recording when you close the app, wakes the
+  computer from sleep and keeps it awake while recording, and if the start was missed (computer
+  off) but you log in before the end it records the rest of the window. It only runs while you are
+  logged in. It records the channel's raw stream on its own connection (so it works while you
+  watch something else if your provider allows two connections; if the account is rejected it
+  retries until the end of the window), reconnecting when the stream drops (new `... - part 2.ts`
+  file), and stops at the end time or when less than 10 GB of disk is left. Turn off/delete a
+  schedule with its buttons. What happened is in `recorder.log` in the data directory (never the
+  stream URL). Add your own padding to the times (a show often overruns its advertised end). If
+  you move the app folder, start it once: it re-creates the tasks for the new path. HLS
+  (`.m3u8`) channels cannot be scheduled. Schedules are stored in `schedules.json`.
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups
   from the results.
 - The status overlay shows what is happening while a stream is not playing:

@@ -62,6 +62,8 @@ Known gaps and ideas that were found during implementation and review but not do
 
 - **Recording, manual checks still to do** (2026-10-23): the recorder/list/delete logic and mpv's runtime `stream-record` are tested, the GUI wiring is not. Try in the real app: R / red button start and stop, badge, file appears in `recordings/`, Esc and channel switch stop it, a stream drop starts `part 2`, closing the app mid-recording leaves a playable file, Recordings tab play/resume/delete (and the confirm keys), Space during recording says pause is off. The 3 h and 10 GB rules are only unit-tested (use a smaller `MAX_RECORD` to try the stop). Recordings are not listed with an exact length (last write minus creation time).
 
+- **Scheduled recording, manual checks still to do** (2026-10-23): verified headless (`rec_job_demo`) and against the real Task Scheduler (create/replace/delete), not yet by a real task firing. Try: add a schedule a few minutes ahead from the Schedules view, close the app, check the task in Task Scheduler (folder IPTV Player) and that the file appears; run with the PC asleep (WakeToRun needs "Allow wake timers" in the power plan); start missed (record the rest). Open questions: whether the provider allows two parallel streams of one account (a test with two recorders was planned); a task whose exe was deleted. No padding option (the user adds it to the times). The Files list is not refreshed while a scheduled recording runs (reopen the Files view).
+
 ## Ideas (not requested)
 
 - Show watched/resumable marks (and the saved position) in the movie and episode lists.

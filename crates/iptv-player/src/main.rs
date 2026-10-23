@@ -6,6 +6,8 @@
 //!   (default: `IPTV_DATA_DIR`, then the exe's directory).
 //! - `--playlist-file` (dev): parse a local `.m3u` instead of downloading
 //!   `playlist_url`; the result is still cached under the data dir.
+//! - `--record <id>`: no window; record schedule `<id>` (what the Windows
+//!   scheduled task runs, see `iptv::rec_job`).
 //! - `--console`: status lines on stderr reach the terminal, and every tail
 //!   scan ("Next episode") saves its frames under `<data dir>/scan-frames/`.
 //!
@@ -21,7 +23,8 @@ use std::time::Instant;
 
 use iptv_player::ui::{run, Options};
 
-const USAGE: &str = "usage: iptv-player [--console] [--data-dir <path>] [--playlist-file <path.m3u>]";
+const USAGE: &str =
+    "usage: iptv-player [--console] [--data-dir <path>] [--playlist-file <path.m3u>] [--record <schedule id>]";
 
 /// GUI-subsystem builds start without a console: borrow the parent's (the
 /// terminal that started us), if any, so stdout/stderr reach it. Redirected
@@ -54,6 +57,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mut data_dir = None;
     let mut playlist_file = None;
+    let mut record = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -61,6 +65,7 @@ fn main() -> anyhow::Result<()> {
             "--playlist-file" => {
                 playlist_file = Some(PathBuf::from(args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?))
             }
+            "--record" => record = Some(args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?),
             "--console" => {}
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -70,6 +75,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let data_dir = iptv::config::data_dir(data_dir);
+    // Started by Task Scheduler: record without a window (see `iptv::rec_job`).
+    if let Some(id) = record {
+        return match iptv::rec_job::run(&data_dir, &id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("iptv-player: recording failed: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
     eprintln!("data dir: {}", data_dir.display());
     run(Options { data_dir, playlist_file, t0, console })
 }

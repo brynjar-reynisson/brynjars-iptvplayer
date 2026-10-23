@@ -32,6 +32,8 @@ use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
 use iptv::recent_series::RecentSeries;
 use iptv::recordings::{self, Recorder, Step as RecStep};
+use iptv::schedule::{Schedules, DAY_NAMES};
+use iptv::tasks;
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
@@ -51,6 +53,7 @@ use iptv::intro::INTRO_SCAN_SECS;
 use iptv::intros::Intros;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::recs::RecList;
+use crate::state::sched_form::SchedForm;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
     playing_title, visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
@@ -104,10 +107,40 @@ enum View {
     Player,
 }
 
+/// What the Recordings tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecMode {
+    Files,
+    Schedules,
+}
+
 /// How often the free disk space is read while recording.
 const REC_DISK_EVERY: Duration = Duration::from_secs(5);
 /// How often the Recordings list is re-read while a recording runs.
 const RECS_RELOAD_EVERY: Duration = Duration::from_secs(3);
+
+/// The scheduled recordings' Windows tasks point at the exe that created them:
+/// when the app was moved or rebuilt elsewhere, create them again (background).
+fn sync_tasks_after_move(schedules: &mut Schedules, data_dir: &std::path::Path) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe_text = exe.display().to_string();
+    if schedules.items().is_empty() || schedules.exe() == Some(exe_text.as_str()) {
+        return;
+    }
+    let dir = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let items = schedules.items().to_vec();
+    std::thread::spawn(move || {
+        for s in items {
+            if let Err(e) = tasks::install(&exe, &dir, &s) {
+                eprintln!("could not update the scheduled recording {}: {}", s.id, safe_text(&format!("{e:#}")));
+            }
+        }
+    });
+    schedules.set_exe(&exe_text);
+    if let Err(e) = schedules.save_if_dirty() {
+        eprintln!("could not save schedules: {}", safe_text(&format!("{e:#}")));
+    }
+}
 
 /// How often the position of a playing movie/episode is written to disk.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(15);
@@ -279,6 +312,13 @@ struct App {
     recs: RecList,
     recs_view: ListView,
     recs_reloaded: Instant,
+    rec_mode: RecMode,
+    /// `schedules.json`: scheduled recordings (run by Windows Task Scheduler).
+    schedules: Schedules,
+    sched_form: SchedForm,
+    /// Which schedules have their Windows task (read in the background).
+    task_ok: std::collections::HashMap<String, bool>,
+    task_rx: Option<Receiver<std::collections::HashMap<String, bool>>>,
     /// Taken by the first library that is shown: go back to `last_view`.
     restore: Option<Last>,
     /// Selected row of that list (keyboard).
@@ -368,6 +408,8 @@ impl App {
         let recent = RecentSeries::load(&opts.data_dir);
         let last_view = LastView::load(&opts.data_dir);
         let data_dir_for_rec = opts.data_dir.clone();
+        let mut schedules = Schedules::load(&opts.data_dir);
+        sync_tasks_after_move(&mut schedules, &opts.data_dir);
         let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
@@ -423,6 +465,11 @@ impl App {
             recs: RecList::default(),
             recs_view: ListView::default(),
             recs_reloaded: Instant::now(),
+            rec_mode: RecMode::Files,
+            schedules,
+            sched_form: SchedForm::default(),
+            task_ok: std::collections::HashMap::new(),
+            task_rx: None,
             restore,
             recent_cursor: None,
             recent_view: ListView::default(),
@@ -597,6 +644,12 @@ impl App {
             }
         }
         self.sync_library();
+        if let Some(rx) = &self.task_rx {
+            if let Ok(map) = rx.try_recv() {
+                self.task_ok = map;
+                self.task_rx = None;
+            }
+        }
         if let Some(rx) = &self.groups_rx {
             match rx.try_recv() {
                 Ok(g) => {
@@ -856,6 +909,169 @@ impl App {
             self.message = Some("Pause is off while recording.".into());
         } else if let Ok(p) = &mut self.player {
             p.toggle_pause();
+        }
+    }
+
+    /// Read, in the background, which schedules have their Windows task.
+    fn refresh_task_status(&mut self) {
+        let ids: Vec<String> = self.schedules.items().iter().map(|s| s.id.clone()).collect();
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let map = ids.into_iter().map(|id| (tasks::exists(&id), id)).map(|(ok, id)| (id, ok)).collect();
+            let _ = tx.send(map);
+            ctx.request_repaint();
+        });
+        self.task_rx = Some(rx);
+    }
+
+    fn save_schedules(&mut self) {
+        if let Err(e) = self.schedules.save_if_dirty() {
+            self.message = Some(safe_text(&format!("Could not save the schedules: {e:#}")));
+        }
+    }
+
+    fn abs_data_dir(&self) -> PathBuf {
+        std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone())
+    }
+
+    /// "Use selected channel": the Live tab's selection, else the playing channel.
+    fn pick_schedule_channel(&mut self) {
+        let selected = self.shown_lib.as_ref().zip(self.live.list().current()).map(|(lib, e)| {
+            let en = lib.entry(e);
+            (en.name.clone(), favorite_key(en))
+        });
+        let playing = self.playback.as_ref().filter(|p| p.is_live()).map(|p| (p.name().to_string(), p.key().to_string()));
+        match selected.or(playing) {
+            Some(c) => self.sched_form.channel = Some(c),
+            None => self.message = Some("Select a channel in the Live tab first.".into()),
+        }
+    }
+
+    fn add_schedule(&mut self) {
+        let nf = match self.sched_form.build() {
+            Ok(n) => n,
+            Err(m) => {
+                self.message = Some(m);
+                return;
+            }
+        };
+        let s = match self.schedules.add(&nf.name, &nf.key, nf.days, nf.start, nf.end) {
+            Ok(s) => s,
+            Err(m) => {
+                self.message = Some(m.into());
+                return;
+            }
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            self.schedules.remove(&s.id);
+            self.message = Some("Cannot find this program's own path.".into());
+            return;
+        };
+        match tasks::install(&exe, &self.abs_data_dir(), &s) {
+            Ok(()) => {
+                self.schedules.set_exe(&exe.display().to_string());
+                self.save_schedules();
+                self.message = Some(format!("Scheduled: {}", s.summary()));
+                self.sched_form.clear_times();
+                self.refresh_task_status();
+            }
+            Err(e) => {
+                self.schedules.remove(&s.id);
+                self.save_schedules();
+                self.message = Some(safe_text(&format!("Could not schedule it: {e:#}")));
+            }
+        }
+    }
+
+    fn delete_schedule(&mut self, id: &str) {
+        if let Err(e) = tasks::remove(id) {
+            self.message = Some(safe_text(&format!("{e:#}")));
+            return;
+        }
+        self.schedules.remove(id);
+        self.save_schedules();
+        self.task_ok.remove(id);
+        self.message = Some("Schedule deleted.".into());
+    }
+
+    fn toggle_schedule(&mut self, id: &str, enabled: bool) {
+        let Some(s) = self.schedules.set_enabled(id, enabled) else { return };
+        let Ok(exe) = std::env::current_exe() else { return };
+        match tasks::install(&exe, &self.abs_data_dir(), &s) {
+            Ok(()) => self.save_schedules(),
+            Err(e) => {
+                self.schedules.set_enabled(id, !enabled);
+                self.message = Some(safe_text(&format!("Could not change the task: {e:#}")));
+            }
+        }
+        self.refresh_task_status();
+    }
+
+    /// The Schedules view of the Recordings tab.
+    fn schedules_ui(&mut self, ui: &mut egui::Ui) {
+        let mut toggle: Option<(String, bool)> = None;
+        let mut delete: Option<String> = None;
+        if self.schedules.items().is_empty() {
+            ui.weak("No scheduled recordings.");
+        }
+        for s in self.schedules.items() {
+            ui.horizontal(|ui| {
+                let missing = self.task_ok.get(&s.id) == Some(&false);
+                ui.label(s.summary());
+                if missing {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Windows task missing");
+                }
+                if ui.small_button(if s.enabled { "Turn off" } else { "Turn on" }).clicked() {
+                    toggle = Some((s.id.clone(), !s.enabled));
+                }
+                if ui.small_button("Delete").clicked() {
+                    delete = Some(s.id.clone());
+                }
+            });
+        }
+        ui.separator();
+        ui.strong("New schedule");
+        let mut pick = false;
+        ui.horizontal(|ui| {
+            ui.label("Channel:");
+            match &self.sched_form.channel {
+                Some((name, _)) => ui.label(name),
+                None => ui.weak("none"),
+            };
+            pick = ui.button("Use selected channel").on_hover_text("The channel selected in the Live tab").clicked();
+        });
+        ui.horizontal(|ui| {
+            for (d, name) in DAY_NAMES.iter().enumerate() {
+                if ui.selectable_label(self.sched_form.has_day(d), *name).clicked() {
+                    self.sched_form.toggle_day(d);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("From");
+            ui.add(egui::TextEdit::singleline(&mut self.sched_form.start).hint_text("18:30").desired_width(60.0));
+            ui.label("to");
+            ui.add(egui::TextEdit::singleline(&mut self.sched_form.end).hint_text("19:45").desired_width(60.0));
+        });
+        ui.weak("Local time; an end before the start means the next day.");
+        let add = ui.button("Add schedule").clicked();
+        ui.add_space(6.0);
+        ui.weak(
+            "Windows Task Scheduler starts the recording at that time, also when this app is closed \
+             (the computer is woken from sleep). Progress: recorder.log in the data folder.",
+        );
+        if pick {
+            self.pick_schedule_channel();
+        }
+        if let Some((id, on)) = toggle {
+            self.toggle_schedule(&id, on);
+        }
+        if let Some(id) = delete {
+            self.delete_schedule(&id);
+        }
+        if add {
+            self.add_schedule();
         }
     }
 
@@ -1484,8 +1700,10 @@ impl App {
                 return;
             }
             Tab::Recordings => {
-                self.recs.step(delta);
-                self.scroll_to = self.recs.cursor();
+                if self.rec_mode == RecMode::Files {
+                    self.recs.step(delta);
+                    self.scroll_to = self.recs.cursor();
+                }
                 return;
             }
             Tab::Series => {
@@ -1535,6 +1753,7 @@ impl App {
                 self.scroll_to = self.vod_cursor();
                 return;
             }
+            Tab::Recordings if self.rec_mode == RecMode::Schedules => return,
             Tab::Recordings => {
                 match self.recs.cursor() {
                     None => {
@@ -1775,6 +1994,7 @@ impl App {
         let esc = esc && !fullscreen;
         // Recordings tab: Delete asks, then Enter deletes and Esc keeps the file.
         let (enter, esc) = if self.tab == Tab::Recordings
+            && self.rec_mode == RecMode::Files
             && self.view == View::Browse
             && !fullscreen
             && !typing
@@ -2793,6 +3013,21 @@ impl App {
             }
             Tab::Recordings => {
                 egui::Panel::left("recordings").resizable(true).default_size(560.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.rec_mode == RecMode::Files, "Files").clicked() {
+                            self.rec_mode = RecMode::Files;
+                            self.reload_recs();
+                        }
+                        if ui.selectable_label(self.rec_mode == RecMode::Schedules, "Schedules").clicked() {
+                            self.rec_mode = RecMode::Schedules;
+                            self.refresh_task_status();
+                        }
+                    });
+                    ui.separator();
+                    if self.rec_mode == RecMode::Schedules {
+                        self.schedules_ui(ui);
+                        return;
+                    }
                     let mut ask = false;
                     let mut yes = false;
                     let mut no = false;

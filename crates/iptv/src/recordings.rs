@@ -63,19 +63,55 @@ mod sys {
     }
 }
 
-/// Local date and time for file names: `2026-10-23 20-30`.
-pub fn local_stamp() -> String {
+/// The local wall-clock time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalNow {
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
+    /// 0 = Sunday ... 6 = Saturday.
+    pub weekday: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+}
+
+pub fn local_now() -> LocalNow {
     #[cfg(windows)]
     {
         let mut t = sys::SystemTime::default();
         unsafe { sys::GetLocalTime(&mut t) };
-        format!("{:04}-{:02}-{:02} {:02}-{:02}", t.year, t.month, t.day, t.hour, t.minute)
+        LocalNow {
+            year: t.year,
+            month: t.month,
+            day: t.day,
+            weekday: t.day_of_week,
+            hour: t.hour,
+            minute: t.minute,
+            second: t.second,
+        }
     }
     #[cfg(not(windows))]
     {
+        // No local time zone support off Windows: UTC.
         let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        format!("t{secs}")
+        let day = secs / 86400;
+        LocalNow {
+            year: 1970,
+            month: 1,
+            day: 1,
+            weekday: ((day + 4) % 7) as u16,
+            hour: (secs / 3600 % 24) as u16,
+            minute: (secs / 60 % 60) as u16,
+            second: (secs % 60) as u16,
+        }
     }
+}
+
+/// Local date and time for file names: `2026-10-23 20-30`.
+pub fn local_stamp() -> String {
+    let t = local_now();
+    format!("{:04}-{:02}-{:02} {:02}-{:02}", t.year, t.month, t.day, t.hour, t.minute)
 }
 
 /// Free bytes available to this user on the disk holding `dir` (which must
@@ -107,7 +143,7 @@ pub enum StopReason {
 impl StopReason {
     pub fn message(self) -> &'static str {
         match self {
-            StopReason::MaxTime => "Recording stopped: the 3 hour limit was reached.",
+            StopReason::MaxTime => "Recording stopped: the time limit was reached.",
             StopReason::LowSpace => "Recording stopped: less than 10 GB of disk space left.",
         }
     }
@@ -145,13 +181,20 @@ pub struct Recorder {
     channel: String,
     stamp: String,
     started: Instant,
+    max: Duration,
     part: u32,
     current: Option<PathBuf>,
 }
 
 impl Recorder {
     pub fn new(dir: &Path, channel: &str, stamp: &str, now: Instant) -> Recorder {
+        Self::with_max(dir, channel, stamp, now, MAX_RECORD)
+    }
+
+    /// Like [`new`](Self::new) with another length limit (scheduled recordings).
+    pub fn with_max(dir: &Path, channel: &str, stamp: &str, now: Instant, max: Duration) -> Recorder {
         Recorder {
+            max,
             dir: dir.to_path_buf(),
             channel: channel.to_string(),
             stamp: stamp.to_string(),
@@ -183,7 +226,7 @@ impl Recorder {
     /// Decide what to do now. `playing`: the stream plays (not reconnecting);
     /// `free`: free disk space (`None` = unknown, treated as low).
     pub fn poll(&mut self, now: Instant, playing: bool, free: Option<u64>) -> Step {
-        let stop = if self.elapsed(now) >= MAX_RECORD {
+        let stop = if self.elapsed(now) >= self.max {
             Some(StopReason::MaxTime)
         } else if free.is_none_or(|f| f < MIN_FREE_BYTES) {
             Some(StopReason::LowSpace)

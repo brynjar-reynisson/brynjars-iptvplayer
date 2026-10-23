@@ -12,6 +12,7 @@ pub mod nav;
 pub mod next;
 pub mod playback;
 pub mod recs;
+pub mod sched_form;
 pub mod seek;
 pub mod skip_intro;
 pub mod titles;
