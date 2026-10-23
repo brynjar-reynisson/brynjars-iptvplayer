@@ -164,7 +164,9 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   `ffmpeg` is installed (next to `iptv-player.exe` or on the PATH), a 2-second title card
   "Connection was lost for 12 seconds" (or "1:12 minutes") is put in the file at that spot, made
   to match the stream's video and sound; the recording itself is not re-encoded. Without ffmpeg,
-  or if a card cannot be made, the pieces are just joined with no card. Shorter gaps get no card.
+  or if a card cannot be made, the pieces are just glued together with no card; then the shown
+  length of a recording that was handed over between the app and the recorder can be wrong (hours
+  too long), because their timestamps differ. With ffmpeg the join makes them continuous. Shorter gaps get no card.
   Providers like yours allow one connection per account (a second one makes the provider cut the
   first, over and over), so only one of "the app" and "the recorder" ever holds it: if the app is
   open and playing when a window opens (it claims the recording up to 45 seconds before, so the

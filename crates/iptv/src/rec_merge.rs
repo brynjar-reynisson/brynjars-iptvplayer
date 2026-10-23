@@ -184,9 +184,13 @@ fn join(dir: &Path, base: &str, spans: Vec<Span>, ffmpeg: Option<&Path>, log: &m
     let cards: Vec<(usize, u64)> = gaps.iter().enumerate().filter(|(_, g)| **g >= MIN_GAP_MS).map(|(i, g)| (i, *g)).collect();
     let mut cards_done = 0;
     let mut joined = false;
-    if !cards.is_empty() {
+    // More than one piece: the pieces' timestamps do not line up (the app's start at 0, the
+    // recorder's carry the provider's clock, hours later), so gluing them leaves a jump that
+    // makes players show an absurd length. An ffmpeg remux (no re-encoding) makes them continuous.
+    if !cards.is_empty() || files.len() > 1 {
         match ffmpeg {
-            None => log("ffmpeg was not found: joining without gap cards"),
+            None if !cards.is_empty() => log("ffmpeg was not found: joining without gap cards"),
+            None => log("ffmpeg was not found: the pieces are only glued together, their timestamps may jump (the length shown can be wrong)"),
             Some(ff) => {
                 let need: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
                 match crate::recordings::free_bytes(dir) {
@@ -195,9 +199,9 @@ fn join(dir: &Path, base: &str, spans: Vec<Span>, ffmpeg: Option<&Path>, log: &m
                             joined = true;
                             cards_done = cards.len();
                         }
-                        Err(e) => log(&format!("gap cards failed ({e}): joining without them")),
+                        Err(e) => log(&format!("joining with ffmpeg failed ({e}): the pieces are only glued together")),
                     },
-                    _ => log("not enough free disk space for gap cards: joining without them"),
+                    _ => log("not enough free disk space for an ffmpeg join: the pieces are only glued together"),
                 }
             }
         }
@@ -323,16 +327,21 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 /// Make the cards, then remux pieces and cards into `work/out.ts` without
 /// re-encoding the recording (`-c copy`).
 fn join_with_cards(work: &Path, files: &[PathBuf], cards: &[(usize, u64)], ffmpeg: &Path) -> Result<(), String> {
-    let probe = hide_window(Command::new(ffprobe_for(ffmpeg)).args(["-v", "error", "-show_streams", "-of", "json"]).arg(&files[0]))
-        .output()
-        .map_err(|e| format!("cannot run ffprobe: {e}"))?;
-    let spec = card_spec(&String::from_utf8_lossy(&probe.stdout)).ok_or("the stream's codecs cannot be matched")?;
-    let font = windows_font().ok_or("no font found for the card text")?;
-    let font = font.replace(':', "\\:");
+    // Cards must look like the stream; a plain remux needs none of this.
+    let card_gear = if cards.is_empty() {
+        None
+    } else {
+        let probe = hide_window(Command::new(ffprobe_for(ffmpeg)).args(["-v", "error", "-show_streams", "-of", "json"]).arg(&files[0]))
+            .output()
+            .map_err(|e| format!("cannot run ffprobe: {e}"))?;
+        let spec = card_spec(&String::from_utf8_lossy(&probe.stdout)).ok_or("the stream's codecs cannot be matched")?;
+        let font = windows_font().ok_or("no font found for the card text")?.replace(':', "\\:");
+        Some((spec, font))
+    };
     let mut list = String::new();
     for (i, f) in files.iter().enumerate() {
         list.push_str(&format!("file '{}'\n", f.file_name().unwrap().to_string_lossy()));
-        if let Some((n, (_, gap))) = cards.iter().enumerate().find(|(_, (at, _))| *at == i) {
+        if let (Some((n, (_, gap))), Some((spec, font))) = (cards.iter().enumerate().find(|(_, (at, _))| *at == i), &card_gear) {
             std::fs::write(work.join(format!("c{n}.txt")), card_text(*gap)).map_err(|e| e.to_string())?;
             let vf = format!(
                 "drawtext=fontfile='{font}':textfile=c{n}.txt:fontcolor=white:fontsize=h/14:x=(w-text_w)/2:y=(h-text_h)/2,format={}",
@@ -484,7 +493,7 @@ mod tests {
         let mut logs = Vec::new();
         let o = finalize(d.path(), base, None, Duration::ZERO, &mut |m| logs.push(m.to_string()));
         assert!(matches!(o, Outcome::Joined { pieces: 2, cards: 0, .. }));
-        assert!(logs.is_empty(), "no card wanted, so no complaint about ffmpeg: {logs:?}");
+        assert!(logs.iter().any(|l| l.contains("timestamps may jump")), "glued only, and it says so: {logs:?}");
     }
 
     #[test]
@@ -539,6 +548,41 @@ mod tests {
         assert!(s.audio.is_none() && s.pix_fmt == "yuv420p" && s.video_encoder == "mpeg2video", "a stream without sound still gets cards");
         assert!(card_spec(r#"{"streams":[{"codec_type":"video","codec_name":"h264"}]}"#).is_none(), "no size or rate");
         assert!(card_spec("nonsense").is_none());
+    }
+
+    /// Real ffmpeg: a piece starting at 0 (the app's) and one on the provider's clock
+    /// (hours later, the recorder's) must not leave a huge jump in the joined file.
+    #[test]
+    fn timestamps_are_made_continuous_with_real_ffmpeg() {
+        let Some(ffmpeg) = find_ffmpeg() else {
+            eprintln!("skipped: no ffmpeg");
+            return;
+        };
+        let d = tempfile::tempdir().unwrap();
+        let base = "Clip - 2026-10-25 18-30";
+        for (n, offset) in [("app1", "0"), ("rec2", "72950")] {
+            let out = d.path().join(format!("{base}.piece-{n}.ts"));
+            let st = hide_window(Command::new(&ffmpeg).args(["-v", "error", "-y"]))
+                .args(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=3"])
+                .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3"])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-output_ts_offset", offset, "-f", "mpegts"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        journal_append(d.path(), base, &PieceInfo { file: format!("{base}.piece-app1.ts"), begin: 0, end: 3_000 }).unwrap();
+        journal_append(d.path(), base, &PieceInfo { file: format!("{base}.piece-rec2.ts"), begin: 3_500, end: 6_500 }).unwrap(); // 0.5 s gap: no card
+        let mut logs = Vec::new();
+        let o = finalize(d.path(), base, Some(&ffmpeg), Duration::ZERO, &mut |m| logs.push(m.to_string()));
+        let Outcome::Joined { file, pieces, cards } = o else { panic!("{o:?} {logs:?}") };
+        assert_eq!((pieces, cards), (2, 0));
+        let probe = hide_window(Command::new(ffprobe_for(&ffmpeg)).args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]))
+            .arg(&file)
+            .output()
+            .unwrap();
+        let secs: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap();
+        assert!((5.0..8.0).contains(&secs), "3 + 3 s, not hours: got {secs}");
     }
 
     /// Real ffmpeg: two small clips with a 5 s gap between them -> one file
