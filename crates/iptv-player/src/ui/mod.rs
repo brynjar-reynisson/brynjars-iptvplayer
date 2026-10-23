@@ -1096,8 +1096,35 @@ impl App {
         std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone())
     }
 
-    /// The Live tab's selected channel, else the playing one (name, favorite key).
-    fn default_schedule_channel(&self) -> Option<(String, String)> {
+    /// Channels the schedule form offers (name, favorite key): the Live tab's
+    /// selection, the playing channel, channels of existing schedules (newest
+    /// first), then live favorites.
+    fn schedule_channel_choices(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = Vec::new();
+        let mut push = |name: String, key: String| {
+            if !v.iter().any(|(_, k)| *k == key) {
+                v.push((name, key));
+            }
+        };
+        if let Some((name, key)) = self.live_tab_channel() {
+            push(name, key);
+        }
+        for s in self.schedules.items().iter().rev() {
+            push(s.name.clone(), s.key.clone());
+        }
+        for f in self.favs.list().iter().filter(|f| f.key.starts_with("live:")) {
+            let name = self
+                .shown_lib
+                .as_ref()
+                .and_then(|l| l.find_by_key(&f.key).map(|e| l.entry(e).name.clone()))
+                .unwrap_or_else(|| f.label.clone());
+            push(name, f.key.clone());
+        }
+        v
+    }
+
+    /// The channel selected in the Live tab, else the playing live channel.
+    fn live_tab_channel(&self) -> Option<(String, String)> {
         let selected = self.shown_lib.as_ref().zip(self.live.list().current()).map(|(lib, e)| {
             let en = lib.entry(e);
             (en.name.clone(), favorite_key(en))
@@ -1106,11 +1133,16 @@ impl App {
         selected.or(playing)
     }
 
+    /// The channel a new schedule starts with.
+    fn default_schedule_channel(&self) -> Option<(String, String)> {
+        self.schedule_channel_choices().into_iter().next()
+    }
+
     /// "Use selected channel".
     fn pick_schedule_channel(&mut self) {
-        match self.default_schedule_channel() {
+        match self.live_tab_channel() {
             Some(c) => self.sched_form.channel = Some(c),
-            None => self.message = Some("Select a channel in the Live tab first.".into()),
+            None => self.message = Some("No channel is selected in the Live tab: select one there first.".into()),
         }
     }
 
@@ -1203,17 +1235,26 @@ impl App {
         ui.separator();
         ui.strong("New schedule");
         let mut pick = false;
+        let choices = self.schedule_channel_choices();
         ui.horizontal(|ui| {
             ui.label("Channel:");
-            match &self.sched_form.channel {
-                Some((name, _)) => ui.label(name),
-                None => ui.weak("none"),
-            };
+            let shown = self.sched_form.channel.as_ref().map_or("choose a channel".to_string(), |(n, _)| n.clone());
+            let current = self.sched_form.channel.as_ref().map(|(_, k)| k.clone());
+            egui::ComboBox::from_id_salt("sched_channel").selected_text(shown).width(300.0).show_ui(ui, |ui| {
+                for (name, key) in &choices {
+                    if ui.selectable_label(current.as_deref() == Some(key.as_str()), name).clicked() {
+                        self.sched_form.channel = Some((name.clone(), key.clone()));
+                    }
+                }
+            });
             pick = ui
                 .button("Use selected channel")
-                .on_hover_text("The channel selected or playing in the Live tab (filled in automatically at first)")
+                .on_hover_text("The channel selected or playing in the Live tab")
                 .clicked();
         });
+        ui.weak(
+            "The list holds the channel selected or playing in the Live tab, the channels of your schedules and your              live favorites. For any other channel: select it in the Live tab first, then come back here and press              \"Use selected channel\".",
+        );
         ui.horizontal(|ui| {
             for (d, name) in DAY_NAMES.iter().enumerate() {
                 if ui.selectable_label(self.sched_form.has_day(d), *name).clicked() {

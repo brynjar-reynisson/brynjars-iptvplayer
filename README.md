@@ -147,8 +147,9 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   plays one (resumes where you stopped), **Delete** (or the Delete button) asks, then Enter
   deletes and Esc keeps it. Files are plain MPEG-TS; other players open them too.
 - Scheduled recordings (e.g. a football show on Sundays 18:30-19:45): the **Schedules** button
-  on the Recordings tab. Select the channel in the Live tab, press "Use selected channel", pick
-  the weekdays, type the start and end time (local time; an end before the start means the next
+  on the Recordings tab. The channel comes from a dropdown (the channel selected or playing in
+  the Live tab, the channels of your schedules, your live favorites); for any other channel select
+  it in the Live tab first and press "Use selected channel". Pick the weekdays, type the start and end time (local time; an end before the start means the next
   day, at most 12 hours) and press "Add schedule". Each schedule becomes a Windows Task Scheduler
   task (folder "IPTV Player") that runs `iptv-player.exe --record <id>` at the start time. That
   needs no window and no running app: it keeps recording when you close the app, wakes the
