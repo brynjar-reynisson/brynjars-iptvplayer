@@ -11,6 +11,7 @@ pub mod live;
 pub mod nav;
 pub mod next;
 pub mod playback;
+pub mod recs;
 pub mod seek;
 pub mod skip_intro;
 pub mod titles;
@@ -28,10 +29,11 @@ pub enum Tab {
     Favorites,
     Movies,
     Series,
+    Recordings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Live, Tab::Favorites, Tab::Movies, Tab::Series];
+    pub const ALL: [Tab; 5] = [Tab::Live, Tab::Favorites, Tab::Movies, Tab::Series, Tab::Recordings];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -39,6 +41,7 @@ impl Tab {
             Tab::Favorites => "Favorites",
             Tab::Movies => "Movies",
             Tab::Series => "Series",
+            Tab::Recordings => "Recordings",
         }
     }
 }

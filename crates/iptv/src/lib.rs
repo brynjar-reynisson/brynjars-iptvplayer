@@ -15,5 +15,6 @@ pub mod episode_titles;
 pub mod supervisor;
 pub mod last_view;
 pub mod recent_series;
+pub mod recordings;
 pub mod intro;
 pub mod intros;

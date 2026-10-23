@@ -1071,6 +1071,9 @@ pub fn start_option(start_at: Option<f64>) -> Option<String> {
 
 impl Backend for MpvBackend {
     fn load(&mut self, url: &str, start_at: Option<f64>, generation: u32) {
+        // A recording never carries over to the next load (it would reopen
+        // and truncate the file); the app starts a new part when it plays.
+        self.set_property("stream-record", "");
         if !self.urls.iter().any(|u| u == url) {
             if self.urls.len() >= 4 {
                 self.urls.pop_front();

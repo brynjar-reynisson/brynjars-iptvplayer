@@ -71,6 +71,26 @@ impl Playback {
         p
     }
 
+    /// A recording file (not in the playlist): plays like a movie, with
+    /// `key` for its resume position. Up/Down and favorites do not apply.
+    pub fn local(lib: Arc<Library>, name: &str, key: &str, path: &str) -> Playback {
+        Playback {
+            lib,
+            list: ChannelList::new(Vec::new()),
+            entry: None,
+            name: name.to_string(),
+            key: key.to_string(),
+            url: path.to_string(),
+            live: false,
+            tab: Tab::Recordings,
+        }
+    }
+
+    /// A recording file, see [`Playback::local`].
+    pub fn is_local(&self) -> bool {
+        self.tab == Tab::Recordings
+    }
+
     fn set_entry(&mut self, entry: usize) {
         let e = self.lib.entry(entry);
         self.entry = Some(entry);
@@ -192,6 +212,16 @@ mod tests {
     use super::*;
     use crate::state::live::tests::{live, sample_lib};
     use crate::state::zap::ZAP_DELAY;
+
+    #[test]
+    fn a_local_recording_is_a_vod_outside_the_playlist() {
+        let lib = Arc::new(sample_lib());
+        let mut p = Playback::local(lib.clone(), "Game", "rec:Game", "C:/x/Game.ts");
+        assert!(p.is_local() && !p.is_live() && !p.in_playlist());
+        assert_eq!((p.key(), p.url()), ("rec:Game", "C:/x/Game.ts"));
+        p.rebase(lib);
+        assert!(!p.in_playlist(), "a library swap does not make it a playlist entry");
+    }
 
     #[test]
     fn steps_through_snapshot_and_wraps() {

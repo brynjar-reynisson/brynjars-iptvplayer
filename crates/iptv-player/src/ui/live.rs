@@ -147,6 +147,32 @@ where
     action
 }
 
+/// Recordings list: title, length and size per row.
+pub fn recordings(
+    ui: &mut egui::Ui,
+    rows: &[iptv::recordings::Recording],
+    cursor: Option<usize>,
+    playing_key: Option<&str>,
+    view: &mut ListView,
+    scroll_to: Option<usize>,
+) -> Option<RowAction> {
+    list(ui, "recordings", rows.len(), view, scroll_to, |ui, i| {
+        let r = &rows[i];
+        let len = r.length().map_or(String::new(), |d| format!("   {}", super::clock(d.as_secs_f64())));
+        let text = format!("{}{len}   {}", r.title, crate::state::format_bytes(r.size));
+        row(
+            ui,
+            RowLook {
+                text: &text,
+                selected: cursor == Some(i),
+                playing: playing_key == Some(r.key().as_str()),
+                star: false,
+                greyed: false,
+            },
+        )
+    })
+}
+
 /// Country list (left panel); the selected country is followed by its
 /// groups. Returns the clicked `(country, group)`.
 pub fn countries(

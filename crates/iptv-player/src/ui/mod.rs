@@ -31,6 +31,7 @@ use iptv::library::{Library, SearchScope};
 use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
 use iptv::recent_series::RecentSeries;
+use iptv::recordings::{self, Recorder, Step as RecStep};
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
@@ -49,6 +50,7 @@ use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
 use iptv::intro::INTRO_SCAN_SECS;
 use iptv::intros::Intros;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
+use crate::state::recs::RecList;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
     playing_title, visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
@@ -102,6 +104,11 @@ enum View {
     Player,
 }
 
+/// How often the free disk space is read while recording.
+const REC_DISK_EVERY: Duration = Duration::from_secs(5);
+/// How often the Recordings list is re-read while a recording runs.
+const RECS_RELOAD_EVERY: Duration = Duration::from_secs(3);
+
 /// How often the position of a playing movie/episode is written to disk.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(15);
 
@@ -150,7 +157,7 @@ fn hard_exit() -> ! {
 }
 
 /// `h:mm:ss` / `m:ss` for a position in seconds.
-fn clock(secs: f64) -> String {
+pub(crate) fn clock(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -259,6 +266,19 @@ struct App {
     recent: RecentSeries,
     /// Where the app was left (`last-view.json`).
     last_view: LastView,
+    /// `recordings` folder in the data dir.
+    rec_dir: PathBuf,
+    /// The running recording of the playing live channel.
+    recorder: Option<Recorder>,
+    /// Player generation the recorder last saw (a change = the stream reloaded).
+    rec_gen: u32,
+    /// Free disk space, read every `REC_DISK_EVERY` while recording.
+    rec_free: Option<u64>,
+    rec_free_at: Instant,
+    /// Recordings tab.
+    recs: RecList,
+    recs_view: ListView,
+    recs_reloaded: Instant,
     /// Taken by the first library that is shown: go back to `last_view`.
     restore: Option<Last>,
     /// Selected row of that list (keyboard).
@@ -347,6 +367,7 @@ impl App {
         let positions = Positions::load(&opts.data_dir);
         let recent = RecentSeries::load(&opts.data_dir);
         let last_view = LastView::load(&opts.data_dir);
+        let data_dir_for_rec = opts.data_dir.clone();
         let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
@@ -394,6 +415,14 @@ impl App {
             positions_saved: Instant::now(),
             recent,
             last_view,
+            rec_dir: recordings::dir_in(&data_dir_for_rec),
+            recorder: None,
+            rec_gen: 0,
+            rec_free: None,
+            rec_free_at: Instant::now(),
+            recs: RecList::default(),
+            recs_view: ListView::default(),
+            recs_reloaded: Instant::now(),
             restore,
             recent_cursor: None,
             recent_view: ListView::default(),
@@ -690,6 +719,8 @@ impl App {
     fn start_with(&mut self, pb: Playback, fresh: bool) {
         self.zap.cancel();
         self.save_position();
+        let was_recording = self.recorder.is_some();
+        self.stop_record(None);
         let saved = if pb.is_live() { None } else { self.positions.resume_for(pb.key()) };
         let resume = resume_for_start(saved, fresh);
         if fresh && saved.is_some() {
@@ -726,6 +757,9 @@ impl App {
         self.arm_skip_intro(&pb, resume);
         // Replaces any older message (e.g. "Resuming at ..." of the last video).
         self.message = resume.map(|t| format!("Resuming at {}", clock(t)));
+        if was_recording {
+            self.message = Some("Recording stopped: the channel changed.".into());
+        }
         if let Some((show, key)) = recent_id(&pb) {
             self.recent.touch(&show, &key);
             self.save_recent();
@@ -735,6 +769,144 @@ impl App {
         }
         self.save_last_view();
         self.playback = Some(pb);
+    }
+
+    // ---- recording ---------------------------------------------------------
+
+    /// R / the record button: start recording the playing live channel, or stop.
+    fn toggle_record(&mut self) {
+        if self.recorder.is_some() {
+            self.stop_record(Some("Recording stopped.".into()));
+            return;
+        }
+        let Some(pb) = self.playback.as_ref().filter(|p| p.is_live()) else {
+            self.message = Some("Recording starts from a playing live channel.".into());
+            return;
+        };
+        let Ok(p) = &self.player else { return };
+        if p.status() != Status::Playing {
+            self.message = Some("Wait until the channel plays, then record.".into());
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&self.rec_dir) {
+            self.message = Some(safe_text(&format!("Cannot create the recordings folder: {e}")));
+            return;
+        }
+        let free = recordings::free_bytes(&self.rec_dir);
+        if let Some(why) = recordings::start_refusal(free) {
+            self.message = Some(why);
+            return;
+        }
+        let now = Instant::now();
+        self.rec_free = free;
+        self.rec_free_at = now;
+        self.rec_gen = p.generation();
+        self.message = Some(format!("Recording {} (stops after 3 hours)", pb.name()));
+        eprintln!("recording: started");
+        self.recorder = Some(Recorder::new(&self.rec_dir, pb.name(), &recordings::local_stamp(), now));
+    }
+
+    /// End the recording (if any) and close its file. `msg` replaces the status message.
+    fn stop_record(&mut self, msg: Option<String>) {
+        if self.recorder.take().is_none() {
+            return;
+        }
+        if let Ok(p) = &mut self.player {
+            p.set_stream_record(None);
+        }
+        eprintln!("recording: stopped");
+        self.recs_reloaded = Instant::now() - RECS_RELOAD_EVERY;
+        if msg.is_some() {
+            self.message = msg;
+        }
+    }
+
+    /// Every frame: write the stream while it plays, start a new part after a
+    /// reconnect, stop at the time limit or when the disk is nearly full.
+    fn update_recording(&mut self) {
+        let Some(rec) = &mut self.recorder else { return };
+        let Ok(p) = &mut self.player else { return };
+        let now = Instant::now();
+        if now.duration_since(self.rec_free_at) >= REC_DISK_EVERY {
+            self.rec_free_at = now;
+            // A failed read keeps the last known value.
+            self.rec_free = recordings::free_bytes(&self.rec_dir).or(self.rec_free);
+        }
+        if p.generation() != self.rec_gen {
+            self.rec_gen = p.generation();
+            rec.interrupt();
+        }
+        let playing = match p.status() {
+            Status::Playing => true,
+            Status::Buffering => rec.current().is_some(),
+            _ => false,
+        };
+        match rec.poll(now, playing, self.rec_free) {
+            RecStep::Nothing => {}
+            RecStep::Begin(path) => p.set_stream_record(Some(&path)),
+            RecStep::End => p.set_stream_record(None),
+            RecStep::Stop(why) => self.stop_record(Some(why.message().into())),
+        }
+    }
+
+    /// Space / the pause button. Not while recording: a paused player stops
+    /// reading the stream once its buffer is full, which would leave a gap.
+    fn toggle_pause(&mut self) {
+        if self.recorder.is_some() {
+            self.message = Some("Pause is off while recording.".into());
+        } else if let Ok(p) = &mut self.player {
+            p.toggle_pause();
+        }
+    }
+
+    fn reload_recs(&mut self) {
+        self.recs_reloaded = Instant::now();
+        self.recs.reload(&self.rec_dir);
+    }
+
+    /// Key of the recording that is loaded in the player.
+    fn playing_rec_key(&self) -> Option<&str> {
+        self.playback.as_ref().filter(|p| p.is_local()).map(Playback::key)
+    }
+
+    fn play_recording(&mut self, i: usize) {
+        let Some(lib) = self.shown_lib.clone() else { return };
+        let Some(r) = self.recs.items().get(i).cloned() else { return };
+        if self.recorder.as_ref().and_then(|rec| rec.current()) == Some(r.path.as_path()) {
+            self.message = Some("This recording is still being written: stop recording first.".into());
+            return;
+        }
+        self.start(Playback::local(lib, &r.title, &r.key(), &r.path.to_string_lossy()));
+    }
+
+    /// The user said yes to deleting the asked-about recording.
+    fn confirm_delete(&mut self) {
+        let Some(path) = self.recs.take_confirmed() else { return };
+        let Some(rec) = self.recs.items().iter().find(|r| r.path == path).cloned() else { return };
+        if self.recorder.as_ref().and_then(|r| r.current()) == Some(path.as_path()) {
+            self.message = Some("This recording is still being written: stop recording first.".into());
+            return;
+        }
+        if self.playing_rec_key() == Some(rec.key().as_str()) {
+            self.stop();
+        }
+        let old = self.recs.cursor();
+        match recordings::delete(&self.rec_dir, &path) {
+            Ok(()) => {
+                self.positions.forget(&rec.key());
+                if let Err(e) = self.positions.save_if_dirty() {
+                    eprintln!("could not save positions: {}", safe_text(&format!("{e:#}")));
+                }
+                self.message = Some(format!("Deleted: {}", rec.title));
+            }
+            Err(e) => self.message = Some(safe_text(&format!("Could not delete {}: {e}", rec.title))),
+        }
+        self.reload_recs();
+        let n = self.recs.items().len();
+        if let (Some(i), true) = (old, n > 0) {
+            self.recs.set_cursor(i.min(n - 1));
+            self.scroll_to = self.recs.cursor();
+        }
     }
 
     fn save_last_view(&mut self) {
@@ -1188,6 +1360,9 @@ impl App {
     fn stop(&mut self) {
         self.zap.cancel();
         self.save_position();
+        if self.recorder.is_some() {
+            self.stop_record(Some("Recording stopped.".into()));
+        }
         // Stopped on purpose: a live channel is not started again next time.
         self.last_view.clear_live();
         self.save_last_view();
@@ -1236,7 +1411,11 @@ impl App {
         self.positions.forget(pb.key());
         self.mark_credits(&pb);
         self.stop();
-        self.message = Some(format!("Finished: {}", pb.name()));
+        self.message = Some(if pb.is_local() {
+            format!("Finished: {} (Recordings tab, Delete key removes it)", pb.name())
+        } else {
+            format!("Finished: {}", pb.name())
+        });
         let e = pb.entry_index().filter(|_| self.shown_lib.as_ref().is_some_and(|l| pb.same_library(l)));
         if let Some(e) = e {
             match pb.tab {
@@ -1263,6 +1442,7 @@ impl App {
             Tab::Favorites => self.fav.playable_entries(),
             Tab::Movies => self.movies.list().items().to_vec(),
             Tab::Series => self.series.open().map(|o| o.episodes()).unwrap_or_default(),
+            Tab::Recordings => Vec::new(),
         }
     }
 
@@ -1303,6 +1483,11 @@ impl App {
                 self.scroll_to = self.recent_cursor;
                 return;
             }
+            Tab::Recordings => {
+                self.recs.step(delta);
+                self.scroll_to = self.recs.cursor();
+                return;
+            }
             Tab::Series => {
                 let _ = match self.series.open_mut() {
                     Some(o) => o.step(delta),
@@ -1329,7 +1514,7 @@ impl App {
                 self.scroll_to = self.fav.cursor();
                 e
             }
-            Tab::Movies | Tab::Series => None,
+            Tab::Movies | Tab::Series | Tab::Recordings => None,
         };
         // Only while live plays (VOD playback never zaps).
         let active = self.playback.as_ref().is_some_and(Playback::is_live) || self.zap.pending().is_some();
@@ -1348,6 +1533,22 @@ impl App {
             Tab::Movies if self.movies.list().cursor().is_none() => {
                 self.movies.list_mut().step(1);
                 self.scroll_to = self.vod_cursor();
+                return;
+            }
+            Tab::Recordings => {
+                match self.recs.cursor() {
+                    None => {
+                        self.recs.step(1);
+                        self.scroll_to = self.recs.cursor();
+                    }
+                    Some(i) if self.recs.current().map(|r| r.key()).as_deref() == self.playing_rec_key() => {
+                        // Already loaded: open the full player view.
+                        let _ = i;
+                        self.zap.cancel();
+                        self.set_fullscreen(ctx, true);
+                    }
+                    Some(i) => self.play_recording(i),
+                }
                 return;
             }
             Tab::Series if self.recent_listed() => {
@@ -1387,6 +1588,7 @@ impl App {
             Tab::Favorites => self.fav.play_target(),
             Tab::Movies => self.movies.list().current(),
             Tab::Series => self.series.open().and_then(|o| o.current()),
+            Tab::Recordings => None,
         }
     }
 
@@ -1432,7 +1634,7 @@ impl App {
     /// channel, else the selected one (see `state::favs::toggle_target`).
     fn toggle_favorite(&mut self) {
         let fav_row = self.fav.cursor().and_then(|c| self.fav.rows().get(c)).cloned();
-        let playing = self.playback.as_ref().map(|p| (p.key().to_string(), p.name().to_string()));
+        let playing = self.playback.as_ref().filter(|p| !p.is_local()).map(|p| (p.key().to_string(), p.name().to_string()));
         let selected = self.shown_lib.as_ref().zip(self.selected_entry()).map(|(lib, e)| {
             let en = lib.entry(e);
             (favorite_key(en), en.name.clone())
@@ -1571,6 +1773,29 @@ impl App {
             self.set_fullscreen(ctx, !fullscreen);
         }
         let esc = esc && !fullscreen;
+        // Recordings tab: Delete asks, then Enter deletes and Esc keeps the file.
+        let (enter, esc) = if self.tab == Tab::Recordings
+            && self.view == View::Browse
+            && !fullscreen
+            && !typing
+            && self.focused_tab.is_none()
+        {
+            if self.recs.pending_delete().is_some() {
+                if enter {
+                    self.confirm_delete();
+                } else if esc {
+                    self.recs.cancel_delete();
+                }
+                (false, false)
+            } else {
+                if ctx.input_mut(|i| i.consume_key(M::NONE, Key::Delete)) {
+                    self.recs.ask_delete();
+                }
+                (enter, esc)
+            }
+        } else {
+            (enter, esc)
+        };
         // The open subtitle menu owns Up/Down/Enter.
         let (up, down, enter) = if self.sub_menu {
             self.sub_menu_keys(up, down, enter);
@@ -1643,6 +1868,14 @@ impl App {
         };
         if back {
             self.series_back();
+        }
+        // R records the playing live channel / stops the recording.
+        if !typing
+            && !self.sub_menu
+            && self.playback.as_ref().is_some_and(Playback::is_live)
+            && ctx.input_mut(|i| i.consume_key(M::NONE, Key::R))
+        {
+            self.toggle_record();
         }
         if sub_key {
             self.toggle_sub_menu();
@@ -1733,9 +1966,7 @@ impl App {
             self.toggle_favorite();
         }
         if space {
-            if let Ok(p) = &mut self.player {
-                p.toggle_pause();
-            }
+            self.toggle_pause();
         }
     }
 
@@ -2010,6 +2241,8 @@ impl App {
             let mut intro: Option<bool> = None;
             // ">>" (next episode) button clicked.
             let mut next_clicked = false;
+            // Record / stop button clicked.
+            let mut toggle_rec = false;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     // Movies/episodes: a strip below the video holds the seek bar.
@@ -2046,6 +2279,7 @@ impl App {
                         ui.ctx().request_repaint_after(cursor::TITLE_SHOW.saturating_sub(since));
                     }
                     p.show(ui, rect, &title, show_title);
+                    self.rec_badge(ui, rect);
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
                         toggle_fs = true;
@@ -2151,6 +2385,28 @@ impl App {
                             if outside {
                                 self.sub_menu = false;
                             }
+                        }
+                    }
+                    // Record button (live only, where "CC" sits for movies): a red
+                    // dot starts recording, a white square stops it.
+                    if chrome && pb.is_live() {
+                        let rbtn = btn.translate(egui::vec2(-76.0, 0.0));
+                        let r_resp = ui.interact(rbtn, egui::Id::unique("rec_btn"), egui::Sense::click());
+                        let ra = if r_resp.hovered() { 230 } else { 140 };
+                        let rp = ui.painter_at(rect);
+                        rp.rect_filled(rbtn, 4.0, egui::Color32::from_black_alpha(ra / 2));
+                        if self.recorder.is_some() {
+                            rp.rect_filled(
+                                egui::Rect::from_center_size(rbtn.center(), egui::vec2(12.0, 12.0)),
+                                1.0,
+                                egui::Color32::from_white_alpha(ra),
+                            );
+                        } else {
+                            rp.circle_filled(rbtn.center(), 7.0, egui::Color32::from_rgba_unmultiplied(230, 60, 60, ra));
+                        }
+                        let tip = if self.recorder.is_some() { "Stop recording (R)" } else { "Record this channel (R)" };
+                        if r_resp.on_hover_text(tip).clicked() {
+                            toggle_rec = true;
                         }
                     }
                     // Play/pause button, left of it: shows the action a click performs.
@@ -2265,9 +2521,10 @@ impl App {
                 self.remember_sub(choice);
             }
             if toggle_pause {
-                if let Ok(p) = &mut self.player {
-                    p.toggle_pause();
-                }
+                self.toggle_pause();
+            }
+            if toggle_rec {
+                self.toggle_record();
             }
             match offer {
                 Some(true) => {
@@ -2291,6 +2548,23 @@ impl App {
                 self.skip_to_next_episode();
             }
         });
+    }
+
+    /// "REC 0:42:10  1.2 GB" with a red dot at the video's top right while recording.
+    fn rec_badge(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(rec) = &self.recorder else { return };
+        let mut text = format!("REC {}", clock(rec.elapsed(Instant::now()).as_secs_f64()));
+        match rec.current().and_then(|p| std::fs::metadata(p).ok()) {
+            Some(m) => text.push_str(&format!("  {}", format_bytes(m.len()))),
+            None => text.push_str("  waiting for the stream"),
+        }
+        let painter = ui.painter_at(rect);
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(16.0), egui::Color32::WHITE);
+        let size = egui::vec2(galley.size().x + 34.0, galley.size().y + 12.0);
+        let bg = egui::Rect::from_min_size(egui::pos2(rect.right() - 12.0 - size.x, rect.top() + 12.0), size);
+        painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(180));
+        painter.circle_filled(egui::pos2(bg.left() + 13.0, bg.center().y), 5.0, egui::Color32::from_rgb(230, 60, 60));
+        painter.galley(egui::pos2(bg.left() + 24.0, bg.top() + 6.0), galley, egui::Color32::WHITE);
     }
 
     /// The "Next episode in N" button (with a countdown line) and a Cancel
@@ -2517,6 +2791,61 @@ impl App {
                     }
                 });
             }
+            Tab::Recordings => {
+                egui::Panel::left("recordings").resizable(true).default_size(560.0).show(ui, |ui| {
+                    let mut ask = false;
+                    let mut yes = false;
+                    let mut no = false;
+                    ui.horizontal(|ui| match self.recs.pending_delete().map(|r| r.title.clone()) {
+                        Some(title) => {
+                            ui.label(format!("Delete \"{title}\"?"));
+                            yes = ui.button("Delete").on_hover_text("Enter").clicked();
+                            no = ui.button("Keep").on_hover_text("Esc").clicked();
+                        }
+                        None => {
+                            ask = ui
+                                .add_enabled(self.recs.cursor().is_some(), egui::Button::new("Delete"))
+                                .on_hover_text("Delete the selected recording (Delete key)")
+                                .clicked();
+                            let free = recordings::free_bytes(&self.rec_dir).map_or(String::new(), |f| format!(" · {} free", format_bytes(f)));
+                            ui.weak(format!("{} recordings{free}", self.recs.items().len()));
+                        }
+                    });
+                    if self.recs.items().is_empty() {
+                        ui.weak("No recordings yet: press R (or the red button) while a live channel plays.");
+                    }
+                    let playing_rec = self.playing_rec_key().map(str::to_string);
+                    let a = live::recordings(
+                        ui,
+                        self.recs.items(),
+                        self.recs.cursor(),
+                        playing_rec.as_deref(),
+                        &mut self.recs_view,
+                        scroll_to,
+                    );
+                    if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
+                        self.recs.set_cursor(i);
+                        let key = self.recs.current().map(|r| r.key());
+                        if key.as_deref() != self.playing_rec_key() {
+                            self.play_recording(i);
+                        } else {
+                            self.zap.cancel();
+                        }
+                        if matches!(a, Some(RowAction::DoubleClick(_))) && self.playback.is_some() {
+                            self.set_fullscreen(&ui.ctx().clone(), true);
+                        }
+                    }
+                    if ask {
+                        self.recs.ask_delete();
+                    }
+                    if yes {
+                        self.confirm_delete();
+                    }
+                    if no {
+                        self.recs.cancel_delete();
+                    }
+                });
+            }
             Tab::Series => {
                 egui::Panel::left("series").resizable(true).default_size(420.0).show(ui, |ui| match self.series.open().cloned() {
                     Some(open) => {
@@ -2608,6 +2937,7 @@ impl eframe::App for App {
             self.on_finished();
         }
         self.update_skip_intro();
+        self.update_recording();
         if ctx.input(|i| i.viewport().close_requested()) {
             // Safety net: if teardown after the window closes ever blocks,
             // end the process instead of leaving it lingering.
@@ -2637,6 +2967,13 @@ impl eframe::App for App {
                     _ => false,
                 };
                 self.scroll_to = self.vod_cursor();
+                if self.tab == Tab::Recordings {
+                    self.reload_recs();
+                    self.scroll_to = self.recs.cursor();
+                }
+            }
+            if self.tab == Tab::Recordings && self.recorder.is_some() && self.recs_reloaded.elapsed() >= RECS_RELOAD_EVERY {
+                self.reload_recs();
             }
             self.status_bar(ui);
             if self.shown_lib.is_some() {
@@ -2702,6 +3039,7 @@ impl eframe::App for App {
             std::thread::sleep(Duration::from_secs(3));
             hard_exit();
         });
+        self.stop_record(None);
         self.save_position();
         if let Ok(p) = &mut self.player {
             p.shutdown(gl);

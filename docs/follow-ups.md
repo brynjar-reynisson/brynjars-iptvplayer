@@ -60,6 +60,8 @@ Known gaps and ideas that were found during implementation and review but not do
 
 - **Restore last view, manual check still to do** (2026-10-23): unit-tested only (record, quarantine, `LiveBrowser::select_entry`). Try in the real app: close while a channel plays (it restarts, country/group highlighted and scrolled to); Esc-stop then close (nothing plays); close in an episode, restart (Series tab, show open, episode selected, Enter resumes). Movies/favorites are not restored.
 
+- **Recording, manual checks still to do** (2026-10-23): the recorder/list/delete logic and mpv's runtime `stream-record` are tested, the GUI wiring is not. Try in the real app: R / red button start and stop, badge, file appears in `recordings/`, Esc and channel switch stop it, a stream drop starts `part 2`, closing the app mid-recording leaves a playable file, Recordings tab play/resume/delete (and the confirm keys), Space during recording says pause is off. The 3 h and 10 GB rules are only unit-tested (use a smaller `MAX_RECORD` to try the stop). Recordings are not listed with an exact length (last write minus creation time).
+
 ## Ideas (not requested)
 
 - Show watched/resumable marks (and the saved position) in the movie and episode lists.

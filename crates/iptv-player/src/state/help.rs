@@ -71,6 +71,15 @@ pub const KEYS: &[Section] = &[
             row("Left", "Go to the country list; Up/Down walk countries and their groups"),
             row("Right  Enter", "From the country list: back into the channels, plays the first"),
             row("Esc", "Leave the country list, or cancel a pending channel switch"),
+            row("R", "Record the playing channel / stop recording (also the red button on the video); max 3 hours, needs 10 GB free; Esc or switching channel stops it; no pause while recording"),
+        ],
+    },
+    Section {
+        title: "Recordings",
+        rows: &[
+            row("Up / Down", "Move the cursor"),
+            row("Enter", "Play the selected recording (resumes where you stopped); on the playing one = full screen"),
+            row("Delete", "Delete the selected recording: Enter confirms, Esc keeps it"),
         ],
     },
     Section {

@@ -136,6 +136,16 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   you stopped, or the next one when that episode had reached its credits (or finished) and there
   is a next one. Exiting the player leaves you in the show's episode list. Credits are only
   detected while `autoplay_next` is on.
+- Recording live channels: while a live channel plays, **R** or the red button at the video's
+  bottom right records it (the button turns into a white stop square; **R** again stops). A red
+  "REC 0:42:10  1.2 GB" badge shows at the top right. It records the stream you are watching (no
+  second connection) into `recordings/` in the data directory as `Channel - 2026-10-23 20-30.ts`
+  (a reconnect starts `... - part 2.ts`). It stops by itself after 3 hours, when less than 10 GB
+  of disk space is left (and does not start below that), on **Esc**, when you switch channel, and
+  when the app closes. Pause is off while recording (a paused player would stop reading the
+  stream). The **Recordings** tab lists the files (newest first, length, size): Enter or a click
+  plays one (resumes where you stopped), **Delete** (or the Delete button) asks, then Enter
+  deletes and Esc keeps it. Files are plain MPEG-TS; other players open them too.
 - Movies/Series: results update as you type. The **Groups** menu hides whole groups
   from the results.
 - The status overlay shows what is happening while a stream is not playing:

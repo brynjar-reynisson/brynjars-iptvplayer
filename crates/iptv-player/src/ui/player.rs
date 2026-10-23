@@ -104,6 +104,17 @@ impl Player {
         self.sup.play_from(url.to_string(), live, start_at, Instant::now());
     }
 
+    /// Start writing the playing stream to `path`, or stop (`None`).
+    pub fn set_stream_record(&mut self, path: Option<&std::path::Path>) {
+        let value = path.and_then(|p| p.to_str()).unwrap_or("");
+        self.sup.backend_mut().set_property("stream-record", value);
+    }
+
+    /// Changes with every load (play or retry).
+    pub fn generation(&self) -> u32 {
+        self.sup.generation()
+    }
+
     pub fn stop(&mut self) {
         if self.paused {
             self.sup.backend_mut().set_pause(false);
