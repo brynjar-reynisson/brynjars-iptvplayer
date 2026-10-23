@@ -13,6 +13,7 @@ pub mod subtitles;
 pub mod positions;
 pub mod episode_titles;
 pub mod supervisor;
+pub mod last_view;
 pub mod recent_series;
 pub mod intro;
 pub mod intros;

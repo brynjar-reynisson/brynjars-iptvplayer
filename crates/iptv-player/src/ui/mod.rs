@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui;
 use iptv::favorites::Favorites;
 use iptv::fetch::{self, RefreshEvent, RefreshOptions, Refresher, Source};
+use iptv::last_view::{Last, LastKind, LastView};
 use iptv::library::{Library, SearchScope};
 use iptv::playlist::{favorite_key, Kind};
 use iptv::positions::Positions;
@@ -256,6 +257,10 @@ struct App {
     /// The last series watched (`recent-series.json`): the list under the
     /// Series search box and the continue button.
     recent: RecentSeries,
+    /// Where the app was left (`last-view.json`).
+    last_view: LastView,
+    /// Taken by the first library that is shown: go back to `last_view`.
+    restore: Option<Last>,
     /// Selected row of that list (keyboard).
     recent_cursor: Option<usize>,
     recent_view: ListView,
@@ -341,6 +346,8 @@ impl App {
         let favs = Favorites::load(&opts.data_dir);
         let positions = Positions::load(&opts.data_dir);
         let recent = RecentSeries::load(&opts.data_dir);
+        let last_view = LastView::load(&opts.data_dir);
+        let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
         let user_agent_for_previews = user_agent.clone();
@@ -386,6 +393,8 @@ impl App {
             positions,
             positions_saved: Instant::now(),
             recent,
+            last_view,
+            restore,
             recent_cursor: None,
             recent_view: ListView::default(),
             data,
@@ -657,6 +666,7 @@ impl App {
         self.groups_rx = Some(rx);
         self.scroll_to = self.live.list().cursor();
         self.shown_lib = Some(new.clone());
+        self.restore_last_view(&new);
         if !self.ready_logged {
             self.ready_logged = true;
             eprintln!(
@@ -719,8 +729,48 @@ impl App {
         if let Some((show, key)) = recent_id(&pb) {
             self.recent.touch(&show, &key);
             self.save_recent();
+            self.last_view.set(LastKind::Episode, &key);
+        } else if pb.is_live() && pb.in_playlist() {
+            self.last_view.set(LastKind::Live, pb.key());
         }
+        self.save_last_view();
         self.playback = Some(pb);
+    }
+
+    fn save_last_view(&mut self) {
+        if let Err(e) = self.last_view.save_if_dirty() {
+            eprintln!("could not save last view: {}", safe_text(&format!("{e:#}")));
+        }
+    }
+
+    /// First library of the session: go back to where the app was closed.
+    /// A live channel is selected in the country/group tree and plays; an
+    /// episode is selected in its open show (Enter plays it, resuming).
+    fn restore_last_view(&mut self, lib: &Arc<Library>) {
+        let Some(last) = self.restore.take() else { return };
+        if self.playback.is_some() {
+            return;
+        }
+        let Some(e) = lib.find_by_key(&last.key) else { return };
+        match last.kind {
+            LastKind::Live if lib.entry(e).kind == Kind::Live => {
+                if self.live.select_entry(lib, e) {
+                    self.filter.clear();
+                    self.tab = Tab::Live;
+                    self.country_scroll = self.live.row_index();
+                    self.scroll_to = self.live.list().cursor();
+                    self.play_from(self.tab_list(), e, Tab::Live);
+                }
+            }
+            LastKind::Episode if lib.entry(e).kind == Kind::Series => {
+                if let Some(show) = show_of(lib, e) {
+                    self.tab = Tab::Series;
+                    self.series.open_show(lib, show, Some(e), &self.hidden);
+                    self.scroll_to = self.vod_cursor();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The playing episode reached its credits (or finished): the continue
@@ -1138,6 +1188,9 @@ impl App {
     fn stop(&mut self) {
         self.zap.cancel();
         self.save_position();
+        // Stopped on purpose: a live channel is not started again next time.
+        self.last_view.clear_live();
+        self.save_last_view();
         if let Ok(p) = &mut self.player {
             p.stop();
         }

@@ -58,6 +58,8 @@ Known gaps and ideas that were found during implementation and review but not do
 
 - **Recent series, manual checks still to do** (2026-10-21): the continue button/Shift+P/list were only unit-tested (record, resolve, quarantine); try it in the real app: button next to the tabs, Shift+P, list under the search box, continue after credits, a show that left the playlist. Credits are only flagged while `autoplay_next` is on (the offer/scan decides); with it off only a finished episode counts. A focused continue button plus Enter is not specially handled.
 
+- **Restore last view, manual check still to do** (2026-10-23): unit-tested only (record, quarantine, `LiveBrowser::select_entry`). Try in the real app: close while a channel plays (it restarts, country/group highlighted and scrolled to); Esc-stop then close (nothing plays); close in an episode, restart (Series tab, show open, episode selected, Enter resumes). Movies/favorites are not restored.
+
 ## Ideas (not requested)
 
 - Show watched/resumable marks (and the saved position) in the movie and episode lists.

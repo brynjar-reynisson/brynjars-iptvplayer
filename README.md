@@ -52,7 +52,7 @@ and the DLL are the only files needed at runtime (`config.example.toml` is just 
 
 ### Data directory
 
-`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `recent-series.json` (last 10 series watched), `episode-titles.json` (cached episode titles), `intros.json` (intro fingerprints per show, for Skip intro) and `settings.json` (hidden
+`config.toml`, `cache/` (parsed playlist), `favorites.json`, `positions.json` (resume points), `recent-series.json` (last 10 series watched), `last-view.json` (where you left off: the next start plays that live channel, or selects that episode without playing), `episode-titles.json` (cached episode titles), `intros.json` (intro fingerprints per show, for Skip intro) and `settings.json` (hidden
 groups, subtitle choices, autoplay) live in the data directory. The app looks for it in this order:
 `--data-dir <path>`, then the `IPTV_DATA_DIR` environment variable, then the exe's folder.
 

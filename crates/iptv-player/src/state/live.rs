@@ -112,6 +112,19 @@ impl LiveBrowser {
         }
     }
 
+    /// Select channel `e`: its country and its playlist group, with the filter
+    /// cleared so it is listed. False (nothing changed) if no country has it.
+    pub fn select_entry(&mut self, lib: &Library, e: usize) -> bool {
+        let Some((c, country)) = lib.countries().iter().enumerate().find(|(_, c)| c.channels.contains(&e)) else {
+            return false;
+        };
+        self.filter.clear();
+        self.country = Some(c);
+        self.group = country.groups.iter().position(|g| g.channels.contains(&e));
+        self.rebuild(lib);
+        self.list.select_entry(e)
+    }
+
     /// Move one row up/down the country panel (wrapping): the selected
     /// country, then its groups, then the next country.
     pub fn step_row(&mut self, lib: &Library, delta: i32) {
@@ -255,6 +268,22 @@ pub(crate) mod tests {
         assert_eq!((b.country(), b.group()), (Some(0), Some(1)));
         b.select_country(&lib, 0);
         assert_eq!(b.group(), None, "selecting the country row clears the group");
+    }
+
+    #[test]
+    fn select_entry_picks_country_group_and_clears_filter() {
+        let lib = sample_lib();
+        let mut b = LiveBrowser::new();
+        b.set_library(None, &lib);
+        b.set_filter(&lib, "nrk");
+        assert!(b.select_entry(&lib, 4)); // Sweden / Sport
+        assert_eq!((b.country(), b.group()), (Some(0), Some(1)));
+        assert_eq!(b.filter(), "");
+        assert_eq!(b.list().current(), Some(4));
+        assert!(b.select_entry(&lib, 2)); // Norway / Main
+        assert_eq!(lib.countries()[b.country().unwrap()].name, "Norway");
+        assert!(!b.select_entry(&lib, 99));
+        assert_eq!(lib.countries()[b.country().unwrap()].name, "Norway", "unchanged on failure");
     }
 
     #[test]
