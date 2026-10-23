@@ -1096,20 +1096,29 @@ impl App {
         std::path::absolute(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone())
     }
 
-    /// "Use selected channel": the Live tab's selection, else the playing channel.
-    fn pick_schedule_channel(&mut self) {
+    /// The Live tab's selected channel, else the playing one (name, favorite key).
+    fn default_schedule_channel(&self) -> Option<(String, String)> {
         let selected = self.shown_lib.as_ref().zip(self.live.list().current()).map(|(lib, e)| {
             let en = lib.entry(e);
             (en.name.clone(), favorite_key(en))
         });
         let playing = self.playback.as_ref().filter(|p| p.is_live()).map(|p| (p.name().to_string(), p.key().to_string()));
-        match selected.or(playing) {
+        selected.or(playing)
+    }
+
+    /// "Use selected channel".
+    fn pick_schedule_channel(&mut self) {
+        match self.default_schedule_channel() {
             Some(c) => self.sched_form.channel = Some(c),
             None => self.message = Some("Select a channel in the Live tab first.".into()),
         }
     }
 
     fn add_schedule(&mut self) {
+        // No channel picked yet: the one selected / playing in the Live tab.
+        if self.sched_form.channel.is_none() {
+            self.sched_form.channel = self.default_schedule_channel();
+        }
         let nf = match self.sched_form.build() {
             Ok(n) => n,
             Err(m) => {
@@ -1200,7 +1209,10 @@ impl App {
                 Some((name, _)) => ui.label(name),
                 None => ui.weak("none"),
             };
-            pick = ui.button("Use selected channel").on_hover_text("The channel selected in the Live tab").clicked();
+            pick = ui
+                .button("Use selected channel")
+                .on_hover_text("The channel selected or playing in the Live tab (filled in automatically at first)")
+                .clicked();
         });
         ui.horizontal(|ui| {
             for (d, name) in DAY_NAMES.iter().enumerate() {
@@ -3198,6 +3210,9 @@ impl App {
                         if ui.selectable_label(self.rec_mode == RecMode::Schedules, "Schedules").clicked() {
                             self.rec_mode = RecMode::Schedules;
                             self.refresh_task_status();
+                            if self.sched_form.channel.is_none() {
+                                self.sched_form.channel = self.default_schedule_channel();
+                            }
                         }
                     });
                     ui.separator();
