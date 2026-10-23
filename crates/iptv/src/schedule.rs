@@ -117,6 +117,42 @@ pub fn remaining_secs(s: &Schedule, now: LocalNow) -> Option<u64> {
     None
 }
 
+fn days_in_month(y: u16, m: u16) -> u16 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
+/// The day before (year, month, day).
+fn previous_day(y: u16, m: u16, d: u16) -> (u16, u16, u16) {
+    if d > 1 {
+        (y, m, d - 1)
+    } else if m > 1 {
+        (y, m - 1, days_in_month(y, m - 1))
+    } else {
+        (y - 1, 12, 31)
+    }
+}
+
+/// `2026-10-25 18-30`: the date and start time of the window that is open at
+/// `now` with `remaining` seconds left (the same for everything that records
+/// this window, so they agree on the file name).
+pub fn window_start_stamp(s: &Schedule, now: LocalNow, remaining: u64) -> String {
+    let elapsed = (s.length_minutes() as u64 * 60).saturating_sub(remaining);
+    let now_s = now.hour as u64 * 3600 + now.minute as u64 * 60 + now.second as u64;
+    let (y, m, d) = if now_s >= elapsed { (now.year, now.month, now.day) } else { previous_day(now.year, now.month, now.day) };
+    format!("{y:04}-{m:02}-{d:02} {:02}-{:02}", s.start / 60 % 24, s.start % 60)
+}
+
+/// File name (without extension) of the recording of the window that is open
+/// at `now` with `remaining` seconds left: `Channel - 2026-10-25 18-30`.
+pub fn session_base(s: &Schedule, now: LocalNow, remaining: u64) -> String {
+    format!("{} - {}", crate::recordings::sanitize_name(&s.name), window_start_stamp(s, now, remaining))
+}
+
 /// The window of `s` is not open at `now` but opens within `secs` seconds.
 pub fn opens_within(s: &Schedule, now: LocalNow, secs: u32) -> bool {
     remaining_secs(s, now).is_none() && remaining_secs(s, now.plus_secs(secs)).is_some()
@@ -293,6 +329,25 @@ mod tests {
         assert_eq!(remaining_secs(&s, at(0, 19, 44, 59)), Some(1));
         assert_eq!(remaining_secs(&s, at(0, 19, 45, 0)), None, "over");
         assert_eq!(remaining_secs(&s, at(1, 19, 0, 0)), None, "Monday is not scheduled");
+    }
+
+    #[test]
+    fn the_window_start_stamp_is_the_same_whenever_it_is_asked() {
+        let s = game(); // Sundays 18:30-19:45 (75 min)
+        let a = window_start_stamp(&s, at(0, 18, 30, 1), 74 * 60 + 59);
+        let b = window_start_stamp(&s, at(0, 19, 10, 0), 35 * 60);
+        assert_eq!(a, "2026-10-25 18-30");
+        assert_eq!(a, b);
+        // A window that began yesterday and runs past midnight keeps yesterday's date.
+        let mut late = game();
+        late.start = 23 * 60;
+        late.end = 60;
+        let mut now = at(1, 0, 30, 0);
+        now.day = 1;
+        now.month = 3;
+        assert_eq!(window_start_stamp(&late, now, 30 * 60), "2026-02-28 23-00");
+        now.month = 1;
+        assert_eq!(window_start_stamp(&late, now, 30 * 60), "2025-12-31 23-00");
     }
 
     #[test]

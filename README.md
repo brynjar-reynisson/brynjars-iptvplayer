@@ -155,8 +155,16 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   needs no window and no running app: it keeps recording when you close the app, wakes the
   computer from sleep and keeps it awake while recording, and if the start was missed (computer
   off) but you log in before the end it records the rest of the window. It only runs while you are
-  logged in. The recorder copies the channel's raw stream, reconnecting when the stream drops
-  (new `... - part 2.ts` file), and stops at the end time or when less than 10 GB of disk is left.
+  logged in. The recorder copies the channel's raw stream, reconnecting when the stream drops, and stops at
+  the end time or when less than 10 GB of disk is left. A scheduled recording always ends up as
+  **one file**, named after its window (`Channel - 2026-10-25 18-30.ts`): the app and the recorder
+  write temporary pieces (hidden from the list) and the recorder joins them when the window is
+  over (the app does it too if no recorder ran; pieces left behind by a crash are joined the next
+  time the app or a recorder starts). Where the connection was lost for 2 seconds or more, and
+  `ffmpeg` is installed (next to `iptv-player.exe` or on the PATH), a 2-second title card
+  "Connection was lost for 12 seconds" (or "1:12 minutes") is put in the file at that spot, made
+  to match the stream's video and sound; the recording itself is not re-encoded. Without ffmpeg,
+  or if a card cannot be made, the pieces are just joined with no card. Shorter gaps get no card.
   Providers like yours allow one connection per account (a second one makes the provider cut the
   first, over and over), so only one of "the app" and "the recorder" ever holds it: if the app is
   open and playing when a window opens (it claims the recording up to 45 seconds before, so the

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::handoff;
 use crate::recordings::{self, Recorder, Step, StopReason};
+use crate::rec_merge;
 use crate::schedule::{self, Schedules};
 
 const READ_CHUNK: usize = 64 * 1024;
@@ -92,7 +93,8 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
         log.line("schedule is off; nothing to do");
         return Ok(());
     }
-    let Some(remaining) = schedule::remaining_secs(&s, recordings::local_now()) else {
+    let now_local = recordings::local_now();
+    let Some(remaining) = schedule::remaining_secs(&s, now_local) else {
         log.line("outside the schedule's window; nothing to do");
         return Ok(());
     };
@@ -125,7 +127,10 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
         .timeout(None::<Duration>)
         .build()
         .map_err(|e| anyhow!("{}", e.without_url()))?;
-    let mut rec = Recorder::with_max(&dir, &s.name, &recordings::local_stamp(), begin, Duration::from_secs(remaining));
+    // One recording per window: the app and this recorder write pieces under the same base name.
+    let base = schedule::session_base(&s, now_local, remaining);
+    let mut rec = Recorder::for_session(&dir, &base, "rec", begin, Duration::from_secs(remaining));
+    let mut last_chunk_ms = recordings::now_ms();
     let mut free_at = Instant::now();
     let mut failures = 0u32;
     let mut bytes_total = 0u64;
@@ -133,7 +138,7 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
     let mut standby = false;
     let mut owner_check = Instant::now();
 
-    while Instant::now() < deadline {
+    'outer: while Instant::now() < deadline {
         if handoff::owned_by_app(data_dir, id) {
             if !standby {
                 standby = true;
@@ -223,7 +228,8 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
                         StopReason::LowSpace => why.message().to_string(),
                     };
                     log.line(&format!("done: {msg} ({} MB written)", bytes_total / 1_000_000));
-                    return Ok(());
+                    journal(&mut rec, &dir, &base);
+                    break 'outer;
                 }
                 Step::End | Step::Nothing => {}
             }
@@ -231,12 +237,14 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
                 o.write_all(&chunk).map_err(|e| anyhow!("cannot write the recording: {e}"))?;
                 bytes_total += n as u64;
                 got_data = true;
+                last_chunk_ms = recordings::now_ms();
             }
         };
         if let Some(mut o) = out.take() {
             let _ = o.flush();
         }
-        rec.interrupt();
+        rec.interrupt_at(last_chunk_ms);
+        journal(&mut rec, &dir, &base);
         failures = if got_data { 0 } else { failures + 1 };
         if end.starts_with("the app took over") {
             log.line(&end);
@@ -245,8 +253,40 @@ fn run_inner(data_dir: &Path, id: &str, log: &Log) -> Result<()> {
             wait(retry_delay(failures.max(1), None), deadline);
         }
     }
-    log.line(&format!("done: the window is over ({} MB written)", bytes_total / 1_000_000));
+    journal(&mut rec, &dir, &base);
+    if Instant::now() >= deadline {
+        log.line(&format!("done: the window is over ({} MB written)", bytes_total / 1_000_000));
+    }
+    finish_session(data_dir, id, &dir, &base, log);
     Ok(())
+}
+
+/// Write the pieces that ended since the last call to the journal.
+fn journal(rec: &mut Recorder, dir: &Path, base: &str) {
+    for p in rec.take_finished() {
+        let _ = rec_merge::journal_append(dir, base, &p);
+    }
+}
+
+/// The window is over: join the pieces (ours and the app's) into one file.
+fn finish_session(data_dir: &Path, id: &str, dir: &Path, base: &str, log: &Log) {
+    // The app may still be closing its last piece.
+    let t = Instant::now();
+    while handoff::owned_by_app(data_dir, id) && t.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut say = |m: &str| log.line(m);
+    match rec_merge::finalize_retrying(dir, base, &mut say) {
+        rec_merge::Outcome::Joined { file, pieces, cards } => say(&format!(
+            "joined {pieces} piece(s) into {} ({cards} gap card(s))",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        )),
+        rec_merge::Outcome::Nothing => say("no pieces to join (already joined, or nothing was recorded)"),
+        rec_merge::Outcome::Failed(e) => say(&format!("could not join the pieces: {e} (they are kept in the recordings folder)")),
+        rec_merge::Outcome::Busy => say("the pieces are still in use; they will be joined later"),
+    }
+    // Anything left unfinished by an earlier crash.
+    rec_merge::recover_orphans(dir, Duration::from_secs(120), &mut say);
 }
 
 /// Seconds to wait before the next attempt: short for network trouble, longer

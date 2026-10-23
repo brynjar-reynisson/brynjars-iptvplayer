@@ -3,7 +3,7 @@
 //! Builds a scratch data dir with a one-channel cache pointing at a local
 //! ffmpeg MPEG-TS server (port 8188), a schedule whose window is the current
 //! minute, runs `iptv::rec_job::run`, kills the stream once so the recorder
-//! must reconnect, and checks that two part files were written. Needs `ffmpeg`.
+//! must reconnect, and checks that the two pieces were joined into one file. Needs `ffmpeg`.
 //!
 //! `rec_job_demo handoff`: the "app" claims the recording for the first 15 s
 //! (`iptv::handoff`); the recorder must stand by without connecting (no file),
@@ -74,6 +74,8 @@ fn main() -> anyhow::Result<()> {
                 killed = true;
             }
             if killed && ff.try_wait().ok().flatten().is_some() && t0.elapsed() < Duration::from_secs(70) {
+                // The stream stays away for 5 s: a gap long enough for a card.
+                std::thread::sleep(Duration::from_secs(5));
                 ff = spawn_ffmpeg();
                 killed = true;
                 // from now on keep it up
@@ -110,12 +112,14 @@ fn main() -> anyhow::Result<()> {
         let log = std::fs::read_to_string(dir.join("recorder.log"))?;
         let first = files.iter().map(|f| f.created).min();
         let after_release = first.is_some_and(|c| c.duration_since(std::time::SystemTime::now() - t0.elapsed()).map_or(false, |d| d >= Duration::from_secs(13)));
-        let ok = log.contains("standing by") && log.contains("taking over") && after_release && !files.is_empty();
+        let ok = log.contains("standing by") && log.contains("taking over") && after_release && files.len() == 1;
         println!("standby seen: {}, takeover seen: {}, first file after release: {after_release}", log.contains("standing by"), log.contains("taking over"));
         println!("RESULT: {}", if ok { "OK" } else { "FAILED" });
         return Ok(());
     }
-    let ok = files.len() >= 2 && files.iter().all(|f| f.size > 10_000);
+    let log = std::fs::read_to_string(dir.join("recorder.log"))?;
+    // One file for the whole window, joined from two pieces (the forced reconnect).
+    let ok = files.len() == 1 && files[0].size > 1_000_000 && log.contains("joined 2 piece(s)") && log.contains("1 gap card(s)");
     println!("RESULT: {}", if ok { "OK" } else { "FAILED" });
     Ok(())
 }

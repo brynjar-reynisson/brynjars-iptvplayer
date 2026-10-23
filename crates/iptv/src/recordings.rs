@@ -3,6 +3,7 @@
 //! record (max length, minimum free disk space) as a pure state machine, and
 //! listing / deleting the finished files. No URL is ever used here.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -192,6 +193,25 @@ pub enum Step {
 
 /// One running recording of one channel. It spans reconnects: every time the
 /// stream plays again a new part file starts.
+/// Milliseconds since the Unix epoch.
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// One written piece of a scheduled recording and when it was written
+/// (wall clock, ms): the gaps between pieces are the lost connection time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PieceInfo {
+    /// File name inside the recordings folder.
+    pub file: String,
+    pub begin: u64,
+    pub end: u64,
+}
+
+/// Marks a piece of a scheduled recording that is not finished yet (hidden
+/// from the list, joined into one file at the end of the window).
+pub const PIECE_MARK: &str = ".piece-";
+
 #[derive(Debug)]
 pub struct Recorder {
     dir: PathBuf,
@@ -201,6 +221,10 @@ pub struct Recorder {
     max: Duration,
     part: u32,
     current: Option<PathBuf>,
+    /// Scheduled recording: (session base name, writer tag `app`/`rec`).
+    session: Option<(String, String)>,
+    begun: Option<(PathBuf, u64)>,
+    finished: Vec<PieceInfo>,
 }
 
 impl Recorder {
@@ -211,6 +235,9 @@ impl Recorder {
     /// Like [`new`](Self::new) with another length limit (scheduled recordings).
     pub fn with_max(dir: &Path, channel: &str, stamp: &str, now: Instant, max: Duration) -> Recorder {
         Recorder {
+            session: None,
+            begun: None,
+            finished: Vec::new(),
             max,
             dir: dir.to_path_buf(),
             channel: channel.to_string(),
@@ -219,6 +246,37 @@ impl Recorder {
             part: 0,
             current: None,
         }
+    }
+
+    /// A scheduled recording: pieces are named `<base>.piece-<who><n>.ts`
+    /// (`who` = `app` or `rec`) and joined into `<base>.ts` at the end.
+    pub fn for_session(dir: &Path, base: &str, who: &str, now: Instant, max: Duration) -> Recorder {
+        let mut r = Self::with_max(dir, base, "", now, max);
+        r.session = Some((base.to_string(), who.to_string()));
+        r
+    }
+
+    /// Pieces that ended since the last call (to be written to the journal).
+    pub fn take_finished(&mut self) -> Vec<PieceInfo> {
+        std::mem::take(&mut self.finished)
+    }
+
+    fn finish_piece(&mut self) {
+        self.finish_piece_at(now_ms());
+    }
+
+    fn finish_piece_at(&mut self, end: u64) {
+        if let Some((path, begin)) = self.begun.take() {
+            let file = path.file_name().map_or(String::new(), |f| f.to_string_lossy().into_owned());
+            self.finished.push(PieceInfo { file, begin, end: end.max(begin) });
+        }
+    }
+
+    /// Like [`interrupt`](Self::interrupt), the piece having ended at `end_ms`
+    /// (when its last data arrived, not when the loss was noticed).
+    pub fn interrupt_at(&mut self, end_ms: u64) {
+        self.current = None;
+        self.finish_piece_at(end_ms);
     }
 
     pub fn channel(&self) -> &str {
@@ -233,6 +291,7 @@ impl Recorder {
     /// `poll` while playing starts a new one).
     pub fn interrupt(&mut self) {
         self.current = None;
+        self.finish_piece();
     }
 
     /// The file being written right now.
@@ -252,6 +311,7 @@ impl Recorder {
         };
         if let Some(r) = stop {
             self.current = None;
+            self.finish_piece();
             return Step::Stop(r);
         }
         match (playing, self.current.is_some()) {
@@ -259,10 +319,12 @@ impl Recorder {
                 self.part += 1;
                 let path = self.free_path();
                 self.current = Some(path.clone());
+                self.begun = Some((path.clone(), now_ms()));
                 Step::Begin(path)
             }
             (false, true) => {
                 self.current = None;
+                self.finish_piece();
                 Step::End
             }
             _ => Step::Nothing,
@@ -270,7 +332,16 @@ impl Recorder {
     }
 
     /// A file name for the next part that does not exist yet.
-    fn free_path(&self) -> PathBuf {
+    fn free_path(&mut self) -> PathBuf {
+        if let Some((base, who)) = self.session.clone() {
+            loop {
+                let p = self.dir.join(format!("{base}{PIECE_MARK}{who}{}.ts", self.part));
+                if !p.exists() {
+                    return p;
+                }
+                self.part += 1;
+            }
+        }
         let first = self.dir.join(file_name(&self.channel, &self.stamp, self.part));
         if !first.exists() {
             return first;
@@ -317,6 +388,10 @@ pub fn list(dir: &Path) -> Vec<Recording> {
         .filter_map(|e| {
             let path = e.path();
             if path.extension().and_then(|x| x.to_str()) != Some("ts") {
+                return None;
+            }
+            // Pieces of a scheduled recording that is still being written / joined.
+            if path.file_name().is_some_and(|n| n.to_string_lossy().contains(PIECE_MARK)) {
                 return None;
             }
             let m = e.metadata().ok().filter(|m| m.is_file())?;
@@ -396,6 +471,37 @@ mod tests {
         assert_eq!(r.poll(t0, true, Some(9 * GB)), Step::Stop(StopReason::LowSpace));
         let mut r = Recorder::new(d.path(), "Game", "s", t0);
         assert_eq!(r.poll(t0, true, None), Step::Stop(StopReason::LowSpace));
+    }
+
+    #[test]
+    fn a_session_names_pieces_by_writer_and_reports_them() {
+        let d = tempfile::tempdir().unwrap();
+        let t0 = Instant::now();
+        let big = Some(50 * GB);
+        let mut r = Recorder::for_session(d.path(), "Game - 2026-10-25 18-30", "app", t0, Duration::from_secs(3600));
+        let Step::Begin(p1) = r.poll(t0, true, big) else { panic!("begin") };
+        assert!(p1.ends_with("Game - 2026-10-25 18-30.piece-app1.ts"), "{p1:?}");
+        assert!(r.take_finished().is_empty(), "still being written");
+        assert_eq!(r.poll(t0, false, big), Step::End);
+        let done = r.take_finished();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].file, "Game - 2026-10-25 18-30.piece-app1.ts");
+        assert!(done[0].end >= done[0].begin);
+        std::fs::write(&p1, b"x").unwrap();
+        let Step::Begin(p2) = r.poll(t0, true, big) else { panic!("begin 2") };
+        assert!(p2.ends_with("Game - 2026-10-25 18-30.piece-app2.ts"));
+        r.interrupt(); // a reload ends the piece too
+        assert_eq!(r.take_finished().len(), 1);
+        // The next writer run never reuses a name.
+        std::fs::write(&p2, b"x").unwrap();
+        let mut again = Recorder::for_session(d.path(), "Game - 2026-10-25 18-30", "app", t0, Duration::from_secs(60));
+        let Step::Begin(p3) = again.poll(t0, true, big) else { panic!("begin 3") };
+        assert!(p3.ends_with("Game - 2026-10-25 18-30.piece-app3.ts"), "{p3:?}");
+        // Unfinished pieces are not listed as recordings.
+        std::fs::write(&p3, b"x").unwrap();
+        std::fs::write(d.path().join("Game - 2026-10-25 18-30.ts"), b"x").unwrap();
+        let titles: Vec<String> = list(d.path()).into_iter().map(|r| r.title).collect();
+        assert_eq!(titles, ["Game - 2026-10-25 18-30"]);
     }
 
     #[test]

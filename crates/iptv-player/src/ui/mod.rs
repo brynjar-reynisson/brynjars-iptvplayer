@@ -34,6 +34,7 @@ use iptv::recent_series::RecentSeries;
 use iptv::recordings::{self, Recorder, Step as RecStep};
 use iptv::schedule::{self, Schedule, Schedules, DAY_NAMES};
 use iptv::handoff;
+use iptv::rec_merge;
 use iptv::tasks;
 use iptv::settings::Settings;
 use iptv::subtitles;
@@ -124,6 +125,15 @@ const CLAIM_GRACE: Duration = Duration::from_secs(20);
 const REC_DISK_EVERY: Duration = Duration::from_secs(5);
 /// How often the Recordings list is re-read while a recording runs.
 const RECS_RELOAD_EVERY: Duration = Duration::from_secs(3);
+
+/// Append finished pieces of a scheduled recording to its journal.
+fn journal_pieces(dir: &std::path::Path, base: &str, pieces: Vec<recordings::PieceInfo>) {
+    for p in pieces {
+        if let Err(e) = rec_merge::journal_append(dir, base, &p) {
+            eprintln!("recording: could not write the journal: {e}");
+        }
+    }
+}
 
 /// The scheduled recordings' Windows tasks point at the exe that created them:
 /// when the app was moved or rebuilt elsewhere, create them again (background).
@@ -330,6 +340,11 @@ struct App {
     /// Schedule claimed before its window opens (and until the app records it):
     /// the background recorder stays away so it cannot cut the app's stream.
     pre_claim: Option<String>,
+    /// File base name of the scheduled recording the app writes pieces for.
+    rec_base: Option<String>,
+    /// Join the pieces of this recording once its window is over (a fallback
+    /// for when no background recorder did it).
+    final_due: Option<(String, Instant)>,
     /// When the window opened while `pre_claim` was held without recording.
     pre_claim_open_since: Option<Instant>,
     /// A popup the user must dismiss (the watched channel was changed).
@@ -431,6 +446,13 @@ impl App {
         let data_dir_for_rec = opts.data_dir.clone();
         let mut schedules = Schedules::load(&opts.data_dir);
         sync_tasks_after_move(&mut schedules, &opts.data_dir);
+        {
+            // Pieces of a scheduled recording that nobody joined (crash, no recorder).
+            let dir = recordings::dir_in(&opts.data_dir);
+            std::thread::spawn(move || {
+                rec_merge::recover_orphans(&dir, Duration::from_secs(120), &mut |m| eprintln!("recording: {m}"));
+            });
+        }
         let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
@@ -492,6 +514,8 @@ impl App {
             sched_check: Instant::now(),
             sched_refused: None,
             pre_claim: None,
+            rec_base: None,
+            final_due: None,
             pre_claim_open_since: None,
             notice: None,
             schedules,
@@ -936,6 +960,18 @@ impl App {
             return;
         }
         self.sched_check = Instant::now();
+        // The window is over and the recorder has had its time: make sure the
+        // pieces are joined (whoever gets there first does it; the other finds nothing).
+        if let Some((base, at)) = self.final_due.clone() {
+            if Instant::now() >= at && self.active_window().is_none() {
+                self.final_due = None;
+                let dir = self.rec_dir.clone();
+                std::thread::spawn(move || {
+                    let o = rec_merge::finalize_retrying(&dir, &base, &mut |m| eprintln!("recording: {m}"));
+                    eprintln!("recording: joining the pieces: {o:?}");
+                });
+            }
+        }
         let using = self.using_provider();
         let Some((s, remaining)) = self.active_window() else {
             self.sched_refused = None;
@@ -998,13 +1034,10 @@ impl App {
             self.rec_free = free;
             self.rec_free_at = now;
             self.rec_gen = gen;
-            self.recorder = Some(Recorder::with_max(
-                &self.rec_dir,
-                &s.name,
-                &recordings::local_stamp(),
-                now,
-                Duration::from_secs(remaining),
-            ));
+            // One file per window: pieces named by the window, joined at its end.
+            let base = schedule::session_base(s, recordings::local_now(), remaining);
+            self.recorder = Some(Recorder::for_session(&self.rec_dir, &base, "app", now, Duration::from_secs(remaining)));
+            self.rec_base = Some(base);
         }
         // (A manual recording of this channel already runs: it simply becomes the scheduled one.)
         self.pre_claim = None;
@@ -1079,8 +1112,13 @@ impl App {
 
     /// End the recording (if any) and close its file. `msg` replaces the status message.
     fn stop_record(&mut self, msg: Option<String>) {
-        if self.recorder.take().is_none() {
-            return;
+        let Some(mut rec) = self.recorder.take() else { return };
+        rec.interrupt(); // the piece in progress ends now
+        if let Some(base) = self.rec_base.take() {
+            journal_pieces(&self.rec_dir, &base, rec.take_finished());
+            if self.rec_sched.is_some() {
+                self.final_due = Some((base, Instant::now() + Duration::from_secs(25)));
+            }
         }
         if let Ok(p) = &mut self.player {
             p.set_stream_record(None);
@@ -1116,7 +1154,12 @@ impl App {
             Status::Buffering => rec.current().is_some(),
             _ => false,
         };
-        match rec.poll(now, playing, self.rec_free) {
+        let step = rec.poll(now, playing, self.rec_free);
+        let finished = rec.take_finished();
+        if let Some(base) = &self.rec_base {
+            journal_pieces(&self.rec_dir, base, finished);
+        }
+        match step {
             RecStep::Nothing => {}
             RecStep::Begin(path) => p.set_stream_record(Some(&path)),
             RecStep::End => p.set_stream_record(None),

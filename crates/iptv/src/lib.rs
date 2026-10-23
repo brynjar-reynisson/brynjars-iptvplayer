@@ -17,6 +17,7 @@ pub mod last_view;
 pub mod recent_series;
 pub mod handoff;
 pub mod rec_job;
+pub mod rec_merge;
 pub mod recordings;
 pub mod schedule;
 pub mod tasks;
