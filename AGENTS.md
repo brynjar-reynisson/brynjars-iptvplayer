@@ -7,6 +7,7 @@ Rust Windows desktop IPTV player (browse + play in one window, with persistent s
 - Playlist URL/credentials live only in gitignored `config.toml`. Never commit it, the sample playlists, or the cache; never print credentialed URLs in logs/errors.
 - Branches: `feature/...`, `bugfix/...`. Use `git -C <path>`. Update this file and docs when committing a feature branch.
 - Add new source files to git.
+- Release (how 0.1.0 and 0.1.1 were made): bump `version` in `crates/iptv/Cargo.toml` and `crates/iptv-player/Cargo.toml` (Cargo.lock follows), commit on `main`, `scripts/package-release.ps1` (with the app closed), lightweight tag `vX.Y.Z`, push `main` and the tag (see the global rule about the `gh` account), then `gh release create vX.Y.Z dist/iptv-player.zip --title vX.Y.Z --notes ...` (the asset is always named `iptv-player.zip`).
 - Build + deploy the release folder (`dist\iptv-player`, the pinned taskbar shortcut's target): use the project skill `.claude/skills/build-and-deploy/SKILL.md` (checks the app is not running, runs tests, `scripts/package-release.ps1`; keeps `config.toml`, cache and favorites).
 - Known gaps, manual checks still to do and ideas are tracked in `docs/follow-ups.md`; update it when you fix or find one.
 - Sample playlist: `<samples dir>\<playlist>.m3u`, in a samples folder outside the repo (contains credentials). Its file name contains a credential segment: never write the path or file name into tracked files or commit messages (read it at run time, e.g. via a glob or `IPTV_SAMPLE`).
