@@ -76,6 +76,23 @@ pub struct LocalNow {
     pub second: u16,
 }
 
+impl LocalNow {
+    /// This time `secs` later (less than a day); the date is not carried, only
+    /// the weekday and the clock.
+    pub fn plus_secs(self, secs: u32) -> LocalNow {
+        let t = self.hour as u32 * 3600 + self.minute as u32 * 60 + self.second as u32 + secs;
+        let days = t / 86400;
+        let t = t % 86400;
+        LocalNow {
+            weekday: ((self.weekday as u32 + days) % 7) as u16,
+            hour: (t / 3600) as u16,
+            minute: (t / 60 % 60) as u16,
+            second: (t % 60) as u16,
+            ..self
+        }
+    }
+}
+
 pub fn local_now() -> LocalNow {
     #[cfg(windows)]
     {

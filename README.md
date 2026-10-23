@@ -159,7 +159,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   (new `... - part 2.ts` file), and stops at the end time or when less than 10 GB of disk is left.
   Providers like yours allow one connection per account (a second one makes the provider cut the
   first, over and over), so only one of "the app" and "the recorder" ever holds it: if the app is
-  open and playing the scheduled channel when the window opens, the app records it itself (badge
+  open and playing when a window opens (it claims the recording up to 45 seconds before, so the
+  recorder never connects at the first second), and it is the scheduled channel, the app records it itself (badge
   "REC (scheduled)") and the background recorder stands by; if you close the app or press Esc, the
   recorder takes over within a couple of seconds. If the app is playing anything else (another
   channel or a movie), it switches to the scheduled channel and shows a popup saying so; during the

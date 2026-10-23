@@ -117,6 +117,11 @@ pub fn remaining_secs(s: &Schedule, now: LocalNow) -> Option<u64> {
     None
 }
 
+/// The window of `s` is not open at `now` but opens within `secs` seconds.
+pub fn opens_within(s: &Schedule, now: LocalNow, secs: u32) -> bool {
+    remaining_secs(s, now).is_none() && remaining_secs(s, now.plus_secs(secs)).is_some()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SchedulesFile {
     version: u64,
@@ -288,6 +293,20 @@ mod tests {
         assert_eq!(remaining_secs(&s, at(0, 19, 44, 59)), Some(1));
         assert_eq!(remaining_secs(&s, at(0, 19, 45, 0)), None, "over");
         assert_eq!(remaining_secs(&s, at(1, 19, 0, 0)), None, "Monday is not scheduled");
+    }
+
+    #[test]
+    fn opens_within_looks_ahead_across_midnight() {
+        let s = game(); // Sundays 18:30-19:45
+        assert!(opens_within(&s, at(0, 18, 29, 30), 45));
+        assert!(!opens_within(&s, at(0, 18, 28, 0), 45), "too early");
+        assert!(!opens_within(&s, at(0, 18, 31, 0), 45), "already open");
+        assert!(!opens_within(&s, at(1, 18, 29, 30), 45), "Monday");
+        let mut late = game();
+        late.start = 0; // Sunday 00:00-01:00
+        late.end = 60;
+        assert!(opens_within(&late, at(6, 23, 59, 30), 45), "Saturday 23:59:30 -> Sunday 00:00");
+        assert!(!opens_within(&late, at(0, 23, 59, 30), 45), "Sunday night -> Monday is not scheduled");
     }
 
     #[test]

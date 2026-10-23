@@ -115,6 +115,11 @@ enum RecMode {
     Schedules,
 }
 
+/// The app claims a schedule this long before its window opens when it is playing.
+const PRE_CLAIM_SECS: u32 = 45;
+/// A claim held into the open window without recording is given up after this.
+const CLAIM_GRACE: Duration = Duration::from_secs(20);
+
 /// How often the free disk space is read while recording.
 const REC_DISK_EVERY: Duration = Duration::from_secs(5);
 /// How often the Recordings list is re-read while a recording runs.
@@ -322,6 +327,11 @@ struct App {
     sched_check: Instant,
     /// A schedule the app could not start recording (disk space): not retried.
     sched_refused: Option<String>,
+    /// Schedule claimed before its window opens (and until the app records it):
+    /// the background recorder stays away so it cannot cut the app's stream.
+    pre_claim: Option<String>,
+    /// When the window opened while `pre_claim` was held without recording.
+    pre_claim_open_since: Option<Instant>,
     /// A popup the user must dismiss (the watched channel was changed).
     notice: Option<String>,
     /// `schedules.json`: scheduled recordings (run by Windows Task Scheduler).
@@ -481,6 +491,8 @@ impl App {
             rec_sched_beat: Instant::now(),
             sched_check: Instant::now(),
             sched_refused: None,
+            pre_claim: None,
+            pre_claim_open_since: None,
             notice: None,
             schedules,
             sched_form: SchedForm::default(),
@@ -880,20 +892,61 @@ impl App {
         true
     }
 
-    /// Once a second while a schedule's window is open: keep the claim fresh,
-    /// move a conflicting playback to the scheduled channel, and record the
-    /// scheduled channel here when it plays (an idle app leaves it to the
-    /// background recorder).
+    /// The first enabled schedule whose window opens within `PRE_CLAIM_SECS`.
+    fn upcoming_window(&self) -> Option<Schedule> {
+        let now = recordings::local_now();
+        self.schedules.items().iter().find(|s| s.enabled && schedule::opens_within(s, now, PRE_CLAIM_SECS)).cloned()
+    }
+
+    /// The app is playing provider content (live or VOD, not a local file).
+    fn using_provider(&self) -> bool {
+        self.playback.as_ref().is_some_and(|p| !p.is_local()) && self.player.as_ref().is_ok_and(Player::is_active)
+    }
+
+    /// Claim `id` (or refresh the claim) on the beat.
+    fn hold_claim(&mut self, id: &str) {
+        if self.pre_claim.as_deref() != Some(id) || self.rec_sched_beat.elapsed() >= handoff::BEAT {
+            self.pre_claim = Some(id.to_string());
+            self.rec_sched_beat = Instant::now();
+            if let Err(e) = handoff::claim(&self.data_dir, id) {
+                eprintln!("recording: could not claim the schedule: {e}");
+            }
+        }
+    }
+
+    /// Give back a claim that was held before recording (the recorder takes over).
+    fn release_pre_claim(&mut self) {
+        self.pre_claim_open_since = None;
+        if let Some(id) = self.pre_claim.take() {
+            if self.rec_sched.as_deref() != Some(id.as_str()) {
+                handoff::release(&self.data_dir, &id);
+            }
+        }
+    }
+
+    /// Once a second around a schedule's window:
+    /// - while the app plays and a window opens within `PRE_CLAIM_SECS` (or is
+    ///   open) it claims the schedule, so the background recorder stays away
+    ///   from the single provider connection from the very first second;
+    /// - once the window is open it moves a conflicting playback to the
+    ///   scheduled channel and records that channel itself when it plays;
+    /// - an idle app (or one that cannot record) leaves it to the recorder.
     fn update_schedule_window(&mut self) {
         if self.sched_check.elapsed() < Duration::from_secs(1) {
             return;
         }
         self.sched_check = Instant::now();
+        let using = self.using_provider();
         let Some((s, remaining)) = self.active_window() else {
             self.sched_refused = None;
+            match self.upcoming_window() {
+                Some(next) if using => self.hold_claim(&next.id),
+                _ => self.release_pre_claim(),
+            }
             return;
         };
         if self.rec_sched.as_deref() == Some(s.id.as_str()) {
+            // Recording here: keep the claim fresh.
             if self.rec_sched_beat.elapsed() >= handoff::BEAT {
                 self.rec_sched_beat = Instant::now();
                 if let Err(e) = handoff::claim(&self.data_dir, &s.id) {
@@ -902,20 +955,24 @@ impl App {
             }
             return;
         }
-        let using = self.playback.as_ref().is_some_and(|p| !p.is_local())
-            && self.player.as_ref().is_ok_and(Player::is_active);
-        if !using {
+        if !using || self.sched_refused.as_deref() == Some(s.id.as_str()) {
+            self.release_pre_claim();
             return;
         }
+        self.hold_claim(&s.id);
         let key = self.playback.as_ref().map(|p| p.key().to_string()).unwrap_or_default();
         if key != s.key {
             self.redirect_to_schedule(&s);
+        } else if self.player.as_ref().is_ok_and(|p| p.status() == Status::Playing) {
+            self.begin_scheduled_recording(&s, remaining);
             return;
         }
-        if self.sched_refused.as_deref() != Some(s.id.as_str())
-            && self.player.as_ref().is_ok_and(|p| p.status() == Status::Playing)
-        {
-            self.begin_scheduled_recording(&s, remaining);
+        // Claimed but not recording yet: do not hold the recorder off forever.
+        let since = *self.pre_claim_open_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= CLAIM_GRACE {
+            eprintln!("recording: the app could not start recording in time; leaving it to the recorder");
+            self.sched_refused = Some(s.id.clone());
+            self.release_pre_claim();
         }
     }
 
@@ -927,12 +984,14 @@ impl App {
             if let Err(e) = std::fs::create_dir_all(&self.rec_dir) {
                 self.message = Some(safe_text(&format!("Cannot create the recordings folder: {e}")));
                 self.sched_refused = Some(s.id.clone());
+                self.release_pre_claim();
                 return;
             }
             let free = recordings::free_bytes(&self.rec_dir);
             if let Some(why) = recordings::start_refusal(free) {
                 self.message = Some(why);
                 self.sched_refused = Some(s.id.clone());
+                self.release_pre_claim();
                 return;
             }
             let now = Instant::now();
@@ -948,6 +1007,8 @@ impl App {
             ));
         }
         // (A manual recording of this channel already runs: it simply becomes the scheduled one.)
+        self.pre_claim = None;
+        self.pre_claim_open_since = None;
         self.rec_sched = Some(s.id.clone());
         self.rec_sched_beat = Instant::now();
         if let Err(e) = handoff::claim(&self.data_dir, &s.id) {
@@ -1798,6 +1859,7 @@ impl App {
             };
             self.stop_record(Some(msg.into()));
         }
+        self.release_pre_claim();
         // Stopped on purpose: a live channel is not started again next time.
         self.last_view.clear_live();
         self.save_last_view();
@@ -3510,6 +3572,7 @@ impl eframe::App for App {
             hard_exit();
         });
         self.stop_record(None);
+        self.release_pre_claim();
         self.save_position();
         if let Ok(p) = &mut self.player {
             p.shutdown(gl);
