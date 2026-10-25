@@ -11,6 +11,8 @@ pub struct SchedForm {
     pub days: u8,
     pub start: String,
     pub end: String,
+    /// Id of the schedule being edited (None = a new one).
+    pub editing: Option<String>,
 }
 
 /// A validated form.
@@ -44,6 +46,17 @@ impl SchedForm {
         Ok(NewSchedule { name, key, days: self.days, start, end })
     }
 
+    /// Fill the form with an existing schedule, to change it.
+    pub fn edit(s: &Schedule) -> SchedForm {
+        SchedForm {
+            channel: Some((s.name.clone(), s.key.clone())),
+            days: s.days,
+            start: iptv::schedule::fmt_minutes(s.start),
+            end: iptv::schedule::fmt_minutes(s.end),
+            editing: Some(s.id.clone()),
+        }
+    }
+
     /// Back to empty after a schedule was added (the channel stays: adding
     /// the same channel on other days is common).
     pub fn clear_times(&mut self) {
@@ -63,7 +76,18 @@ mod tests {
             days: 1 << 6,
             start: "18:30".into(),
             end: "19:45".into(),
+            editing: None,
         }
+    }
+
+    #[test]
+    fn editing_fills_the_form_from_a_schedule() {
+        let s = Schedule { id: "s3".into(), name: "Syn".into(), key: "live:1".into(), days: 64, start: 1110, end: 1185, enabled: true };
+        let f = SchedForm::edit(&s);
+        assert_eq!(f.editing.as_deref(), Some("s3"));
+        assert_eq!((f.start.as_str(), f.end.as_str()), ("18:30", "19:45"));
+        let n = f.build().unwrap();
+        assert_eq!((n.name.as_str(), n.key.as_str(), n.days, n.start, n.end), ("Syn", "live:1", 64, 1110, 1185));
     }
 
     #[test]

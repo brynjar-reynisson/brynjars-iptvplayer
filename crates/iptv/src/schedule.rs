@@ -252,6 +252,17 @@ impl Schedules {
         Ok(s)
     }
 
+    /// Replace what schedule `id` records (validated); the id and the on/off
+    /// state stay. Returns the old schedule (to roll back) and the new one.
+    pub fn update(&mut self, id: &str, name: &str, key: &str, days: u8, start: u16, end: u16) -> Result<(Schedule, Schedule), &'static str> {
+        let i = self.items.iter().position(|s| s.id == id).ok_or("That schedule no longer exists.")?;
+        let new = Schedule { name: name.trim().to_string(), key: key.to_string(), days: days & 0x7f, start, end, ..self.items[i].clone() };
+        new.validate()?;
+        let old = std::mem::replace(&mut self.items[i], new.clone());
+        self.dirty = true;
+        Ok((old, new))
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         let n = self.items.len();
         self.items.retain(|s| s.id != id);
@@ -329,6 +340,20 @@ mod tests {
         assert_eq!(remaining_secs(&s, at(0, 19, 44, 59)), Some(1));
         assert_eq!(remaining_secs(&s, at(0, 19, 45, 0)), None, "over");
         assert_eq!(remaining_secs(&s, at(1, 19, 0, 0)), None, "Monday is not scheduled");
+    }
+
+    #[test]
+    fn update_keeps_the_id_and_the_on_off_state() {
+        let d = tempfile::tempdir().unwrap();
+        let mut all = Schedules::load(d.path());
+        let a = all.add("A", "live:1", 64, 1110, 1185).unwrap();
+        all.set_enabled(&a.id, false);
+        let (old, new) = all.update(&a.id, " B ", "live:2", 64, 1110, 1200).unwrap();
+        assert_eq!((old.end, new.end, new.name.as_str(), new.enabled, new.id.as_str()), (1185, 1200, "B", false, "s1"));
+        assert_eq!(all.get("s1").unwrap().key, "live:2");
+        assert!(all.update("s1", "B", "live:2", 0, 1110, 1200).is_err(), "no weekday");
+        assert_eq!(all.get("s1").unwrap().end, 1200, "a refused edit changes nothing");
+        assert!(all.update("s9", "B", "k", 1, 0, 60).is_err());
     }
 
     #[test]

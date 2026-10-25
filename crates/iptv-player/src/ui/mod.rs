@@ -1290,6 +1290,42 @@ impl App {
         }
     }
 
+    /// Save the form over the schedule being edited and replace its Windows task.
+    fn save_schedule_edit(&mut self, id: &str) {
+        let nf = match self.sched_form.build() {
+            Ok(n) => n,
+            Err(m) => {
+                self.message = Some(m);
+                return;
+            }
+        };
+        let (old, new) = match self.schedules.update(id, &nf.name, &nf.key, nf.days, nf.start, nf.end) {
+            Ok(p) => p,
+            Err(m) => {
+                self.message = Some(m.into());
+                return;
+            }
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            self.message = Some("Cannot find this program's own path.".into());
+            self.schedules.update(id, &old.name, &old.key, old.days, old.start, old.end).ok();
+            return;
+        };
+        match tasks::install(&exe, &self.abs_data_dir(), &new) {
+            Ok(()) => {
+                self.schedules.set_exe(&exe.display().to_string());
+                self.save_schedules();
+                self.message = Some(format!("Saved: {}", new.summary()));
+                self.sched_form = SchedForm { channel: self.sched_form.channel.clone(), ..SchedForm::default() };
+                self.refresh_task_status();
+            }
+            Err(e) => {
+                self.schedules.update(id, &old.name, &old.key, old.days, old.start, old.end).ok();
+                self.message = Some(safe_text(&format!("Could not change the task: {e:#}")));
+            }
+        }
+    }
+
     fn delete_schedule(&mut self, id: &str) {
         if let Err(e) = tasks::remove(id) {
             self.message = Some(safe_text(&format!("{e:#}")));
@@ -1298,6 +1334,9 @@ impl App {
         self.schedules.remove(id);
         self.save_schedules();
         self.task_ok.remove(id);
+        if self.sched_form.editing.as_deref() == Some(id) {
+            self.sched_form = SchedForm::default();
+        }
         self.message = Some("Schedule deleted.".into());
     }
 
@@ -1318,6 +1357,7 @@ impl App {
     fn schedules_ui(&mut self, ui: &mut egui::Ui) {
         let mut toggle: Option<(String, bool)> = None;
         let mut delete: Option<String> = None;
+        let mut edit: Option<Schedule> = None;
         if self.schedules.items().is_empty() {
             ui.weak("No scheduled recordings.");
         }
@@ -1331,13 +1371,17 @@ impl App {
                 if ui.small_button(if s.enabled { "Turn off" } else { "Turn on" }).clicked() {
                     toggle = Some((s.id.clone(), !s.enabled));
                 }
+                if ui.small_button("Edit").clicked() {
+                    edit = Some(s.clone());
+                }
                 if ui.small_button("Delete").clicked() {
                     delete = Some(s.id.clone());
                 }
             });
         }
         ui.separator();
-        ui.strong("New schedule");
+        let editing = self.sched_form.editing.clone();
+        ui.strong(if editing.is_some() { "Edit schedule" } else { "New schedule" });
         let mut pick = false;
         let choices = self.schedule_channel_choices();
         ui.horizontal(|ui| {
@@ -1373,7 +1417,14 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.sched_form.end).hint_text("19:45").desired_width(60.0));
         });
         ui.weak("Local time; an end before the start means the next day.");
-        let add = ui.button("Add schedule").clicked();
+        let mut add = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            add = ui.button(if editing.is_some() { "Save changes" } else { "Add schedule" }).clicked();
+            if editing.is_some() {
+                cancel = ui.button("Cancel").clicked();
+            }
+        });
         ui.add_space(6.0);
         ui.weak(
             "Windows Task Scheduler starts the recording at that time, also when this app is closed \
@@ -1388,8 +1439,17 @@ impl App {
         if let Some(id) = delete {
             self.delete_schedule(&id);
         }
+        if let Some(s) = edit {
+            self.sched_form = SchedForm::edit(&s);
+        }
+        if cancel {
+            self.sched_form = SchedForm::default();
+        }
         if add {
-            self.add_schedule();
+            match editing {
+                Some(id) => self.save_schedule_edit(&id),
+                None => self.add_schedule(),
+            }
         }
     }
 
