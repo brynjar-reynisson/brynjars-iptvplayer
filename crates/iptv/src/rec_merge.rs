@@ -212,8 +212,23 @@ fn join(dir: &Path, base: &str, spans: Vec<Span>, ffmpeg: Option<&Path>, log: &m
     }
     let target = free_target(dir, base);
     std::fs::rename(&out, &target).map_err(|e| format!("cannot move the joined recording: {e}"))?;
+    // The list estimates the length as last write minus creation, and the joined file was only
+    // created now: give it the time span of what it holds.
+    if let (Some(first), Some(last)) = (spans.first(), spans.iter().map(|s| s.end).max()) {
+        stamp_times(&target, first.begin, last);
+    }
     let _ = std::fs::remove_dir_all(&work);
     Ok(Outcome::Joined { file: target, pieces: files.len(), cards: cards_done })
+}
+
+/// Set a file's creation and last-write time (ms since the epoch); best effort.
+fn stamp_times(path: &Path, begin_ms: u64, end_ms: u64) {
+    use std::os::windows::fs::FileTimesExt;
+    let at = |ms: u64| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+    let times = std::fs::FileTimes::new().set_created(at(begin_ms)).set_modified(at(end_ms.max(begin_ms)));
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_times(times);
+    }
 }
 
 fn free_target(dir: &Path, base: &str) -> PathBuf {
@@ -494,6 +509,18 @@ mod tests {
         let o = finalize(d.path(), base, None, Duration::ZERO, &mut |m| logs.push(m.to_string()));
         assert!(matches!(o, Outcome::Joined { pieces: 2, cards: 0, .. }));
         assert!(logs.iter().any(|l| l.contains("timestamps may jump")), "glued only, and it says so: {logs:?}");
+    }
+
+    #[test]
+    fn the_joined_file_reports_the_length_of_what_it_holds() {
+        let d = tempfile::tempdir().unwrap();
+        let base = "G - 2026-10-25 18-30";
+        let t0 = 1_761_000_000_000u64;
+        piece(d.path(), &format!("{base}.piece-app1.ts"), b"1", t0, t0 + 600_000, base);
+        piece(d.path(), &format!("{base}.piece-rec1.ts"), b"2", t0 + 601_000, t0 + 4_500_000, base);
+        let Outcome::Joined { file, .. } = finalize(d.path(), base, None, Duration::ZERO, &mut quiet) else { panic!() };
+        let len = crate::recordings::list(d.path()).into_iter().find(|r| r.path == file).unwrap().length().unwrap();
+        assert_eq!(len, Duration::from_millis(4_500_000), "75 minutes, not the seconds the join took");
     }
 
     #[test]
