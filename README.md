@@ -5,6 +5,13 @@ A Windows desktop IPTV player written in Rust: browse an Xtream-style M3U playli
 with libmpv. Streams that drop are reconnected automatically, without any user action,
 until you pick something else.
 
+![Live channels by country, playing in the same window](docs/screenshots/live.png)
+
+![Recordings: play, resume or delete what was recorded](docs/screenshots/recordings.png)
+
+*The screenshots use made-up countries and channels. Video: "Sintel" trailer, © Blender Foundation | durian.blender.org, licensed
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).*
+
 ## Setup
 
 1. **Toolchain**: Rust stable with MSVC (`rustup default stable-x86_64-pc-windows-msvc`).
@@ -257,6 +264,12 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   of them (no button).
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.
+
+## Contributing
+
+I'm open to contributions for great features I haven't thought of, and for fixes to bugs I haven't noticed.
+
+If you want a very different workflow, then you're better off forking this repo and working with your agent harness to shape it to your willing.
 
 ## License
 
