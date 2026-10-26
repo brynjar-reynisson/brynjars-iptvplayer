@@ -81,6 +81,13 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   or **Enter** go back into the channels and play the first one. **Esc** also leaves the country
   list. The selected country is opened to show its groups (Sport, Kids, News, ...) indented
   under it: pick the country row for all its channels or a group row for just that group.
+- Programme guide (EPG): on the Live tab, a panel under the video lists what is on now and
+  next for the selected channel (times in your local time, a progress percentage for the
+  running programme, descriptions for the running and next one). It needs an Xtream-style
+  playlist URL (`get.php?username=..&password=..` or `/live/<user>/<pass>/<id>`): at start the
+  app downloads the provider's XMLTV guide and the stream-to-guide-channel list, and asks
+  `get_short_epg` for each channel you select. The richer of the two answers is shown, and the
+  panel's last line names the source. Many channels have no guide data at all.
 - **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's
   bottom right (or **F11** / **Alt+Enter**) makes the player fill the whole screen, without
   the channel list. **Esc** goes back to how it was before. In full screen the mouse cursor hides after 3 seconds without movement and returns as soon as you move it. The channel or episode title at the top left and the buttons at the bottom right also hide after 5 seconds in full screen (the next-episode offer stays), and show again when you move the mouse or switch channel. Otherwise **Esc** leaves the filter box, or stops
@@ -262,6 +269,11 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   while it runs, next to the playing stream (and the preview connection if the seek bar is
   hovered); a provider with a low connection limit may refuse some (the others carry on) or all
   of them (no button).
+- Programme guide: only on the Live tab in the normal view (not fullscreen, Favorites or the
+  other tabs). The XMLTV file (about 2.6 MB, 117 of 5,449 channels had programmes on the
+  developer's provider) is downloaded on every start and not cached; F5 does not refresh it, and
+  a playlist URL entered after start-up is only used after a restart. Channels the provider has
+  no guide for show "No programme information for this channel."
 - Credentials: URLs are redacted in every log line and error message. The playlist
   cache contains the raw URLs, so keep the data directory private.
 

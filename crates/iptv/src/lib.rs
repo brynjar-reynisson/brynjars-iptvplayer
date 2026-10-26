@@ -23,3 +23,4 @@ pub mod schedule;
 pub mod tasks;
 pub mod intro;
 pub mod intros;
+pub mod epg;

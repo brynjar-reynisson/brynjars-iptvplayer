@@ -8,6 +8,7 @@
 //! searches run on a `SearchWorker` thread; Up/Down only move the cursor
 //! there (no zap), click/Enter play at once, as VOD.
 
+pub mod epg;
 pub mod fonts;
 pub mod help;
 pub mod live;
@@ -53,6 +54,7 @@ use crate::state::next::{
 use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
 use iptv::intro::INTRO_SCAN_SECS;
 use iptv::intros::Intros;
+use crate::state::epg::EpgLoader;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::recs::RecList;
 use crate::state::sched_form::SchedForm;
@@ -392,6 +394,8 @@ struct App {
     search: SearchWorker,
     /// Episode titles from TVmaze (background worker).
     titles: TitleLoader,
+    /// Programme guide (EPG spike): XMLTV + per-channel short guide.
+    epg: EpgLoader,
     /// Movie/series group titles + counts for the filter menu (computed off
     /// the UI thread per library: ~30 ms on 250k entries).
     groups: Option<Vec<VodGroup>>,
@@ -462,6 +466,9 @@ impl App {
         let wake = cc.egui_ctx.clone();
         let titles = TitleLoader::new(opts.data_dir.clone(), TVMAZE_URL.to_string(), move || wake.request_repaint());
         let wake = cc.egui_ctx.clone();
+        let account = iptv::config::load(&opts.data_dir).ok().and_then(|c| iptv::epg::Account::from_playlist_url(&c.playlist_url));
+        let epg = EpgLoader::new(account, user_agent.clone(), move || wake.request_repaint());
+        let wake = cc.egui_ctx.clone();
         let intro_scanner = IntroScanner::new(user_agent.clone(), move || wake.request_repaint());
         let intros = Intros::load(&opts.data_dir);
         let mut app = App {
@@ -479,6 +486,7 @@ impl App {
             shown_title: String::new(),
             title_changed: Instant::now(),
             seek: SeekState::default(),
+            epg,
             previews: Previews::new(user_agent_for_previews, cc.egui_ctx.clone()),
             key_seek: None,
             autoplay: Autoplay::new(),
@@ -3548,7 +3556,29 @@ impl App {
                 });
             }
         }
+        self.epg_panel(ui, &lib);
         self.video_area(ui);
+    }
+
+    /// EPG spike: now/next under the video for the selected live channel
+    /// (Live tab, browse view). Must run before `video_area` (central panel).
+    fn epg_panel(&mut self, ui: &mut egui::Ui, lib: &Library) {
+        if self.tab != Tab::Live {
+            return;
+        }
+        let Some(e) = self.live.list().current().or_else(|| self.playing_entry()) else { return };
+        let entry = lib.entry(e);
+        if entry.kind != iptv::playlist::Kind::Live || entry.id.is_empty() || !entry.id.bytes().all(|b| b.is_ascii_digit()) {
+            return;
+        }
+        let (id, name) = (entry.id.clone(), entry.name.clone());
+        self.epg.request_short(&id);
+        let (now, offset) = (iptv::epg::unix_now(), iptv::epg::local_offset_secs());
+        egui::Panel::bottom("epg").resizable(true).default_size(190.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| epg::panel(ui, &self.epg, &name, &id, now, offset));
+        });
+        // Keep "now" fresh without input.
+        ui.ctx().request_repaint_after(Duration::from_secs(30));
     }
 }
 
@@ -3562,6 +3592,7 @@ impl eframe::App for App {
         }
         self.poll_background();
         self.titles.poll();
+        self.epg.poll();
         self.previews.poll(&ctx);
         let finished = match &mut self.player {
             Ok(p) => {
