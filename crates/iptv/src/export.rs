@@ -311,8 +311,25 @@ pub fn should_retry_without_subs(stderr: &str, with_subs: bool) -> bool {
     if !with_subs {
         return false;
     }
-    let s = stderr.to_lowercase();
-    s.contains("subtitle") || s.contains("codec not currently supported in container")
+    let all = stderr.to_lowercase();
+    // A full disk or an I/O error is not a subtitle problem, whatever streams
+    // the input has.
+    if all.contains("no space left") || all.contains("input/output error") || all.contains("i/o error") {
+        return false;
+    }
+    all.lines().map(str::trim).any(|l| {
+        // The input listing (`Stream #0:2: Subtitle: dvb_subtitle`) is not an error.
+        if l.starts_with("stream #") || l.starts_with("stream mapping") {
+            return false;
+        }
+        let subs_or_codec = l.contains("subtitle") || l.contains("codec");
+        l.contains("codec not currently supported in container")
+            || l.contains("subtitle codec")
+            || (l.contains("could not write header") && subs_or_codec)
+            || (l.contains("invalid argument") && l.contains("subtitle"))
+            || (l.starts_with("[matroska") && subs_or_codec)
+            || (l.contains("error initializing output stream") && subs_or_codec)
+    })
 }
 
 /// Delete `*.mkv.part` files directly in `dir` (leftovers of a crashed export).
@@ -342,14 +359,60 @@ fn short_message(stderr: &str) -> String {
     }
 }
 
-fn probe_duration(ffmpeg: &Path, src: &Path) -> Option<f64> {
-    let mut cmd = Command::new(rec_merge::ffprobe_for(ffmpeg));
-    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(src);
-    let out = rec_merge::hide_window(&mut cmd).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    if !out.status.success() {
+/// Put `child` in the killable slot; kills it at once when a cancel already landed.
+fn store_child(shared: &Shared, child: Child) {
+    if let Ok(mut slot) = shared.child.lock() {
+        *slot = Some(child);
+    }
+    // A cancel that landed before the child was stored found nothing to kill.
+    if shared.cancelled.load(Ordering::SeqCst) {
+        shared.kill();
+    }
+}
+
+/// Wait for the child in the slot (polling, without holding the lock) and empty the slot.
+fn wait_slot(shared: &Shared) -> Option<std::process::ExitStatus> {
+    let status = loop {
+        let r = match shared.child.lock() {
+            Ok(mut c) => match c.as_mut() {
+                Some(ch) => ch.try_wait(),
+                None => Ok(None),
+            },
+            Err(_) => Ok(None),
+        };
+        match r {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            Err(_) => break None,
+        }
+    };
+    if let Ok(mut c) = shared.child.lock() {
+        *c = None;
+    }
+    status
+}
+
+/// ffprobe runs in the same killable slot as ffmpeg, so a cancel interrupts it.
+fn probe_duration(ffmpeg: &Path, src: &Path, shared: &Shared) -> Option<f64> {
+    if shared.cancelled.load(Ordering::SeqCst) {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok().filter(|d| d.is_finite())
+    let mut cmd = Command::new(rec_merge::ffprobe_for(ffmpeg));
+    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(src)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = rec_merge::hide_window(&mut cmd).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    store_child(shared, child);
+    let mut text = Vec::new();
+    let _ = out.read_to_end(&mut text);
+    let status = wait_slot(shared)?;
+    if !status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&text).trim().parse::<f64>().ok().filter(|d| d.is_finite())
 }
 
 fn run_ffmpeg(
@@ -374,13 +437,7 @@ fn run_ffmpeg(
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    if let Ok(mut slot) = shared.child.lock() {
-        *slot = Some(child);
-    }
-    // A cancel that landed before the child was stored found nothing to kill.
-    if shared.cancelled.load(Ordering::SeqCst) {
-        shared.kill();
-    }
+    store_child(shared, child);
     let err_thread = std::thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
         if let Some(mut s) = stderr {
@@ -399,7 +456,16 @@ fn run_ffmpeg(
     });
     if let Some(out) = stdout {
         let mut p = Progress::default();
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
+        let mut reader = BufReader::new(out);
+        let mut raw: Vec<u8> = Vec::new();
+        // Read to EOF whatever the bytes are, so ffmpeg never blocks on a full pipe.
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&raw).into_owned();
             apply_progress_line(&line, &mut p);
             if line.starts_with("progress=") {
                 p.fraction = fraction(p.out_secs, duration);
@@ -410,23 +476,7 @@ fn run_ffmpeg(
         }
     }
     // The pipes are closed: the process is ending. Poll without holding the lock.
-    let status = loop {
-        let r = match shared.child.lock() {
-            Ok(mut c) => match c.as_mut() {
-                Some(ch) => ch.try_wait(),
-                None => Ok(None),
-            },
-            Err(_) => Ok(None),
-        };
-        match r {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
-            Err(_) => break None,
-        }
-    };
-    if let Ok(mut c) = shared.child.lock() {
-        *c = None;
-    }
+    let status = wait_slot(shared);
     let err_text = err_thread.join().unwrap_or_default();
     let outcome = if shared.cancelled.load(Ordering::SeqCst) {
         Outcome::Cancelled
@@ -440,7 +490,7 @@ fn run_ffmpeg(
 
 fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, shared: Arc<Shared>) {
     let part = part_path(&dest);
-    let duration = probe_duration(&ffmpeg, &src);
+    let duration = probe_duration(&ffmpeg, &src, &shared);
     let mut without_subtitles = false;
     let (mut outcome, err) = run_ffmpeg(&ffmpeg, &src, &part, true, duration, &shared);
     if matches!(outcome, Outcome::Failed(_)) && should_retry_without_subs(&err, true) {
@@ -637,6 +687,68 @@ mod tests {
         assert!(st.success());
     }
 
+    /// A local HTTP server that sends a whole file but never ends the response,
+    /// so ffprobe/ffmpeg reading it stay running until killed: cancel tests
+    /// cannot race a fast remux.
+    struct StallServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl StallServer {
+        fn start(file: &Path) -> StallServer {
+            use std::io::Write;
+            let data = std::fs::read(file).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop2 = stop.clone();
+            std::thread::spawn(move || {
+                while !stop2.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let (data, stop3) = (data.clone(), stop2.clone());
+                            std::thread::spawn(move || {
+                                let _ = s.set_nonblocking(false);
+                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                                let mut req = [0u8; 2048];
+                                let _ = s.read(&mut req);
+                                let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n";
+                                if s.write_all(head.as_bytes()).is_err() || s.write_all(&data).is_err() {
+                                    return;
+                                }
+                                // stall until the client goes away or the test ends
+                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                let mut b = [0u8; 16];
+                                while !stop3.load(Ordering::SeqCst) {
+                                    match s.read(&mut b) {
+                                        Ok(0) => break,
+                                        Ok(_) => {}
+                                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+            StallServer { port, stop }
+        }
+
+        fn url(&self) -> PathBuf {
+            PathBuf::from(format!("http://127.0.0.1:{}/in.ts", self.port))
+        }
+    }
+
+    impl Drop for StallServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
     fn wait_end(job: &mut ExportJob, secs: u64) -> JobState {
         let t0 = std::time::Instant::now();
         loop {
@@ -723,11 +835,14 @@ mod tests {
     fn cancel_removes_the_part_and_never_creates_the_mkv() {
         let Some(ff) = rec_merge::find_ffmpeg() else { return };
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("long.ts");
-        make_source(&ff, &src, 60);
+        let src = dir.path().join("short.ts");
+        make_source(&ff, &src, 3);
+        let server = StallServer::start(&src);
+        let src = server.url();
         let dest = dir.path().join("out.mkv");
         let mut job = ExportJob::start(ff.clone(), src.clone(), dest.clone());
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(job.poll(), JobState::Running(_)), "the stalled source cannot finish");
         let t = std::time::Instant::now();
         job.cancel();
         assert!(t.elapsed() < Duration::from_millis(500), "cancel must not block");
@@ -737,6 +852,7 @@ mod tests {
         let dest2 = dir.path().join("old.mkv");
         std::fs::write(&dest2, "OLD").unwrap();
         let mut job = ExportJob::start(ff, src, dest2.clone());
+        std::thread::sleep(Duration::from_millis(100));
         job.cancel();
         assert_eq!(wait_end(&mut job, 10), JobState::Cancelled);
         assert!(!part_path(&dest2).exists());
@@ -747,11 +863,13 @@ mod tests {
     fn kill_blocking_removes_the_part_quickly() {
         let Some(ff) = rec_merge::find_ffmpeg() else { return };
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("long.ts");
-        make_source(&ff, &src, 60);
+        let src = dir.path().join("short.ts");
+        make_source(&ff, &src, 3);
+        let server = StallServer::start(&src);
         let dest = dir.path().join("out.mkv");
-        let mut job = ExportJob::start(ff, src, dest.clone());
-        std::thread::sleep(Duration::from_millis(200));
+        let mut job = ExportJob::start(ff, server.url(), dest.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(job.poll(), JobState::Running(_)), "the stalled source cannot finish");
         let t = std::time::Instant::now();
         job.kill_blocking();
         assert!(t.elapsed() < Duration::from_secs(2));
@@ -762,6 +880,20 @@ mod tests {
     fn retries_without_subtitles_when_they_cannot_be_copied() {
         assert!(should_retry_without_subs("Subtitle codec 94213 is not supported", true));
         assert!(should_retry_without_subs("Could not write header: codec not currently supported in container", true));
+        assert!(should_retry_without_subs(
+            "Stream #0:2: Subtitle: dvb_subtitle\n[matroska @ 0x1] Subtitle codec 94213 is not supported\n",
+            true
+        ));
+        assert!(should_retry_without_subs(
+            "Could not write header for output file #0 (incorrect codec parameters ?): Invalid argument (subtitle)",
+            true
+        ));
+        // the input listing alone is not an error about the output
+        assert!(!should_retry_without_subs(
+            "  Stream #0:2[0x1c0]: Subtitle: dvb_subtitle\nError writing trailer: No space left on device\n",
+            true
+        ));
+        assert!(!should_retry_without_subs("  Stream #0:2: Subtitle: dvb_subtitle\nInvalid data found\n", true));
         assert!(!should_retry_without_subs("Subtitle codec 94213 is not supported", false));
         assert!(!should_retry_without_subs("Invalid data found when processing input", true));
         assert!(!should_retry_without_subs("", true));
