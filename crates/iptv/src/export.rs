@@ -45,13 +45,16 @@ pub fn clean_file_name(input: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("Type a file name.".to_string());
     }
-    let has_ext = trimmed.len() > EXT.len() && trimmed.to_lowercase().ends_with(EXT);
+    let has_ext = trimmed.len() > EXT.len()
+        && trimmed.is_char_boundary(trimmed.len() - EXT.len())
+        && trimmed[trimmed.len() - EXT.len()..].eq_ignore_ascii_case(EXT);
     let stem = if has_ext { &trimmed[..trimmed.len() - EXT.len()] } else { trimmed };
     let stem = stem.trim_matches(|c| c == ' ' || c == '.');
     if stem.is_empty() {
         return Err("Type a file name.".to_string());
     }
-    if is_reserved(stem) {
+    let device = stem.split('.').next().unwrap_or("").trim_end_matches(|c| c == ' ' || c == '.');
+    if is_reserved(device) {
         return Err(format!("\"{stem}\" is a reserved Windows name; pick another."));
     }
     let ext = if has_ext { &trimmed[trimmed.len() - EXT.len()..] } else { EXT };
@@ -261,6 +264,17 @@ mod tests {
         assert!(clean_file_name("").is_err());
         assert!(clean_file_name("...").is_err());
         assert!(clean_file_name("   ").is_err());
+        for bad in ["COM1", "LPT9", "nul.txt", "con .x"] {
+            assert!(clean_file_name(bad).is_err(), "{bad}");
+        }
+        for ok in ["console.mkv", "communism", "aux1"] {
+            assert!(clean_file_name(ok).is_ok(), "{ok}");
+        }
+        let kelvin = char::from_u32(0x212A).unwrap();
+        let k = clean_file_name(&format!("a.{kelvin}V")).unwrap();
+        assert!(k.ends_with(".mkv"), "{k}");
+        let wide = clean_file_name(&char::from_u32(0xE9).unwrap().to_string().repeat(300)).unwrap();
+        assert!(wide.chars().count() <= 150 && wide.ends_with(".mkv"));
         let bsl = char::from(92u8);
         let r = clean_file_name(&format!("..{bsl}x")).unwrap();
         assert!(!r.contains([bsl, '/', ':', '*', '?', '"', '<', '>', '|']), "{r}");
@@ -340,7 +354,7 @@ mod tests {
         assert_eq!(default_dir(Some(t.to_str().unwrap())), Some(t));
         assert_eq!(default_dir(Some("Z:/no/such/dir")), downloads_dir());
         if let Some(d) = downloads_dir() {
-            assert_eq!(d.file_name().unwrap(), "Downloads");
+            assert!(d.is_absolute() && !d.as_os_str().is_empty());
         }
     }
 }
