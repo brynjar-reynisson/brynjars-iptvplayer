@@ -116,7 +116,7 @@ pub enum Outcome {
     Failed(String),
 }
 
-fn hide_window(cmd: &mut Command) -> &mut Command {
+pub(crate) fn hide_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -313,7 +313,7 @@ pub fn card_spec(json: &str) -> Option<CardSpec> {
     })
 }
 
-fn ffprobe_for(ffmpeg: &Path) -> PathBuf {
+pub(crate) fn ffprobe_for(ffmpeg: &Path) -> PathBuf {
     let sibling = ffmpeg.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
     if sibling.is_file() {
         sibling

@@ -5,6 +5,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use crate::rec_merge;
 
 /// A source file written to within this many seconds counts as still being written.
 pub const RECENT_WRITE_SECS: u64 = 10;
@@ -246,6 +254,263 @@ pub fn drives() -> Vec<PathBuf> {
     drives_from_mask(unsafe { win::GetLogicalDrives() })
 }
 
+// ---- background job ----
+
+/// Where an `ExportJob` stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JobState {
+    Running(Progress),
+    Done { dest: PathBuf, without_subtitles: bool },
+    Failed(String),
+    Cancelled,
+}
+
+/// Longest ffmpeg stderr kept (the tail), so a chatty run cannot grow memory.
+const STDERR_KEEP: usize = 16 * 1024;
+const MAX_MESSAGE_CHARS: usize = 200;
+
+struct Shared {
+    state: Mutex<JobState>,
+    child: Mutex<Option<Child>>,
+    cancelled: AtomicBool,
+}
+
+impl Shared {
+    fn kill(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut c) = self.child.lock() {
+            if let Some(child) = c.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn set(&self, s: JobState) {
+        if let Ok(mut st) = self.state.lock() {
+            *st = s;
+        }
+    }
+}
+
+/// A running remux of `src` into `<dest>.part`, renamed to `dest` on success.
+pub struct ExportJob {
+    shared: Arc<Shared>,
+    dest: PathBuf,
+    worker: Option<JoinHandle<()>>,
+}
+
+enum Outcome {
+    Ok,
+    Cancelled,
+    Failed(String),
+}
+
+/// Subtitles that cannot be stored in Matroska without re-encoding make ffmpeg
+/// fail; the export is then retried once without them.
+pub fn should_retry_without_subs(stderr: &str, with_subs: bool) -> bool {
+    if !with_subs {
+        return false;
+    }
+    let s = stderr.to_lowercase();
+    s.contains("subtitle") || s.contains("codec not currently supported in container")
+}
+
+/// Delete `*.mkv.part` files directly in `dir` (leftovers of a crashed export).
+pub fn sweep_parts(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        if name.ends_with(".mkv.part") && e.path().is_file() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The last lines of ffmpeg's stderr as a short one-line message.
+fn short_message(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines.iter().rev().take(2).rev().copied().collect::<Vec<_>>().join(" / ");
+    let clean: String = tail.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    if clean.is_empty() {
+        return "ffmpeg failed".to_string();
+    }
+    if clean.chars().count() > MAX_MESSAGE_CHARS {
+        let cut: String = clean.chars().take(MAX_MESSAGE_CHARS - 3).collect();
+        format!("{cut}...")
+    } else {
+        clean
+    }
+}
+
+fn probe_duration(ffmpeg: &Path, src: &Path) -> Option<f64> {
+    let mut cmd = Command::new(rec_merge::ffprobe_for(ffmpeg));
+    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"]).arg(src);
+    let out = rec_merge::hide_window(&mut cmd).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok().filter(|d| d.is_finite())
+}
+
+fn run_ffmpeg(
+    ffmpeg: &Path,
+    src: &Path,
+    part: &Path,
+    with_subs: bool,
+    duration: Option<f64>,
+    shared: &Shared,
+) -> (Outcome, String) {
+    if shared.cancelled.load(Ordering::SeqCst) {
+        return (Outcome::Cancelled, String::new());
+    }
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(ffmpeg_args(src, part, with_subs))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match rec_merge::hide_window(&mut cmd).spawn() {
+        Ok(c) => c,
+        Err(e) => return (Outcome::Failed(format!("could not start ffmpeg: {}", e.kind())), String::new()),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if let Ok(mut slot) = shared.child.lock() {
+        *slot = Some(child);
+    }
+    // A cancel that landed before the child was stored found nothing to kill.
+    if shared.cancelled.load(Ordering::SeqCst) {
+        shared.kill();
+    }
+    let err_thread = std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        if let Some(mut s) = stderr {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = s.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > STDERR_KEEP * 2 {
+                    buf.drain(..buf.len() - STDERR_KEEP);
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    if let Some(out) = stdout {
+        let mut p = Progress::default();
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            apply_progress_line(&line, &mut p);
+            if line.starts_with("progress=") {
+                p.fraction = fraction(p.out_secs, duration);
+                if !shared.cancelled.load(Ordering::SeqCst) {
+                    shared.set(JobState::Running(p));
+                }
+            }
+        }
+    }
+    // The pipes are closed: the process is ending. Poll without holding the lock.
+    let status = loop {
+        let r = match shared.child.lock() {
+            Ok(mut c) => match c.as_mut() {
+                Some(ch) => ch.try_wait(),
+                None => Ok(None),
+            },
+            Err(_) => Ok(None),
+        };
+        match r {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            Err(_) => break None,
+        }
+    };
+    if let Ok(mut c) = shared.child.lock() {
+        *c = None;
+    }
+    let err_text = err_thread.join().unwrap_or_default();
+    let outcome = if shared.cancelled.load(Ordering::SeqCst) {
+        Outcome::Cancelled
+    } else if status.is_some_and(|s| s.success()) {
+        Outcome::Ok
+    } else {
+        Outcome::Failed(short_message(&err_text))
+    };
+    (outcome, err_text)
+}
+
+fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, shared: Arc<Shared>) {
+    let part = part_path(&dest);
+    let duration = probe_duration(&ffmpeg, &src);
+    let mut without_subtitles = false;
+    let (mut outcome, err) = run_ffmpeg(&ffmpeg, &src, &part, true, duration, &shared);
+    if matches!(outcome, Outcome::Failed(_)) && should_retry_without_subs(&err, true) {
+        let _ = std::fs::remove_file(&part);
+        outcome = run_ffmpeg(&ffmpeg, &src, &part, false, duration, &shared).0;
+        without_subtitles = true;
+    }
+    let final_state = match outcome {
+        Outcome::Ok => match std::fs::rename(&part, &dest) {
+            Ok(()) => JobState::Done { dest: dest.clone(), without_subtitles },
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                JobState::Failed(format!("could not save the file: {}", e.kind()))
+            }
+        },
+        Outcome::Cancelled => {
+            let _ = std::fs::remove_file(&part);
+            JobState::Cancelled
+        }
+        Outcome::Failed(msg) => {
+            let _ = std::fs::remove_file(&part);
+            JobState::Failed(msg)
+        }
+    };
+    shared.set(final_state);
+}
+
+impl ExportJob {
+    pub fn start(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf) -> ExportJob {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(JobState::Running(Progress::default())),
+            child: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+        });
+        let (s2, d2) = (shared.clone(), dest.clone());
+        let worker = std::thread::Builder::new()
+            .name("export".into())
+            .spawn(move || work(ffmpeg, src, d2, s2))
+            .ok();
+        if worker.is_none() {
+            shared.set(JobState::Failed("could not start the export thread".to_string()));
+        }
+        ExportJob { shared, dest, worker }
+    }
+
+    /// Current state; never blocks.
+    pub fn poll(&mut self) -> JobState {
+        self.shared.state.lock().map(|s| s.clone()).unwrap_or(JobState::Cancelled)
+    }
+
+    /// Kill ffmpeg now and return at once; the worker deletes the `.part` and
+    /// the state becomes `Cancelled`.
+    pub fn cancel(&self) {
+        self.shared.kill();
+    }
+
+    /// For app exit: kill ffmpeg and delete the `.part` before returning.
+    pub fn kill_blocking(&mut self) {
+        self.shared.kill();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        let _ = std::fs::remove_file(part_path(&self.dest));
+    }
+
+    pub fn dest(&self) -> &Path {
+        &self.dest
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +621,175 @@ mod tests {
         if let Some(d) = downloads_dir() {
             assert!(d.is_absolute() && !d.as_os_str().is_empty());
         }
+    }
+
+    // ---- ExportJob ----
+
+    fn make_source(ffmpeg: &Path, out: &Path, secs: u32) {
+        let st = Command::new(ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25", "-f", "lavfi", "-i", "sine", "-t"])
+            .arg(secs.to_string())
+            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"])
+            .arg(out)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    fn wait_end(job: &mut ExportJob, secs: u64) -> JobState {
+        let t0 = std::time::Instant::now();
+        loop {
+            match job.poll() {
+                JobState::Running(_) => {
+                    assert!(t0.elapsed() < Duration::from_secs(secs), "job did not end in time");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn export_makes_an_mkv_and_keeps_the_source() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.ts");
+        make_source(&ff, &src, 3);
+        let before = std::fs::read(&src).unwrap();
+        let dest = dir.path().join("out.mkv");
+        let mut job = ExportJob::start(ff.clone(), src.clone(), dest.clone());
+        assert_eq!(job.dest(), dest.as_path());
+        match wait_end(&mut job, 30) {
+            JobState::Done { dest: d, without_subtitles } => {
+                assert_eq!(d, dest);
+                assert!(!without_subtitles);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(dest.is_file());
+        assert!(!part_path(&dest).exists());
+        assert_eq!(std::fs::read(&src).unwrap(), before);
+        let out = Command::new(rec_merge::ffprobe_for(&ff))
+            .args(["-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "csv=p=0"])
+            .arg(&dest)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(text.contains("video") && text.contains("audio"), "{text}");
+        let dur: f64 = text.lines().filter_map(|l| l.trim().parse::<f64>().ok()).next().expect(&text);
+        assert!((dur - 3.0).abs() < 0.5, "duration {dur}");
+    }
+
+    #[test]
+    fn progress_is_reported_while_running() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.ts");
+        make_source(&ff, &src, 3);
+        let mut job = ExportJob::start(ff, src, dir.path().join("p.mkv"));
+        let t0 = std::time::Instant::now();
+        let last = loop {
+            match job.poll() {
+                JobState::Running(_) => {
+                    // bytes > 0 when seen; a fast job may skip straight to Done
+                    assert!(t0.elapsed() < Duration::from_secs(30));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => break other,
+            }
+        };
+        assert!(matches!(last, JobState::Done { .. }), "{last:?}");
+    }
+
+    #[test]
+    fn failure_leaves_no_part_and_keeps_an_existing_mkv() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("bad.ts");
+        std::fs::write(&src, "this is not a video\n").unwrap();
+        let dest = dir.path().join("out.mkv");
+        std::fs::write(&dest, "OLD").unwrap();
+        let mut job = ExportJob::start(ff, src, dest.clone());
+        match wait_end(&mut job, 30) {
+            JobState::Failed(msg) => assert!(!msg.is_empty() && msg.chars().count() <= 200),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!part_path(&dest).exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "OLD");
+    }
+
+    #[test]
+    fn cancel_removes_the_part_and_never_creates_the_mkv() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.ts");
+        make_source(&ff, &src, 60);
+        let dest = dir.path().join("out.mkv");
+        let mut job = ExportJob::start(ff.clone(), src.clone(), dest.clone());
+        std::thread::sleep(Duration::from_millis(150));
+        let t = std::time::Instant::now();
+        job.cancel();
+        assert!(t.elapsed() < Duration::from_millis(500), "cancel must not block");
+        assert_eq!(wait_end(&mut job, 10), JobState::Cancelled);
+        assert!(!dest.exists() && !part_path(&dest).exists());
+        // a pre-existing destination stays untouched
+        let dest2 = dir.path().join("old.mkv");
+        std::fs::write(&dest2, "OLD").unwrap();
+        let mut job = ExportJob::start(ff, src, dest2.clone());
+        job.cancel();
+        assert_eq!(wait_end(&mut job, 10), JobState::Cancelled);
+        assert!(!part_path(&dest2).exists());
+        assert_eq!(std::fs::read_to_string(&dest2).unwrap(), "OLD");
+    }
+
+    #[test]
+    fn kill_blocking_removes_the_part_quickly() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.ts");
+        make_source(&ff, &src, 60);
+        let dest = dir.path().join("out.mkv");
+        let mut job = ExportJob::start(ff, src, dest.clone());
+        std::thread::sleep(Duration::from_millis(200));
+        let t = std::time::Instant::now();
+        job.kill_blocking();
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!dest.exists() && !part_path(&dest).exists());
+    }
+
+    #[test]
+    fn retries_without_subtitles_when_they_cannot_be_copied() {
+        assert!(should_retry_without_subs("Subtitle codec 94213 is not supported", true));
+        assert!(should_retry_without_subs("Could not write header: codec not currently supported in container", true));
+        assert!(!should_retry_without_subs("Subtitle codec 94213 is not supported", false));
+        assert!(!should_retry_without_subs("Invalid data found when processing input", true));
+        assert!(!should_retry_without_subs("", true));
+    }
+
+    #[test]
+    fn short_message_is_short_and_one_line() {
+        assert_eq!(short_message(""), "ffmpeg failed");
+        let long = "x".repeat(500);
+        assert_eq!(short_message(&format!("a\n{long}\n")).chars().count(), 200);
+        assert_eq!(short_message("a\n\nb\nc\n"), "b / c");
+    }
+
+    #[test]
+    fn sweep_parts_removes_only_mkv_part_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.mkv.part", "b.mkv", "c.ts", "d.part", "e.mkv.part.txt"] {
+            std::fs::write(dir.path().join(n), "x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("sub.mkv.part")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("f.mkv.part"), "x").unwrap();
+        sweep_parts(dir.path());
+        assert!(!dir.path().join("a.mkv.part").exists());
+        for n in ["b.mkv", "c.ts", "d.part", "e.mkv.part.txt"] {
+            assert!(dir.path().join(n).exists(), "{n}");
+        }
+        assert!(dir.path().join("sub.mkv.part").is_dir());
+        assert!(dir.path().join("sub").join("f.mkv.part").exists());
     }
 }
