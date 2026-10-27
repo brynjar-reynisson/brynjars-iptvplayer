@@ -16,6 +16,7 @@ pub mod sched_form;
 pub mod seek;
 pub mod skip_intro;
 pub mod epg;
+pub mod export;
 pub mod titles;
 pub mod vod;
 pub mod zap;
