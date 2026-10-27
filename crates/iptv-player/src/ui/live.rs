@@ -21,6 +21,8 @@ pub enum RowAction {
     DoubleClick(usize),
     /// The delete "x" at the end of a row (Recordings).
     Delete(usize),
+    /// The "Export" cell left of the delete "x" (Recordings).
+    Export(usize),
 }
 
 /// Scroll position of one list, remembered between frames so the keyboard
@@ -159,6 +161,7 @@ pub fn recordings(
     scroll_to: Option<usize>,
 ) -> Option<RowAction> {
     let mut delete = None;
+    let mut export = None;
     let a = list(ui, "recordings", rows.len(), view, scroll_to, |ui, i| {
         let r = &rows[i];
         let len = r.length().map_or(String::new(), |d| format!("   {}", super::clock(d.as_secs_f64())));
@@ -186,13 +189,28 @@ pub fn recordings(
         if over && resp.clicked() {
             delete = Some(i);
         }
+        // "Export" (plain text) just left of the x.
+        let ecell = egui::Rect::from_min_max(
+            egui::pos2(cell.left() - 54.0, resp.rect.top()),
+            egui::pos2(cell.left(), resp.rect.bottom()),
+        );
+        let eover = ui.rect_contains_pointer(ecell);
+        if ui.is_rect_visible(resp.rect) {
+            let color = if eover { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+            ui.painter().text(ecell.center(), egui::Align2::CENTER_CENTER, "Export", egui::FontId::proportional(13.0), color);
+        }
+        if eover && resp.clicked() {
+            export = Some(i);
+        }
         if over {
             resp.on_hover_text("Delete this recording")
+        } else if eover {
+            resp.on_hover_text("Export as MKV")
         } else {
             resp
         }
     });
-    delete.map(RowAction::Delete).or(a)
+    delete.map(RowAction::Delete).or(export.map(RowAction::Export)).or(a)
 }
 
 /// Country list (left panel); the selected country is followed by its
@@ -221,7 +239,7 @@ pub fn countries(
         row(ui, RowLook { text: &label, selected: is_selected, playing: false, star: false, greyed: false })
     });
     a.map(|a| match a {
-        RowAction::Click(r) | RowAction::DoubleClick(r) | RowAction::Delete(r) => at(r),
+        RowAction::Click(r) | RowAction::DoubleClick(r) | RowAction::Delete(r) | RowAction::Export(r) => at(r),
     })
 }
 

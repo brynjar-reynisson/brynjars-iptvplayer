@@ -9,6 +9,7 @@
 //! there (no zap), click/Enter play at once, as VOD.
 
 pub mod epg;
+pub mod export;
 pub mod fonts;
 pub mod help;
 pub mod live;
@@ -57,6 +58,7 @@ use iptv::intros::Intros;
 use crate::state::epg::EpgLoader;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::recs::RecList;
+use crate::state::export::{ExportDialog, Exports, Submit};
 use crate::state::sched_form::SchedForm;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -331,6 +333,13 @@ struct App {
     recs_view: ListView,
     recs_reloaded: Instant,
     rec_mode: RecMode,
+    /// Export as MKV: the dialog, its error line, the running job, the file
+    /// name shown in the progress line and the ffmpeg lookup (cached).
+    export_dialog: Option<ExportDialog>,
+    export_error: Option<String>,
+    exports: Exports,
+    export_name: String,
+    ffmpeg: Option<Option<PathBuf>>,
     /// Id of the schedule the app itself records (it holds the provider
     /// connection, so the headless recorder stands by; see `iptv::handoff`).
     rec_sched: Option<String>,
@@ -516,6 +525,11 @@ impl App {
             recs: RecList::default(),
             recs_view: ListView::default(),
             recs_reloaded: Instant::now(),
+            export_dialog: None,
+            export_error: None,
+            exports: Exports::default(),
+            export_name: String::new(),
+            ffmpeg: None,
             rec_mode: RecMode::Files,
             rec_sched: None,
             rec_sched_beat: Instant::now(),
@@ -1073,6 +1087,84 @@ impl App {
         });
         if close {
             self.notice = None;
+        }
+    }
+
+    // ---- export as MKV -----------------------------------------------------
+
+    /// The Export cell of Recordings row `i`.
+    fn open_export(&mut self, i: usize) {
+        self.recs.set_cursor(i);
+        let Some(rec) = self.recs.current().cloned() else { return };
+        if self.exports.busy() {
+            self.message = Some("An export is already running".to_string());
+            return;
+        }
+        if self.ffmpeg.get_or_insert_with(rec_merge::find_ffmpeg).is_none() {
+            self.message = Some("Export needs ffmpeg: put ffmpeg.exe beside iptv-player.exe or on the PATH".to_string());
+            return;
+        }
+        self.export_error = None;
+        self.export_dialog = Some(ExportDialog::new(rec, self.settings.export_dir()));
+    }
+
+    /// Draw the dialog and act on it; the success toast too.
+    fn export_ui(&mut self, ctx: &egui::Context) {
+        use export::DialogAction as A;
+        if let Some(d) = &mut self.export_dialog {
+            let a = export::dialog(ctx, d, self.export_error.as_deref());
+            let mut start = None;
+            let mut close = false;
+            match a {
+                A::None => {}
+                A::Edited => self.export_error = None,
+                A::Cancel => close = true,
+                A::Replace => start = d.confirm_replace(),
+                A::Export => {
+                    let rec = d.rec();
+                    let being_recorded = self.recorder.as_ref().and_then(|r| r.current()) == Some(rec.path.as_path());
+                    let free = d.folder().and_then(recordings::free_bytes);
+                    match d.submit(SystemTime::now(), being_recorded, free) {
+                        Submit::Invalid(m) => self.export_error = Some(safe_text(&m)),
+                        Submit::AskReplace(_) => self.export_error = None,
+                        Submit::Start(req) => start = Some(req),
+                    }
+                }
+            }
+            if let Some(req) = start {
+                self.settings.set_export_dir(&req.folder.to_string_lossy());
+                if let Err(e) = self.settings.save() {
+                    self.message = Some(safe_text(&format!("Could not save settings: {e:#}")));
+                }
+                iptv::export::sweep_parts(&req.folder);
+                if let Some(Some(ff)) = self.ffmpeg.clone() {
+                    self.export_name = req.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.exports.start(ff, req);
+                }
+                close = true;
+            }
+            if close {
+                self.export_dialog = None;
+                self.export_error = None;
+            }
+        }
+        if let Some(msg) = self.exports.poll(Instant::now()) {
+            // Success shows the toast instead of the status line.
+            if !self.exports.toast.as_ref().is_some_and(|t| t.text == msg) {
+                self.message = Some(safe_text(&msg));
+            }
+        }
+        let now = Instant::now();
+        match self.exports.toast.as_ref().map(|t| (t.visible(now), t.text.clone())) {
+            Some((true, text)) => {
+                export::toast(ctx, &text);
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Some((false, _)) => self.exports.toast = None,
+            None => {}
+        }
+        if self.exports.busy() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -2293,6 +2385,10 @@ impl App {
         if self.url_prompt.is_some() {
             return;
         }
+        // The export dialog is modal: it reads its own Enter/Esc.
+        if self.export_dialog.is_some() {
+            return;
+        }
         // The "channel changed" popup is modal too: Enter, Esc or Space close it.
         if self.notice.is_some() {
             let close = ctx.input_mut(|i| {
@@ -3453,6 +3549,12 @@ impl App {
                             ui.weak(format!("{} recordings{free}", self.recs.items().len()));
                         }
                     });
+                    if self.exports.busy() {
+                        let p = self.exports.progress();
+                        if export::progress_line(ui, &self.export_name, p) {
+                            self.exports.cancel();
+                        }
+                    }
                     if self.recs.items().is_empty() {
                         ui.weak("No recordings yet: press R (or the red button) while a live channel plays.");
                     }
@@ -3480,6 +3582,9 @@ impl App {
                     if let Some(RowAction::Delete(i)) = a {
                         self.recs.set_cursor(i);
                         self.recs.ask_delete();
+                    }
+                    if let Some(RowAction::Export(i)) = a {
+                        self.open_export(i);
                     }
                     if ask {
                         self.recs.ask_delete();
@@ -3676,6 +3781,7 @@ impl eframe::App for App {
         }
         self.url_prompt_ui(&ctx);
         self.notice_ui(&ctx);
+        self.export_ui(&ctx);
 
         let spent = frame_start.elapsed();
         if spent > SLOW_FRAME {
@@ -3711,6 +3817,7 @@ impl eframe::App for App {
             std::thread::sleep(Duration::from_secs(3));
             hard_exit();
         });
+        self.exports.kill_blocking();
         self.stop_record(None);
         self.release_pre_claim();
         self.save_position();
