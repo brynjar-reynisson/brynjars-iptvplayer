@@ -89,6 +89,8 @@ pub struct ExportRequest {
     pub src: PathBuf,
     pub dest: PathBuf,
     pub folder: PathBuf,
+    /// The recording's estimated length (for trusting the probed duration).
+    pub length_hint: Option<Duration>,
 }
 
 /// Result of pressing Export in the dialog.
@@ -157,14 +159,20 @@ impl ExportDialog {
             Ok(f) => f,
             Err(m) => return Submit::Invalid(m),
         };
-        if let Err(m) = export::check_source(self.rec.modified, now, being_recorded) {
+        // The list is a snapshot (and directory listings lag for a file another
+        // process holds open): look at the file itself now.
+        let (modified, size) = match std::fs::metadata(&self.rec.path) {
+            Ok(m) => (m.modified().unwrap_or(self.rec.modified), m.len()),
+            Err(_) => return Submit::Invalid("The recording is gone: it was moved or deleted.".to_string()),
+        };
+        if let Err(m) = export::check_source(modified, now, being_recorded) {
             return Submit::Invalid(m);
         }
-        if let Err(m) = export::check_space(self.rec.size, free) {
+        if let Err(m) = export::check_space(size, free) {
             return Submit::Invalid(m);
         }
         let dest = export::dest_path(&folder, &file);
-        let req = ExportRequest { src: self.rec.path.clone(), dest, folder };
+        let req = ExportRequest { src: self.rec.path.clone(), dest, folder, length_hint: self.rec.length() };
         if req.dest.exists() {
             self.replace_question = Some(req.clone());
             Submit::AskReplace(req)
@@ -221,7 +229,7 @@ impl Exports {
     /// Start `req` with `ffmpeg`; ignored while another export runs.
     pub fn start(&mut self, ffmpeg: PathBuf, req: ExportRequest) {
         if self.job.is_none() {
-            self.job = Some(ExportJob::start(ffmpeg, req.src, req.dest));
+            self.job = Some(ExportJob::start_with_hint(ffmpeg, req.src, req.dest, req.length_hint));
         }
     }
 
@@ -284,6 +292,12 @@ mod tests {
         }
     }
 
+    /// Make the file look `secs` old (submit re-reads the real metadata).
+    fn age(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+    }
+
     fn dialog(dir: &Path, title: &str) -> ExportDialog {
         ExportDialog::new(rec_at(Path::new("src.ts"), title, 3600), Some(dir.to_str().unwrap()))
     }
@@ -342,6 +356,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src.ts");
         std::fs::write(&src, b"x").unwrap();
+        age(&src, 3600);
         let out = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
         let mut d = ExportDialog::new(rec_at(&src, "Show", 3600), Some(out.path().to_str().unwrap()));
@@ -350,8 +365,6 @@ mod tests {
             Submit::Invalid(m) => assert!(m.contains("still being recorded"), "{m}"),
             _ => panic!("expected Invalid"),
         }
-        let mut recent = ExportDialog::new(rec_at(&src, "Show", 1), Some(out.path().to_str().unwrap()));
-        assert!(matches!(recent.submit(now, false, Some(100 * GIB)), Submit::Invalid(_)));
         assert!(matches!(d.submit(now, false, None), Submit::Invalid(_)));
         d.name = String::new();
         assert!(matches!(d.submit(now, false, Some(100 * GIB)), Submit::Invalid(_)));
@@ -375,6 +388,35 @@ mod tests {
         assert_eq!(again.dest, req.dest);
         assert!(d.replace_question.is_none());
         assert!(d.confirm_replace().is_none());
+    }
+
+    #[test]
+    fn submit_uses_the_files_real_state_not_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.ts");
+        std::fs::write(&src, b"x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let remembered = Some(out.path().to_str().unwrap());
+        let now = SystemTime::now();
+        // snapshot says old (and tiny), the file was touched just now
+        let mut d = ExportDialog::new(rec_at(&src, "Show", 3600), remembered);
+        match d.submit(now, false, Some(100 * GIB)) {
+            Submit::Invalid(m) => assert!(m.contains("a moment ago"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        // now it is old, but has grown since the snapshot: the space check uses the real size
+        age(&src, 3600);
+        std::fs::write(&src, vec![0u8; 5000]).unwrap();
+        age(&src, 3600);
+        let mut d = ExportDialog::new(rec_at(&src, "Show", 3600), remembered);
+        assert!(matches!(d.submit(now, false, Some(GIB + 4999)), Submit::Invalid(_)));
+        assert!(matches!(d.submit(now, false, Some(GIB + 5000)), Submit::Start(_)));
+        // deleted
+        std::fs::remove_file(&src).unwrap();
+        match d.submit(now, false, Some(100 * GIB)) {
+            Submit::Invalid(m) => assert!(m.contains("gone"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
@@ -440,7 +482,7 @@ mod tests {
         let dest = tmp.path().join("out.mkv");
         let mut ex = Exports::default();
         assert!(!ex.busy());
-        ex.start(ffmpeg, ExportRequest { src, dest: dest.clone(), folder: tmp.path().to_path_buf() });
+        ex.start(ffmpeg, ExportRequest { src, dest: dest.clone(), folder: tmp.path().to_path_buf(), length_hint: None });
         assert!(ex.busy());
         let t0 = Instant::now();
         let msg = loop {
@@ -464,7 +506,7 @@ mod tests {
         let mut ex = Exports::default();
         ex.start(
             tmp.path().join("no-such-ffmpeg.exe"),
-            ExportRequest { src: tmp.path().join("a.ts"), dest: tmp.path().join("a.mkv"), folder: tmp.path().to_path_buf() },
+            ExportRequest { src: tmp.path().join("a.ts"), dest: tmp.path().join("a.mkv"), folder: tmp.path().to_path_buf(), length_hint: None },
         );
         let t0 = Instant::now();
         let msg = loop {

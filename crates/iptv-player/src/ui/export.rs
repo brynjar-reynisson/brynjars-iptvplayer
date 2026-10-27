@@ -31,8 +31,14 @@ fn name_id() -> egui::Id {
 /// The modal dialog. It reads Enter/Esc itself (the app's `handle_keys`
 /// returns early while it is open).
 pub fn dialog(ctx: &egui::Context, d: &mut ExportDialog, error: Option<&str>) -> DialogAction {
+    // Enter is the dialog's shortcut only while the text box (or nothing) has
+    // focus; a Tab-focused button or list row handles its own Enter.
+    let shortcut = ctx.memory(|m| m.focused()).is_none_or(|id| id == name_id());
     let (enter, esc) = ctx.input_mut(|i| {
-        (i.consume_key(egui::Modifiers::NONE, egui::Key::Enter), i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        (
+            shortcut && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+        )
     });
     let mut action = DialogAction::None;
     // Three states of one window: replace question, folder picker, form.
@@ -100,6 +106,8 @@ pub fn dialog(ctx: &egui::Context, d: &mut ExportDialog, error: Option<&str>) ->
         if use_it && can_use {
             d.use_picked();
             d.replace_question = None;
+            // a stale error (e.g. not enough free space) belonged to the old folder
+            action = DialogAction::Edited;
         } else if back {
             d.close_picker();
         }

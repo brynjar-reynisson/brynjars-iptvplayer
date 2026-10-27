@@ -81,10 +81,15 @@ pub fn dest_path(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(file_name)
 }
 
-/// The temporary file written during the export: `<dest>.part`.
+/// Suffix of our temporary file. Deliberately not plain `.mkv.part`, which
+/// browsers and download managers use for their own resumable downloads in
+/// the same (Downloads) folder.
+pub const PART_SUFFIX: &str = ".iptv-export.part";
+
+/// The temporary file written during the export: `<dest>.iptv-export.part`.
 pub fn part_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_os_string();
-    s.push(".part");
+    s.push(PART_SUFFIX);
     PathBuf::from(s)
 }
 
@@ -165,12 +170,22 @@ pub fn apply_progress_line(line: &str, p: &mut Progress) {
     }
 }
 
-/// Fraction done, only when the duration is known, positive and plausible
-/// (<= `MAX_TRUSTED_SECS`: raw recordings can carry bogus durations) and the
-/// output has not run past it.
+/// Slack added to the recording's estimated length when trusting a duration.
+pub const TRUST_SLACK_SECS: f64 = 12.0 * 3600.0;
+
+/// Is a probed duration plausible? Raw recordings can carry bogus durations
+/// (provider clock): with a length hint (the list's estimate) at most
+/// `hint + TRUST_SLACK_SECS`, without one at most `MAX_TRUSTED_SECS`.
+pub fn trusted_duration(d: f64, hint: Option<Duration>) -> bool {
+    let cap = hint.map_or(MAX_TRUSTED_SECS, |h| h.as_secs_f64() + TRUST_SLACK_SECS);
+    d.is_finite() && d > 0.0 && d <= cap
+}
+
+/// Fraction done, only when the (already trusted) duration is known and
+/// positive and the output has not run past it.
 pub fn fraction(out_secs: f64, duration: Option<f64>) -> Option<f32> {
     let d = duration?;
-    if !(d > 0.0) || d > MAX_TRUSTED_SECS || out_secs > d {
+    if !(d > 0.0) || out_secs > d {
         return None;
     }
     Some((out_secs / d) as f32)
@@ -332,12 +347,13 @@ pub fn should_retry_without_subs(stderr: &str, with_subs: bool) -> bool {
     })
 }
 
-/// Delete `*.mkv.part` files directly in `dir` (leftovers of a crashed export).
+/// Delete `*.mkv.iptv-export.part` files directly in `dir` (leftovers of a
+/// crashed export). Other `.part` files (browser downloads) are never touched.
 pub fn sweep_parts(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_lowercase();
-        if name.ends_with(".mkv.part") && e.path().is_file() {
+        if name.ends_with(".mkv.iptv-export.part") && e.path().is_file() {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -488,9 +504,9 @@ fn run_ffmpeg(
     (outcome, err_text)
 }
 
-fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, shared: Arc<Shared>) {
+fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, hint: Option<Duration>, shared: Arc<Shared>) {
     let part = part_path(&dest);
-    let duration = probe_duration(&ffmpeg, &src, &shared);
+    let duration = probe_duration(&ffmpeg, &src, &shared).filter(|d| trusted_duration(*d, hint));
     let mut without_subtitles = false;
     let (mut outcome, err) = run_ffmpeg(&ffmpeg, &src, &part, true, duration, &shared);
     if matches!(outcome, Outcome::Failed(_)) && should_retry_without_subs(&err, true) {
@@ -520,6 +536,12 @@ fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, shared: Arc<Shared>) {
 
 impl ExportJob {
     pub fn start(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf) -> ExportJob {
+        ExportJob::start_with_hint(ffmpeg, src, dest, None)
+    }
+
+    /// Like `start`; `length_hint` = the recording's estimated length, used to
+    /// decide whether the probed duration can be trusted for the percentage.
+    pub fn start_with_hint(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, length_hint: Option<Duration>) -> ExportJob {
         let shared = Arc::new(Shared {
             state: Mutex::new(JobState::Running(Progress::default())),
             child: Mutex::new(None),
@@ -528,7 +550,7 @@ impl ExportJob {
         let (s2, d2) = (shared.clone(), dest.clone());
         let worker = std::thread::Builder::new()
             .name("export".into())
-            .spawn(move || work(ffmpeg, src, d2, s2))
+            .spawn(move || work(ffmpeg, src, d2, length_hint, s2))
             .ok();
         if worker.is_none() {
             shared.set(JobState::Failed("could not start the export thread".to_string()));
@@ -600,7 +622,7 @@ mod tests {
     #[test]
     fn default_and_part() {
         assert_eq!(default_file_name("News One - 2026-10-25 18-30"), "News One - 2026-10-25 18-30.mkv");
-        assert!(part_path(Path::new("D:/x/a.mkv")).to_string_lossy().ends_with("a.mkv.part"));
+        assert!(part_path(Path::new("D:/x/a.mkv")).to_string_lossy().ends_with("a.mkv.iptv-export.part"));
         assert_eq!(dest_path(Path::new("D:/x"), "a.mkv"), Path::new("D:/x").join("a.mkv"));
     }
 
@@ -623,7 +645,7 @@ mod tests {
 
     #[test]
     fn args() {
-        let a: Vec<String> = ffmpeg_args(Path::new("in.ts"), Path::new("out.mkv.part"), true)
+        let a: Vec<String> = ffmpeg_args(Path::new("in.ts"), Path::new("out.mkv.iptv-export.part"), true)
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
@@ -639,7 +661,7 @@ mod tests {
         for w in ["-nostdin", "-y", "-nostats"] {
             assert!(a.iter().any(|x| x == w), "{w}");
         }
-        assert_eq!(a.last().unwrap(), "out.mkv.part");
+        assert_eq!(a.last().unwrap(), "out.mkv.iptv-export.part");
         let b = ffmpeg_args(Path::new("in.ts"), Path::new("o.part"), false);
         assert!(!b.iter().any(|x| x == "0:s?"));
     }
@@ -657,7 +679,13 @@ mod tests {
         assert_eq!(p, before);
         assert_eq!(fraction(30.0, Some(60.0)), Some(0.5));
         assert_eq!(fraction(70.0, Some(60.0)), None);
-        assert_eq!(fraction(1.0, Some(100_000.0)), None);
+        assert_eq!(fraction(1.0, Some(100_000.0)), Some(1e-5));
+        assert!(trusted_duration(3600.0, None));
+        assert!(!trusted_duration(100_000.0, None));
+        let hint = Some(Duration::from_secs(3600));
+        assert!(trusted_duration(3600.0 + 11.0 * 3600.0, hint));
+        assert!(!trusted_duration(3600.0 + 13.0 * 3600.0, hint));
+        assert!(!trusted_duration(0.0, hint) && !trusted_duration(f64::NAN, hint));
         assert_eq!(fraction(1.0, None), None);
         assert_eq!(fraction(1.0, Some(0.0)), None);
     }
@@ -676,14 +704,21 @@ mod tests {
     // ---- ExportJob ----
 
     fn make_source(ffmpeg: &Path, out: &Path, secs: u32) {
-        let st = Command::new(ffmpeg)
+        make_source_at(ffmpeg, out, secs, None);
+    }
+
+    /// `ts_offset` = ffmpeg `-output_ts_offset` value: the provider's clock
+    /// (about 20 h) in raw recordings.
+    fn make_source_at(ffmpeg: &Path, out: &Path, secs: u32, ts_offset: Option<&str>) {
+        let mut cmd = Command::new(ffmpeg);
+        cmd
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25", "-f", "lavfi", "-i", "sine", "-t"])
             .arg(secs.to_string())
-            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"])
-            .arg(out)
-            .stdin(Stdio::null())
-            .status()
-            .unwrap();
+            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"]);
+        if let Some(o) = ts_offset {
+            cmd.args(["-output_ts_offset", o]);
+        }
+        let st = cmd.arg(out).stdin(Stdio::null()).status().unwrap();
         assert!(st.success());
     }
 
@@ -767,7 +802,7 @@ mod tests {
         let Some(ff) = rec_merge::find_ffmpeg() else { return };
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.ts");
-        make_source(&ff, &src, 3);
+        make_source_at(&ff, &src, 3, Some("72000"));
         let before = std::fs::read(&src).unwrap();
         let dest = dir.path().join("out.mkv");
         let mut job = ExportJob::start(ff.clone(), src.clone(), dest.clone());
@@ -783,14 +818,21 @@ mod tests {
         assert!(!part_path(&dest).exists());
         assert_eq!(std::fs::read(&src).unwrap(), before);
         let out = Command::new(rec_merge::ffprobe_for(&ff))
-            .args(["-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "csv=p=0"])
+            .args(["-v", "error", "-show_entries", "stream=codec_type:format=start_time,duration", "-of", "csv=p=0"])
             .arg(&dest)
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(text.contains("video") && text.contains("audio"), "{text}");
-        let dur: f64 = text.lines().filter_map(|l| l.trim().parse::<f64>().ok()).next().expect(&text);
-        assert!((dur - 3.0).abs() < 0.5, "duration {dur}");
+        // csv of the format section: "<start_time>,<duration>"
+        let nums: Vec<f64> = text
+            .lines()
+            .flat_map(|l| l.split(','))
+            .filter_map(|v| v.trim().parse::<f64>().ok())
+            .collect();
+        assert_eq!(nums.len(), 2, "{text}");
+        assert!(nums[0].abs() < 1.0, "start_time {} (offset clock not normalised)", nums[0]);
+        assert!((nums[1] - 3.0).abs() < 0.5, "duration {}", nums[1]);
     }
 
     #[test]
@@ -910,18 +952,19 @@ mod tests {
     #[test]
     fn sweep_parts_removes_only_mkv_part_files() {
         let dir = tempfile::tempdir().unwrap();
-        for n in ["a.mkv.part", "b.mkv", "c.ts", "d.part", "e.mkv.part.txt"] {
+        for n in ["a.mkv.iptv-export.part", "b.mkv", "c.ts", "d.part", "e.mkv.iptv-export.part.txt", "foo.mkv.part"] {
             std::fs::write(dir.path().join(n), "x").unwrap();
         }
-        std::fs::create_dir(dir.path().join("sub.mkv.part")).unwrap();
+        std::fs::create_dir(dir.path().join("sub.mkv.iptv-export.part")).unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub").join("f.mkv.part"), "x").unwrap();
+        std::fs::write(dir.path().join("sub").join("f.mkv.iptv-export.part"), "x").unwrap();
         sweep_parts(dir.path());
-        assert!(!dir.path().join("a.mkv.part").exists());
-        for n in ["b.mkv", "c.ts", "d.part", "e.mkv.part.txt"] {
+        assert!(!dir.path().join("a.mkv.iptv-export.part").exists());
+        // a browser's resumable download is never ours
+        for n in ["b.mkv", "c.ts", "d.part", "e.mkv.iptv-export.part.txt", "foo.mkv.part"] {
             assert!(dir.path().join(n).exists(), "{n}");
         }
-        assert!(dir.path().join("sub.mkv.part").is_dir());
-        assert!(dir.path().join("sub").join("f.mkv.part").exists());
+        assert!(dir.path().join("sub.mkv.iptv-export.part").is_dir());
+        assert!(dir.path().join("sub").join("f.mkv.iptv-export.part").exists());
     }
 }

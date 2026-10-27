@@ -339,7 +339,7 @@ struct App {
     export_error: Option<String>,
     exports: Exports,
     export_name: String,
-    ffmpeg: Option<Option<PathBuf>>,
+    ffmpeg: Option<PathBuf>,
     /// Id of the schedule the app itself records (it holds the provider
     /// connection, so the headless recorder stands by; see `iptv::handoff`).
     rec_sched: Option<String>,
@@ -468,6 +468,10 @@ impl App {
         }
         let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
+        // Leftovers of an export that was killed: best effort, off the UI thread.
+        if let Some(dir) = settings.export_dir().map(PathBuf::from).filter(|d| d.is_dir()) {
+            std::thread::spawn(move || iptv::export::sweep_parts(&dir));
+        }
         let hidden: Hidden = Arc::new(settings.hidden_groups.iter().cloned().collect());
         let user_agent_for_previews = user_agent.clone();
         let wake = cc.egui_ctx.clone();
@@ -1100,7 +1104,11 @@ impl App {
             self.message = Some("An export is already running".to_string());
             return;
         }
-        if self.ffmpeg.get_or_insert_with(rec_merge::find_ffmpeg).is_none() {
+        // Only a found path is cached, so installing ffmpeg works without a restart.
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = rec_merge::find_ffmpeg();
+        }
+        if self.ffmpeg.is_none() {
             self.message = Some("Export needs ffmpeg: put ffmpeg.exe beside iptv-player.exe or on the PATH".to_string());
             return;
         }
@@ -1137,7 +1145,7 @@ impl App {
                     self.message = Some(safe_text(&format!("Could not save settings: {e:#}")));
                 }
                 iptv::export::sweep_parts(&req.folder);
-                if let Some(Some(ff)) = self.ffmpeg.clone() {
+                if let Some(ff) = self.ffmpeg.clone() {
                     self.export_name = req.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     self.exports.start(ff, req);
                 }
