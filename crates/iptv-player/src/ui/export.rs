@@ -62,57 +62,10 @@ pub fn dialog(ctx: &egui::Context, d: &mut ExportDialog, error: Option<&str>) ->
         return action;
     }
     if d.picker.is_some() {
-        let mut up = false;
-        let mut entered = None;
-        let mut use_it = enter;
-        let mut back = esc;
-        let mut can_use = false;
-        egui::Modal::new(egui::Id::unique("export_dialog")).show(ctx, |ui| {
-            ui.set_width(420.0_f32.min((ctx.content_rect().width() - 60.0).max(240.0)));
-            ui.heading("Choose a folder");
-            ui.add_space(6.0);
-            if let Some(p) = &d.picker {
-                can_use = p.location().is_some();
-                let here = p.location().map_or("Drives".to_string(), |l| l.display().to_string());
-                ui.label(here);
-                ui.add_space(4.0);
-                ui.add_enabled_ui(can_use, |ui| up = ui.button("Up").clicked());
-                egui::ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, name) in p.rows().iter().enumerate() {
-                        if ui.selectable_label(false, name).clicked() {
-                            entered = Some(i);
-                        }
-                    }
-                });
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(can_use, egui::Button::new("Use this folder")).on_hover_text("Enter").clicked() {
-                    use_it = true;
-                }
-                if ui.button("Back").on_hover_text("Esc").clicked() {
-                    back = true;
-                }
-            });
-        });
-        if let Some(p) = &mut d.picker {
-            if up {
-                p.up();
-            }
-            if let Some(i) = entered {
-                p.enter(i);
-            }
-        }
-        if use_it && can_use {
-            d.use_picked();
-            d.replace_question = None;
-            // a stale error (e.g. not enough free space) belonged to the old folder
-            action = DialogAction::Edited;
-        } else if back {
-            d.close_picker();
-        }
-        return action;
+        return folder_tree(ctx, d, enter, esc);
     }
+    // the tree is closed: the next one scrolls to its selection again
+    ctx.data_mut(|m| m.remove::<Option<std::path::PathBuf>>(tree_seen_id()));
     let mut change = false;
     let mut run = enter;
     let mut cancel = esc;
@@ -193,4 +146,133 @@ pub fn toast(ctx: &egui::Context, text: &str) {
                 ui.label(text);
             });
         });
+}
+
+/// Height of one tree row.
+const TREE_ROW_H: f32 = 22.0;
+/// Indent per tree level, and the width of the triangle's click area.
+const TREE_INDENT: f32 = 16.0;
+
+fn tree_seen_id() -> egui::Id {
+    egui::Id::unique("export_tree_seen")
+}
+
+/// The folder tree state of the dialog: Select / Cancel.
+fn folder_tree(ctx: &egui::Context, d: &mut ExportDialog, enter: bool, esc: bool) -> DialogAction {
+    // Keys: the tree owns the arrows while it is shown.
+    let (up, down, left, right) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+        )
+    });
+    if let Some(t) = &mut d.picker {
+        if up {
+            t.step(-1);
+        }
+        if down {
+            t.step(1);
+        }
+        if left {
+            t.left();
+        }
+        if right {
+            t.right();
+        }
+    }
+    let mut select_it = enter;
+    let mut cancel = esc;
+    let mut clicked: Option<(usize, bool)> = None;
+    let mut can_select = false;
+    let seen = ctx.data(|m| m.get_temp::<Option<std::path::PathBuf>>(tree_seen_id()));
+    let now_sel = d.picker.as_ref().and_then(|t| t.selected().map(|p| p.to_path_buf()));
+    let scroll_to = seen.as_ref() != Some(&now_sel);
+    egui::Modal::new(egui::Id::unique("export_dialog")).show(ctx, |ui| {
+        ui.set_width(420.0_f32.min((ctx.content_rect().width() - 60.0).max(240.0)));
+        ui.heading("Choose a folder");
+        ui.add_space(6.0);
+        if let Some(t) = &d.picker {
+            can_select = t.selected().is_some();
+            let line = t.selected().map_or("Click a folder to select it".to_string(), |p| p.display().to_string());
+            ui.label(line);
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let sel = t.selected_row();
+                for (i, row) in t.rows().iter().enumerate() {
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width(), TREE_ROW_H), egui::Sense::click());
+                    if scroll_to && sel == Some(i) {
+                        ui.scroll_to_rect(rect, None);
+                    }
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let v = ui.visuals();
+                    let selected = sel == Some(i);
+                    if selected {
+                        ui.painter().rect_filled(rect, 2.0, v.selection.bg_fill);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, 2.0, v.widgets.hovered.weak_bg_fill);
+                    }
+                    let color = if selected { v.selection.stroke.color } else { v.text_color() };
+                    let x0 = rect.left() + 4.0 + row.depth as f32 * TREE_INDENT;
+                    let c = egui::pos2(x0 + TREE_INDENT * 0.5, rect.center().y);
+                    let pts = if row.expanded {
+                        vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.5)]
+                    } else {
+                        vec![c + egui::vec2(-2.5, -4.0), c + egui::vec2(3.5, 0.0), c + egui::vec2(-2.5, 4.0)]
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+                    let text_x = x0 + TREE_INDENT + 4.0;
+                    let galley = ui.painter().layout_no_wrap(row.name.clone(), egui::FontId::proportional(14.0), color);
+                    let clip = egui::Rect::from_min_max(egui::pos2(text_x, rect.top()), rect.right_bottom())
+                        .intersect(ui.clip_rect());
+                    ui.painter().with_clip_rect(clip).galley(
+                        egui::pos2(text_x, rect.center().y - galley.size().y / 2.0),
+                        galley,
+                        color,
+                    );
+                    if resp.clicked() {
+                        let on_triangle = resp
+                            .interact_pointer_pos()
+                            .is_some_and(|p| p.x >= x0 && p.x < x0 + TREE_INDENT + 2.0);
+                        clicked = Some((i, on_triangle));
+                    }
+                }
+            });
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(can_select, egui::Button::new("Select")).on_hover_text("Enter").clicked() {
+                select_it = true;
+            }
+            if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    if let Some(t) = &mut d.picker {
+        if let Some((i, on_triangle)) = clicked {
+            if on_triangle {
+                t.toggle(i);
+            } else {
+                t.select(i);
+            }
+        }
+        let now_sel = t.selected().map(|p| p.to_path_buf());
+        ctx.data_mut(|m| m.insert_temp(tree_seen_id(), now_sel));
+    }
+    if select_it && can_select {
+        d.use_picked();
+        d.replace_question = None;
+        // a stale error (e.g. not enough free space) belonged to the old folder
+        return DialogAction::Edited;
+    }
+    if cancel {
+        d.close_picker();
+    }
+    DialogAction::None
 }
