@@ -269,6 +269,7 @@ struct App {
     cursor_moved: Instant,
     cursor_hidden: bool,
     was_fullscreen: bool,
+    was_focused: bool,
     /// Title overlay text and when it last changed (fullscreen shows it again then).
     shown_title: String,
     title_changed: Instant,
@@ -496,6 +497,7 @@ impl App {
             cursor_moved: Instant::now(),
             cursor_hidden: false,
             was_fullscreen: false,
+            was_focused: true,
             shown_title: String::new(),
             title_changed: Instant::now(),
             seek: SeekState::default(),
@@ -2047,7 +2049,12 @@ impl App {
         self.was_fullscreen = fullscreen;
         let still = self.cursor_moved.elapsed();
         let hide = cursor::hidden(fullscreen, still);
-        if hide != self.cursor_hidden {
+        // After Alt+Tab the OS keeps the other app's cursor until the mouse
+        // moves (no WM_SETCURSOR), so re-send the state when focus returns.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let refocused = focused && !self.was_focused;
+        self.was_focused = focused;
+        if hide != self.cursor_hidden || (refocused && hide) {
             self.cursor_hidden = hide;
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!hide));
         }
