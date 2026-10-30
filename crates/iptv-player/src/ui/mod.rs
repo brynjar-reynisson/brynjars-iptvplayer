@@ -3798,6 +3798,14 @@ impl eframe::App for App {
         self.notice_ui(&ctx);
         self.export_ui(&ctx);
 
+        // egui-winit calls `set_cursor_visible(true)` whenever the egui cursor
+        // icon changes or the pointer re-enters (e.g. after Alt+Tab), undoing
+        // `CursorVisible(false)`. Asking egui for no icon, last in the frame
+        // (widgets set theirs while drawing), makes it hide the cursor itself.
+        if self.cursor_hidden {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+
         let spent = frame_start.elapsed();
         if spent > SLOW_FRAME {
             eprintln!("slow frame: {} ms building the UI", spent.as_millis());
