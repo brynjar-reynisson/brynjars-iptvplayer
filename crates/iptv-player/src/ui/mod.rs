@@ -1118,6 +1118,40 @@ impl App {
         self.export_dialog = Some(ExportDialog::new(rec, self.settings.export_dir()));
     }
 
+    /// The Export button of the player: the playing movie/episode as MKV.
+    fn open_export_playing(&mut self) {
+        let Some(pb) = &self.playback else { return };
+        let playing = self.player.as_ref().is_ok_and(|p| p.status() == Status::Playing);
+        if pb.is_live() || pb.is_local() || !playing {
+            return;
+        }
+        if self.exports.busy() {
+            self.message = Some("An export is already running".to_string());
+            return;
+        }
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = rec_merge::find_ffmpeg();
+        }
+        if self.ffmpeg.is_none() {
+            self.message = Some("Export needs ffmpeg: put ffmpeg.exe beside iptv-player.exe or on the PATH".to_string());
+            return;
+        }
+        let title = pb
+            .entry_index()
+            .and_then(|e| playing_title(pb.library(), e, |show| self.titles.get(show)))
+            .unwrap_or_else(|| pb.name().to_string());
+        let length = self
+            .player
+            .as_ref()
+            .ok()
+            .and_then(|p| p.position())
+            .and_then(|(_, d)| d)
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(Duration::from_secs_f64);
+        self.export_error = None;
+        self.export_dialog = Some(ExportDialog::stream(&title, pb.url(), &self.user_agent, length, self.settings.export_dir()));
+    }
+
     /// Draw the dialog and act on it; the success toast too.
     fn export_ui(&mut self, ctx: &egui::Context) {
         use export::DialogAction as A;
@@ -1132,7 +1166,7 @@ impl App {
                 A::Replace => start = d.confirm_replace(),
                 A::Export => {
                     let rec = d.rec();
-                    let being_recorded = self.recorder.as_ref().and_then(|r| r.current()) == Some(rec.path.as_path());
+                    let being_recorded = rec.is_some_and(|r| self.recorder.as_ref().and_then(|rr| rr.current()) == Some(r.path.as_path()));
                     let free = d.folder().and_then(recordings::free_bytes);
                     match d.submit(SystemTime::now(), being_recorded, free) {
                         Submit::Invalid(m) => self.export_error = Some(safe_text(&m)),
@@ -2976,6 +3010,8 @@ impl App {
             let mut next_clicked = false;
             // Record / stop button clicked.
             let mut toggle_rec = false;
+            // Export button (movies/episodes) clicked.
+            let mut export_clicked = false;
             match (&self.player, &self.playback) {
                 (Ok(p), Some(pb)) => {
                     // Movies/episodes: a strip below the video holds the seek bar.
@@ -3013,6 +3049,29 @@ impl App {
                     }
                     p.show(ui, rect, &title, show_title);
                     self.rec_badge(ui, rect);
+                    // A running export (started from the player or the Recordings
+                    // tab) shows its progress over the video, bottom left.
+                    if self.exports.busy() {
+                        let prog = self.exports.progress();
+                        let name = self.export_name.clone();
+                        let mut cancel = false;
+                        egui::Area::new(egui::Id::unique("export_overlay"))
+                            .order(egui::Order::Foreground)
+                            .pivot(egui::Align2::LEFT_BOTTOM)
+                            .fixed_pos(rect.left_bottom() + egui::vec2(10.0, -10.0))
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_black_alpha(190))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        cancel = export::progress_line(ui, &name, prog);
+                                    });
+                            });
+                        if cancel {
+                            self.exports.cancel();
+                        }
+                    }
                     let r = ui.interact(rect, egui::Id::unique("video"), egui::Sense::click());
                     if r.double_clicked() {
                         toggle_fs = true;
@@ -3167,6 +3226,34 @@ impl App {
                             toggle_pause = true;
                         }
                     }
+                    // Export button (movies and episodes that are playing): a down
+                    // arrow onto a tray, in the slot left of "CC" (the ">>" button
+                    // moves one slot further left when it shows too).
+                    let has_next = self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some();
+                    let xbtn = btn.translate(egui::vec2(if has_next { -152.0 } else { -114.0 }, 0.0));
+                    let x_fits = xbtn.left() >= rect.left() + 4.0 && xbtn.top() >= rect.top() + 4.0;
+                    if chrome && x_fits && !pb.is_live() && !pb.is_local() && p.status() == Status::Playing {
+                        let x_resp = ui.interact(xbtn, egui::Id::unique("export_btn"), egui::Sense::click());
+                        let xa = if x_resp.hovered() { 230 } else { 140 };
+                        let xp = ui.painter_at(rect);
+                        xp.rect_filled(xbtn, 4.0, egui::Color32::from_black_alpha(xa / 2));
+                        let white = egui::Color32::from_white_alpha(xa);
+                        let c = xbtn.center();
+                        let stroke = egui::Stroke::new(2.0, white);
+                        xp.line_segment([c + egui::vec2(0.0, -8.0), c + egui::vec2(0.0, 2.0)], stroke);
+                        xp.add(egui::Shape::convex_polygon(
+                            vec![c + egui::vec2(-5.0, 0.0), c + egui::vec2(5.0, 0.0), c + egui::vec2(0.0, 6.0)],
+                            white,
+                            egui::Stroke::NONE,
+                        ));
+                        xp.add(egui::Shape::line(
+                            vec![c + egui::vec2(-7.0, 3.0), c + egui::vec2(-7.0, 9.0), c + egui::vec2(7.0, 9.0), c + egui::vec2(7.0, 3.0)],
+                            stroke,
+                        ));
+                        if x_resp.on_hover_text("Export as MKV").clicked() {
+                            export_clicked = true;
+                        }
+                    }
                     // Next episode button (">>" as two triangles), left of "CC":
                     // episodes with a next one only; hidden when it would not fit
                     // inside the video rect.
@@ -3258,6 +3345,9 @@ impl App {
             }
             if toggle_rec {
                 self.toggle_record();
+            }
+            if export_clicked {
+                self.open_export_playing();
             }
             match offer {
                 Some(true) => {

@@ -193,13 +193,27 @@ impl FolderTree {
 }
 
 /// What to export where; produced by a successful `ExportDialog::submit`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExportRequest {
+    /// A recording file, or a stream URL (credentials: never printed).
     pub src: PathBuf,
     pub dest: PathBuf,
     pub folder: PathBuf,
-    /// The recording's estimated length (for trusting the probed duration).
+    /// The recording's (or movie's) length, for trusting the probed duration.
     pub length_hint: Option<Duration>,
+    /// Sent when `src` is a stream URL.
+    pub user_agent: Option<String>,
+}
+
+impl std::fmt::Debug for ExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportRequest")
+            .field("stream", &export::is_url(&self.src))
+            .field("dest", &self.dest)
+            .field("folder", &self.folder)
+            .field("length_hint", &self.length_hint)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result of pressing Export in the dialog.
@@ -212,10 +226,16 @@ pub enum Submit {
     Start(ExportRequest),
 }
 
-/// The export dialog for one recording.
-#[derive(Debug)]
+/// What the dialog exports.
+enum Source {
+    Recording(Recording),
+    /// The playing movie/episode: its stream URL is a credential (manual Debug).
+    Stream { url: String, user_agent: String, length: Option<Duration> },
+}
+
+/// The export dialog for one recording or the playing movie.
 pub struct ExportDialog {
-    rec: Recording,
+    source: Source,
     folder: Option<PathBuf>,
     /// The file name as typed (cleaned on submit).
     pub name: String,
@@ -223,19 +243,59 @@ pub struct ExportDialog {
     pub replace_question: Option<ExportRequest>,
 }
 
+impl std::fmt::Debug for ExportDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportDialog")
+            .field("stream", &matches!(self.source, Source::Stream { .. }))
+            .field("folder", &self.folder)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExportDialog {
     /// Folder = the remembered one if it still exists, else Downloads.
     pub fn new(rec: Recording, remembered: Option<&str>) -> ExportDialog {
         let name = export::default_file_name(&rec.title);
-        ExportDialog { folder: export::default_dir(remembered), rec, name, picker: None, replace_question: None }
+        ExportDialog {
+            folder: export::default_dir(remembered),
+            source: Source::Recording(rec),
+            name,
+            picker: None,
+            replace_question: None,
+        }
+    }
+
+    /// Export the playing movie/episode `title` from its stream `url`.
+    /// `length` = the duration mpv reported (if known yet).
+    pub fn stream(title: &str, url: &str, user_agent: &str, length: Option<Duration>, remembered: Option<&str>) -> ExportDialog {
+        ExportDialog {
+            folder: export::default_dir(remembered),
+            source: Source::Stream { url: url.to_string(), user_agent: user_agent.to_string(), length },
+            name: export::default_file_name(title),
+            picker: None,
+            replace_question: None,
+        }
+    }
+
+    /// The recording being exported (none for a stream).
+    pub fn rec(&self) -> Option<&Recording> {
+        match &self.source {
+            Source::Recording(r) => Some(r),
+            Source::Stream { .. } => None,
+        }
+    }
+
+    /// Dialog heading.
+    pub fn heading(&self) -> &'static str {
+        match self.source {
+            Source::Recording(_) => "Export recording as MKV",
+            Source::Stream { .. } => "Export movie as MKV",
+        }
     }
 
     pub fn folder(&self) -> Option<&Path> {
         self.folder.as_deref()
-    }
-
-    pub fn rec(&self) -> &Recording {
-        &self.rec
     }
 
     /// Open the folder picker at the current folder.
@@ -268,20 +328,33 @@ impl ExportDialog {
             Ok(f) => f,
             Err(m) => return Submit::Invalid(m),
         };
-        // The list is a snapshot (and directory listings lag for a file another
-        // process holds open): look at the file itself now.
-        let (modified, size) = match std::fs::metadata(&self.rec.path) {
-            Ok(m) => (m.modified().unwrap_or(self.rec.modified), m.len()),
-            Err(_) => return Submit::Invalid("The recording is gone: it was moved or deleted.".to_string()),
+        let (src, length_hint, user_agent) = match &self.source {
+            Source::Recording(rec) => {
+                // The list is a snapshot (and directory listings lag for a file
+                // another process holds open): look at the file itself now.
+                let (modified, size) = match std::fs::metadata(&rec.path) {
+                    Ok(m) => (m.modified().unwrap_or(rec.modified), m.len()),
+                    Err(_) => return Submit::Invalid("The recording is gone: it was moved or deleted.".to_string()),
+                };
+                if let Err(m) = export::check_source(modified, now, being_recorded) {
+                    return Submit::Invalid(m);
+                }
+                if let Err(m) = export::check_space(size, free) {
+                    return Submit::Invalid(m);
+                }
+                (rec.path.clone(), rec.length(), None)
+            }
+            Source::Stream { url, user_agent, length } => {
+                // The size is not known yet: only the margin is checked here, the
+                // job checks the real size when the server announces it.
+                if let Err(m) = export::check_space(0, free) {
+                    return Submit::Invalid(m);
+                }
+                (PathBuf::from(url), *length, Some(user_agent.clone()))
+            }
         };
-        if let Err(m) = export::check_source(modified, now, being_recorded) {
-            return Submit::Invalid(m);
-        }
-        if let Err(m) = export::check_space(size, free) {
-            return Submit::Invalid(m);
-        }
         let dest = export::dest_path(&folder, &file);
-        let req = ExportRequest { src: self.rec.path.clone(), dest, folder, length_hint: self.rec.length() };
+        let req = ExportRequest { src, dest, folder, length_hint, user_agent };
         if req.dest.exists() {
             self.replace_question = Some(req.clone());
             Submit::AskReplace(req)
@@ -338,7 +411,7 @@ impl Exports {
     /// Start `req` with `ffmpeg`; ignored while another export runs.
     pub fn start(&mut self, ffmpeg: PathBuf, req: ExportRequest) {
         if self.job.is_none() {
-            self.job = Some(ExportJob::start_with_hint(ffmpeg, req.src, req.dest, req.length_hint));
+            self.job = Some(ExportJob::start_with_agent(ffmpeg, req.src, req.dest, req.length_hint, req.user_agent));
         }
     }
 
@@ -722,7 +795,7 @@ mod tests {
         let dest = tmp.path().join("out.mkv");
         let mut ex = Exports::default();
         assert!(!ex.busy());
-        ex.start(ffmpeg, ExportRequest { src, dest: dest.clone(), folder: tmp.path().to_path_buf(), length_hint: None });
+        ex.start(ffmpeg, ExportRequest { src, dest: dest.clone(), folder: tmp.path().to_path_buf(), length_hint: None, user_agent: None });
         assert!(ex.busy());
         let t0 = Instant::now();
         let msg = loop {
@@ -746,7 +819,7 @@ mod tests {
         let mut ex = Exports::default();
         ex.start(
             tmp.path().join("no-such-ffmpeg.exe"),
-            ExportRequest { src: tmp.path().join("a.ts"), dest: tmp.path().join("a.mkv"), folder: tmp.path().to_path_buf(), length_hint: None },
+            ExportRequest { src: tmp.path().join("a.ts"), dest: tmp.path().join("a.mkv"), folder: tmp.path().to_path_buf(), length_hint: None, user_agent: None },
         );
         let t0 = Instant::now();
         let msg = loop {
@@ -759,5 +832,28 @@ mod tests {
         assert!(msg.starts_with("Export failed: "), "{msg}");
         assert!(ex.toast.is_none());
         assert!(!ex.busy());
+    }
+
+    #[test]
+    fn stream_dialog_starts_a_stream_request_without_printing_the_url() {
+        let out = tempfile::tempdir().unwrap();
+        let url = "http://h.invalid:8080/movie/SECRETUSER/SECRETPASS/7.mkv";
+        let mut d = ExportDialog::stream("Some Movie (1999)", url, "VLC/3", Some(Duration::from_secs(5400)), Some(out.path().to_str().unwrap()));
+        assert_eq!(d.heading(), "Export movie as MKV");
+        assert!(d.rec().is_none());
+        assert!(!format!("{d:?}").contains("SECRET"));
+        // the margin is the only space check before the job knows the size
+        assert!(matches!(d.submit(SystemTime::now(), false, Some(100 * GIB)), Submit::Start(_)));
+        assert!(matches!(d.submit(SystemTime::now(), false, Some(GIB / 2)), Submit::Invalid(_)));
+        match d.submit(SystemTime::now(), false, Some(100 * GIB)) {
+            Submit::Start(r) => {
+                assert_eq!(r.src, PathBuf::from(url));
+                assert_eq!(r.user_agent.as_deref(), Some("VLC/3"));
+                assert_eq!(r.length_hint, Some(Duration::from_secs(5400)));
+                assert!(r.dest.starts_with(out.path()));
+                assert!(!format!("{r:?}").contains("SECRET"));
+            }
+            _ => panic!("expected Start"),
+        }
     }
 }

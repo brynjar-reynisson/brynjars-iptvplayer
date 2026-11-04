@@ -1,4 +1,4 @@
-//! Thin egui layer of "Export recording as MKV": the dialog (with its folder
+//! Thin egui layer of "Export as MKV" (a recording or the playing movie): the dialog (with its folder
 //! picker and replace question), the progress line and the done toast. All
 //! state lives in `crate::state::export`.
 
@@ -71,7 +71,7 @@ pub fn dialog(ctx: &egui::Context, d: &mut ExportDialog, error: Option<&str>) ->
     let mut cancel = esc;
     egui::Modal::new(egui::Id::unique("export_dialog")).show(ctx, |ui| {
         ui.set_width(420.0_f32.min((ctx.content_rect().width() - 60.0).max(240.0)));
-        ui.heading("Export recording as MKV");
+        ui.heading(d.heading());
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             let folder = d.folder().map_or("(none)".to_string(), |f| f.display().to_string());

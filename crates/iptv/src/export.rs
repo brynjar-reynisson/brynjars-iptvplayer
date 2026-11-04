@@ -125,13 +125,42 @@ pub fn check_space(source_size: u64, free: Option<u64>) -> Result<(), String> {
     Ok(())
 }
 
+/// True when `src` is an http(s) stream rather than a file.
+pub fn is_url(src: &Path) -> bool {
+    let s = src.to_string_lossy().to_ascii_lowercase();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Input options for a stream: the provider answers some clients without a
+/// User-Agent with HTTP 454, and a stalled connection should fail, not hang.
+fn stream_input_opts(src: &Path, user_agent: Option<&str>) -> Vec<OsString> {
+    let mut a: Vec<OsString> = Vec::new();
+    if is_url(src) {
+        for s in ["-rw_timeout", "20000000"] {
+            a.push(OsString::from(s));
+        }
+        if let Some(ua) = user_agent.filter(|u| !u.is_empty()) {
+            a.push(OsString::from("-user_agent"));
+            a.push(OsString::from(ua));
+        }
+    }
+    a
+}
+
 /// ffmpeg arguments (after the program name): remux without re-encoding into
 /// Matroska at `part`, progress on stdout.
 pub fn ffmpeg_args(src: &Path, part: &Path, with_subtitles: bool) -> Vec<OsString> {
+    ffmpeg_args_ua(src, part, with_subtitles, None)
+}
+
+/// `ffmpeg_args` with the User-Agent to send when `src` is a stream URL.
+pub fn ffmpeg_args_ua(src: &Path, part: &Path, with_subtitles: bool, user_agent: Option<&str>) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
-    for s in ["-nostdin", "-y", "-nostats", "-fflags", "+genpts", "-i"] {
+    for s in ["-nostdin", "-y", "-nostats", "-fflags", "+genpts"] {
         a.push(OsString::from(s));
     }
+    a.extend(stream_input_opts(src, user_agent));
+    a.push(OsString::from("-i"));
     a.push(src.as_os_str().to_os_string());
     for s in ["-map", "0:v", "-map", "0:a?"] {
         a.push(OsString::from(s));
@@ -408,27 +437,47 @@ fn wait_slot(shared: &Shared) -> Option<std::process::ExitStatus> {
     status
 }
 
+/// What ffprobe reports about the source (either may be unknown).
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct Probed {
+    duration: Option<f64>,
+    size: Option<u64>,
+}
+
+/// Read `duration=` / `size=` lines of `ffprobe -of default=nw=1`.
+fn parse_probe(text: &str) -> Probed {
+    let mut p = Probed::default();
+    for l in text.lines() {
+        if let Some(v) = l.trim().strip_prefix("duration=") {
+            p.duration = v.parse::<f64>().ok().filter(|d| d.is_finite());
+        } else if let Some(v) = l.trim().strip_prefix("size=") {
+            p.size = v.parse::<u64>().ok().filter(|n| *n > 0);
+        }
+    }
+    p
+}
+
 /// ffprobe runs in the same killable slot as ffmpeg, so a cancel interrupts it.
-fn probe_duration(ffmpeg: &Path, src: &Path, shared: &Shared) -> Option<f64> {
+fn probe(ffmpeg: &Path, src: &Path, user_agent: Option<&str>, shared: &Shared) -> Probed {
     if shared.cancelled.load(Ordering::SeqCst) {
-        return None;
+        return Probed::default();
     }
     let mut cmd = Command::new(rec_merge::ffprobe_for(ffmpeg));
-    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+    cmd.args(["-v", "error", "-show_entries", "format=duration,size", "-of", "default=nw=1"])
+        .args(stream_input_opts(src, user_agent))
         .arg(src)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = rec_merge::hide_window(&mut cmd).spawn().ok()?;
-    let mut out = child.stdout.take()?;
+    let Ok(mut child) = rec_merge::hide_window(&mut cmd).spawn() else { return Probed::default() };
+    let Some(mut out) = child.stdout.take() else { return Probed::default() };
     store_child(shared, child);
     let mut text = Vec::new();
     let _ = out.read_to_end(&mut text);
-    let status = wait_slot(shared)?;
-    if !status.success() {
-        return None;
+    match wait_slot(shared) {
+        Some(status) if status.success() => parse_probe(&String::from_utf8_lossy(&text)),
+        _ => Probed::default(),
     }
-    String::from_utf8_lossy(&text).trim().parse::<f64>().ok().filter(|d| d.is_finite())
 }
 
 fn run_ffmpeg(
@@ -436,6 +485,7 @@ fn run_ffmpeg(
     src: &Path,
     part: &Path,
     with_subs: bool,
+    user_agent: Option<&str>,
     duration: Option<f64>,
     shared: &Shared,
 ) -> (Outcome, String) {
@@ -443,7 +493,7 @@ fn run_ffmpeg(
         return (Outcome::Cancelled, String::new());
     }
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(ffmpeg_args(src, part, with_subs))
+    cmd.args(ffmpeg_args_ua(src, part, with_subs, user_agent))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -493,7 +543,7 @@ fn run_ffmpeg(
     }
     // The pipes are closed: the process is ending. Poll without holding the lock.
     let status = wait_slot(shared);
-    let err_text = err_thread.join().unwrap_or_default();
+    let err_text = scrub_source(&err_thread.join().unwrap_or_default(), src);
     let outcome = if shared.cancelled.load(Ordering::SeqCst) {
         Outcome::Cancelled
     } else if status.is_some_and(|s| s.success()) {
@@ -504,14 +554,47 @@ fn run_ffmpeg(
     (outcome, err_text)
 }
 
-fn work(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, hint: Option<Duration>, shared: Arc<Shared>) {
+/// ffmpeg prints the input it opened in its messages: a stream URL carries the
+/// account, so it is replaced by its redacted form before the text goes anywhere.
+fn scrub_source(text: &str, src: &Path) -> String {
+    if !is_url(src) {
+        return text.to_string();
+    }
+    let url = src.to_string_lossy();
+    let t = text.replace(url.as_ref(), &crate::redact::redact_url(&url));
+    // Any other URL-shaped text (a redirect target) is redacted word by word.
+    t.split_inclusive(char::is_whitespace)
+        .map(|w| if w.contains("://") { crate::redact::redact_url(w) } else { w.to_string() })
+        .collect()
+}
+
+fn work(
+    ffmpeg: PathBuf,
+    src: PathBuf,
+    dest: PathBuf,
+    hint: Option<Duration>,
+    user_agent: Option<String>,
+    shared: Arc<Shared>,
+) {
     let part = part_path(&dest);
-    let duration = probe_duration(&ffmpeg, &src, &shared).filter(|d| trusted_duration(*d, hint));
+    let ua = user_agent.as_deref();
+    let probed = probe(&ffmpeg, &src, ua, &shared);
+    let duration = probed.duration.filter(|d| trusted_duration(*d, hint));
+    // A file's size was checked when the dialog was submitted; a stream's is
+    // only known now (when the server announces it).
+    if is_url(&src) && !shared.cancelled.load(Ordering::SeqCst) {
+        if let (Some(size), Some(dir)) = (probed.size, dest.parent()) {
+            if let Err(m) = check_space(size, crate::recordings::free_bytes(dir)) {
+                shared.set(JobState::Failed(m));
+                return;
+            }
+        }
+    }
     let mut without_subtitles = false;
-    let (mut outcome, err) = run_ffmpeg(&ffmpeg, &src, &part, true, duration, &shared);
+    let (mut outcome, err) = run_ffmpeg(&ffmpeg, &src, &part, true, ua, duration, &shared);
     if matches!(outcome, Outcome::Failed(_)) && should_retry_without_subs(&err, true) {
         let _ = std::fs::remove_file(&part);
-        outcome = run_ffmpeg(&ffmpeg, &src, &part, false, duration, &shared).0;
+        outcome = run_ffmpeg(&ffmpeg, &src, &part, false, ua, duration, &shared).0;
         without_subtitles = true;
     }
     let final_state = match outcome {
@@ -542,6 +625,17 @@ impl ExportJob {
     /// Like `start`; `length_hint` = the recording's estimated length, used to
     /// decide whether the probed duration can be trusted for the percentage.
     pub fn start_with_hint(ffmpeg: PathBuf, src: PathBuf, dest: PathBuf, length_hint: Option<Duration>) -> ExportJob {
+        ExportJob::start_with_agent(ffmpeg, src, dest, length_hint, None)
+    }
+
+    /// Like `start_with_hint`; `user_agent` is sent when `src` is a stream URL.
+    pub fn start_with_agent(
+        ffmpeg: PathBuf,
+        src: PathBuf,
+        dest: PathBuf,
+        length_hint: Option<Duration>,
+        user_agent: Option<String>,
+    ) -> ExportJob {
         let shared = Arc::new(Shared {
             state: Mutex::new(JobState::Running(Progress::default())),
             child: Mutex::new(None),
@@ -550,7 +644,7 @@ impl ExportJob {
         let (s2, d2) = (shared.clone(), dest.clone());
         let worker = std::thread::Builder::new()
             .name("export".into())
-            .spawn(move || work(ffmpeg, src, d2, length_hint, s2))
+            .spawn(move || work(ffmpeg, src, d2, length_hint, user_agent, s2))
             .ok();
         if worker.is_none() {
             shared.set(JobState::Failed("could not start the export thread".to_string()));
@@ -918,6 +1012,125 @@ mod tests {
         assert!(!dest.exists() && !part_path(&dest).exists());
     }
 
+    /// Serves `data` at `/movie/SECRETUSER/SECRETPASS/1.ts` to clients that send
+    /// the User-Agent `want` (HTTP 454 otherwise, like the real provider; 404 for
+    /// any other path) and ends the response. Records every User-Agent seen.
+    struct AgentServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentServer {
+        fn start(data: Vec<u8>, want: &'static str) -> AgentServer {
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (stop2, seen2) = (stop.clone(), seen.clone());
+            std::thread::spawn(move || {
+                while !stop2.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let (data, seen3) = (data.clone(), seen2.clone());
+                            std::thread::spawn(move || {
+                                let _ = s.set_nonblocking(false);
+                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                                let mut req = [0u8; 4096];
+                                let n = s.read(&mut req).unwrap_or(0);
+                                let text = String::from_utf8_lossy(&req[..n]).into_owned();
+                                let ua = text
+                                    .lines()
+                                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v.trim().to_string()))
+                                    .unwrap_or_default();
+                                seen3.lock().unwrap().push(ua.clone());
+                                let ok_path = text.contains("GET /movie/SECRETUSER/SECRETPASS/1.ts");
+                                let head = if !ok_path {
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                                } else if !ua.starts_with(want) {
+                                    "HTTP/1.1 454 Session Does Not Exist\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                                } else {
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        data.len()
+                                    )
+                                };
+                                let _ = s.write_all(head.as_bytes());
+                                if ok_path && ua.starts_with(want) {
+                                    let _ = s.write_all(&data);
+                                }
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            });
+            AgentServer { port, stop, seen }
+        }
+
+        fn url(&self, path: &str) -> PathBuf {
+            PathBuf::from(format!("http://127.0.0.1:{}{path}", self.port))
+        }
+    }
+
+    impl Drop for AgentServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn wait_job(job: &mut ExportJob) -> JobState {
+        let t0 = std::time::Instant::now();
+        loop {
+            let st = job.poll();
+            if !matches!(st, JobState::Running(_)) {
+                return st;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(60), "job did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn stream_export_sends_the_user_agent_and_hides_the_account_on_failure() {
+        let Some(ff) = rec_merge::find_ffmpeg() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.ts");
+        make_source(&ff, &src, 3);
+        let server = AgentServer::start(std::fs::read(&src).unwrap(), "TestAgent/1");
+
+        // right agent: an MKV, every request carried the agent
+        let dest = dir.path().join("out.mkv");
+        let mut job = ExportJob::start_with_agent(
+            ff.clone(),
+            server.url("/movie/SECRETUSER/SECRETPASS/1.ts"),
+            dest.clone(),
+            None,
+            Some("TestAgent/1".to_string()),
+        );
+        let st = wait_job(&mut job);
+        assert!(matches!(st, JobState::Done { .. }), "{st:?} seen={:?}", server.seen);
+        assert!(dest.exists() && !part_path(&dest).exists());
+        assert!(server.seen.lock().unwrap().iter().all(|u| u.starts_with("TestAgent/1")), "{:?}", server.seen);
+
+        // wrong path: fails, and the message carries no account
+        let dest2 = dir.path().join("bad.mkv");
+        let mut job = ExportJob::start_with_agent(
+            ff,
+            server.url("/movie/SECRETUSER/SECRETPASS/2.ts"),
+            dest2.clone(),
+            None,
+            Some("TestAgent/1".to_string()),
+        );
+        match wait_job(&mut job) {
+            JobState::Failed(m) => assert!(!m.contains("SECRETUSER") && !m.contains("SECRETPASS"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!dest2.exists() && !part_path(&dest2).exists());
+    }
+
     #[test]
     fn retries_without_subtitles_when_they_cannot_be_copied() {
         assert!(should_retry_without_subs("Subtitle codec 94213 is not supported", true));
@@ -939,6 +1152,44 @@ mod tests {
         assert!(!should_retry_without_subs("Subtitle codec 94213 is not supported", false));
         assert!(!should_retry_without_subs("Invalid data found when processing input", true));
         assert!(!should_retry_without_subs("", true));
+    }
+
+    #[test]
+    fn stream_args_carry_user_agent_and_timeout_before_the_input() {
+        let a: Vec<String> = ffmpeg_args_ua(Path::new("http://h.invalid/u/p/1.mkv"), Path::new("o.part"), true, Some("VLC/3"))
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let i = a.iter().position(|x| x == "-i").unwrap();
+        let ua = a.iter().position(|x| x == "-user_agent").unwrap();
+        assert!(ua < i && a[ua + 1] == "VLC/3");
+        assert!(a.iter().position(|x| x == "-rw_timeout").unwrap() < i);
+        // a file gets none of it
+        let f: Vec<String> = ffmpeg_args_ua(Path::new("in.ts"), Path::new("o.part"), true, Some("VLC/3"))
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(!f.iter().any(|x| x == "-user_agent" || x == "-rw_timeout"));
+    }
+
+    #[test]
+    fn probe_output_is_parsed() {
+        let p = parse_probe("duration=5880.5\nsize=8123456789\n");
+        assert_eq!(p, Probed { duration: Some(5880.5), size: Some(8123456789) });
+        assert_eq!(parse_probe("duration=N/A\nsize=N/A\n"), Probed::default());
+        assert_eq!(parse_probe(""), Probed::default());
+    }
+
+    #[test]
+    fn scrub_source_hides_the_stream_account() {
+        let src = Path::new("http://h.invalid:8080/movie/SECRETUSER/SECRETPASS/123.mkv");
+        let t = scrub_source(
+            "Error opening input: http://h.invalid:8080/movie/SECRETUSER/SECRETPASS/123.mkv: Server returned 404",
+            src,
+        );
+        assert!(!t.contains("SECRETUSER") && !t.contains("SECRETPASS"), "{t}");
+        assert!(t.contains("Server returned 404"));
+        assert_eq!(scrub_source("plain text", Path::new("in.ts")), "plain text");
     }
 
     #[test]

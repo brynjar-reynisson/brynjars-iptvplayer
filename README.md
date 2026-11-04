@@ -166,6 +166,25 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   recording is still being written or the disk is nearly full. The video and sound are copied, not
   re-encoded, so it is fast; progress and Cancel show under the file count, and a popup tells
   when it is done. One export runs at a time. It needs `ffmpeg.exe` beside `iptv-player.exe` or on the PATH.
+- Export a movie or episode (to watch on another device): while a movie or episode is playing, the
+  **Export** button (a down arrow onto a tray) appears in the player controls, left of "CC" (and of
+  ">>" when it shows). It opens the same dialog as above (folder, file name) and copies the stream
+  into an `.mkv` with ffmpeg, without re-encoding: video, sound and any subtitle tracks the movie
+  has. It reads the movie from the provider a second time, so the provider's one-connection limit
+  applies: the playing stream may stutter or reconnect while it runs (the same as for scheduled
+  recordings). Progress and Cancel show over the video while it runs.
+  To add a subtitle file (`.srt`) the movie lacks, run ffmpeg on the exported file; nothing is
+  re-encoded. Example with an imaginary movie whose file has two subtitle tracks already (so the
+  new one is subtitle number 2; use 0 when it has none, and `ffprobe -show_streams` to count):
+
+  ```
+  ffmpeg -i "D:\Exports\Example Movie (1990).mkv" -sub_charenc UTF-8 -i "D:\Subs\Example.Movie.1990.en.srt" ^
+    -map 0 -map 1:0 -c copy -metadata:s:s:2 language=eng -metadata:s:s:2 title=English ^
+    "D:\Exports\Example Movie (1990) - English subs.mkv"
+  ```
+
+  If the lines drift from the picture (the subtitle is timed for another cut), add `-itsoffset <seconds>`
+  (negative = earlier) before the `.srt` input.
 - Scheduled recordings (e.g. a football show on Sundays 18:30-19:45): the **Schedules** button
   on the Recordings tab. The channel comes from a dropdown (the channel selected or playing in
   the Live tab, the channels of your schedules, your live favorites); for any other channel select
