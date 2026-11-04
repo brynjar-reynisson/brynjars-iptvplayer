@@ -173,8 +173,10 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   has. It reads the movie from the provider a second time, so the provider's one-connection limit
   applies: the playing stream may stutter or reconnect while it runs (the same as for scheduled
   recordings). Progress and Cancel show over the video while it runs.
-  To add a subtitle file (`.srt`) the movie lacks, run ffmpeg on the exported file; nothing is
-  re-encoded. Example with an imaginary movie whose file has two subtitle tracks already (so the
+  To add a subtitle file (`.srt`) the movie lacks, use the project skill `.claude/skills/add-subtitles`
+  in Claude Code (it counts the tracks, tags the language, can make the new track the default, measures a
+  constant timing offset against a subtitle track already in the movie, checks the result and replaces the
+  original only when you agree), or run ffmpeg yourself; nothing is re-encoded. Example with an imaginary movie whose file has two subtitle tracks already (so the
   new one is subtitle number 2; use 0 when it has none, and `ffprobe -show_streams` to count):
 
   ```
