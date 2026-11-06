@@ -25,3 +25,4 @@ pub mod intro;
 pub mod intros;
 pub mod epg;
 pub mod export;
+pub mod subsync;
