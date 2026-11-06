@@ -16,7 +16,7 @@ Known gaps and ideas that were found during implementation and review but not do
 
 ## External subtitles, manual checks still to do (2026-11-06)
 
-Built and unit-tested; the GUI, mpv and the Windows dialog could not be driven automatically, so nothing below has been seen in the running app. Setup: local ffmpeg server + `--playlist-file` scratch data dir (see AGENTS.md), an episode file with a Danish-like embedded subtitle track and an external `Example.Show.S02E06.en.srt` that is 3.0 s late.
+Built and unit-tested; the GUI, mpv and the Windows dialog could not be driven automatically, so nothing below has been seen in the running app. Setup: local ffmpeg server + `--playlist-file` scratch data dir (see AGENTS.md), an episode file with an embedded subtitle track and an external `Example.Show.S02E06.en.srt` that is 3.0 s late.
 
 - [ ] Import by file and by folder (Series open show, and Movies).
 - [ ] The CC menu lists `<Language> (imported)`; the choice is remembered per show.
