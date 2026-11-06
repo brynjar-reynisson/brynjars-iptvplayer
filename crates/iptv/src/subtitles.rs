@@ -139,6 +139,23 @@ pub fn language_name(code: &str) -> Option<&'static str> {
     })
 }
 
+/// The embedded track to time an imported file against: the first track that
+/// is not imported and not forced; one in `prefer_lang` wins.
+pub fn pick_reference(tracks: &[SubTrack], prefer_lang: Option<&str>) -> Option<i64> {
+    let same = |a: &str, b: &str| match (normalize_lang(a), normalize_lang(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    };
+    let mut embedded = tracks.iter().filter(|t| !t.forced && t.title.as_deref() != Some(IMPORTED_TITLE));
+    let first = embedded.clone().next()?;
+    if let Some(want) = prefer_lang {
+        if let Some(t) = embedded.find(|t| t.lang.as_deref().is_some_and(|l| same(l, want))) {
+            return Some(t.id);
+        }
+    }
+    Some(first.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +236,25 @@ mod tests {
             let j = serde_json::to_string(&c).unwrap();
             assert_eq!(serde_json::from_str::<SubChoice>(&j).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn pick_reference_prefers_language_then_first_embedded() {
+        let tr = [t(1, Some("is"), None, false), t(2, Some("eng"), None, false), t(3, Some("en"), None, false)];
+        assert_eq!(pick_reference(&tr, Some("en")), Some(2));
+        assert_eq!(pick_reference(&tr, Some("fr")), Some(1));
+        assert_eq!(pick_reference(&tr, None), Some(1));
+    }
+
+    #[test]
+    fn pick_reference_ignores_imported_and_forced() {
+        let tr = [
+            t(1, Some("eng"), Some(IMPORTED_TITLE), false),
+            t(2, Some("eng"), None, true),
+            t(3, Some("is"), None, false),
+        ];
+        assert_eq!(pick_reference(&tr, Some("eng")), Some(3));
+        assert_eq!(pick_reference(&tr[..2], None), None);
+        assert_eq!(pick_reference(&[], None), None);
     }
 }

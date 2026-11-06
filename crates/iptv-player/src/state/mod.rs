@@ -2,6 +2,7 @@
 //! startup/refresh). The egui layer in `ui` stays a thin view over this.
 
 pub mod autoplay;
+pub mod autosync;
 pub mod credits;
 pub mod cursor;
 pub mod data;
