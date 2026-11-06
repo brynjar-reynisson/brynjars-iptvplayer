@@ -928,6 +928,64 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Add an external subtitle file to the loaded video without selecting it
+    /// (`sub-add <path> auto Imported <lang>`). The track is dropped by the next
+    /// `load`, so it must be re-added per generation. True on success.
+    pub fn sub_add(&mut self, path: &std::path::Path, lang: &str) -> bool {
+        let args = [
+            CString::new("sub-add").unwrap(),
+            CString::new(path.to_string_lossy().replace('\0', "")).unwrap(),
+            CString::new("auto").unwrap(),
+            CString::new("Imported").unwrap(),
+            CString::new(lang.replace('\0', "")).unwrap(),
+        ];
+        let mut argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(ptr::null());
+        unsafe { sys::mpv_command(self.core.handle, argv.as_mut_ptr()) >= 0 }
+    }
+
+    /// Global subtitle delay in seconds (positive = subtitles later).
+    pub fn set_sub_delay(&mut self, secs: f64) {
+        self.set_property("sub-delay", &format!("{secs:.3}"));
+    }
+
+    /// Current `sub-delay` in seconds (0 when unreadable).
+    pub fn sub_delay(&self) -> f64 {
+        get_opt_string(self.core.handle, "sub-delay").and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    }
+
+    /// Select the secondary subtitle track (never drawn: visibility is forced
+    /// off), or `None` for off. Used to read exact line start times.
+    pub fn set_secondary_sub(&mut self, id: Option<i64>) {
+        self.set_property("secondary-sub-visibility", "no");
+        self.set_property("secondary-sid", &id.map_or_else(|| "no".to_string(), |i| i.to_string()));
+    }
+
+    /// Start time of the secondary track's line shown now (`None` between lines).
+    pub fn secondary_sub_start(&self) -> Option<f64> {
+        get_opt_string(self.core.handle, "secondary-sub-start").and_then(|v| v.parse().ok())
+    }
+
+    /// Whether this libmpv knows `secondary-sub-start` (an unavailable value is
+    /// fine; only "property not found" means false).
+    pub fn has_secondary_sub_start(&self) -> bool {
+        const NOT_FOUND: c_int = -8;
+        let name = CString::new("secondary-sub-start").unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe {
+            sys::mpv_get_property(
+                self.core.handle,
+                name.as_ptr(),
+                sys::mpv_format_MPV_FORMAT_STRING,
+                &mut out as *mut *mut c_char as *mut c_void,
+            )
+        };
+        if rc >= 0 && !out.is_null() {
+            unsafe { sys::mpv_free(out as *mut c_void) };
+        }
+        rc != NOT_FOUND
+    }
+
     /// Height in pixels of the decoded video (`None` until known).
     pub fn video_height(&self) -> Option<i64> {
         get_opt_string(self.core.handle, "height").and_then(|v| v.parse().ok()).filter(|h| *h > 0)
