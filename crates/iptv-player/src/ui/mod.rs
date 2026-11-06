@@ -57,6 +57,7 @@ use crate::state::next::{
     continue_target, neighbour_episode, next_episode, resume_for_start, shift_right, show_episodes, show_of, NextCache, ShiftRight,
 };
 use crate::state::skip_intro::{self, IntroKey, KeyGate, SkipIntro, Which};
+use crate::state::subkeys;
 use iptv::intro::INTRO_SCAN_SECS;
 use iptv::intros::Intros;
 use crate::state::epg::EpgLoader;
@@ -961,6 +962,52 @@ impl App {
         }
     }
 
+    /// Stores what the player reported about imported subtitles (auto-sync
+    /// results, nudges) and shows the notice. Called every frame before the keys
+    /// and before a new video loads (`set_imported` clears the queue).
+    fn drain_sync(&mut self) {
+        use crate::state::subkeys as sk;
+        let events = match &mut self.player {
+            Ok(p) => p.poll_sync(),
+            Err(_) => return,
+        };
+        let Some(key) = self.playback.as_ref().map(|p| p.key().to_string()) else { return };
+        for e in events {
+            match e {
+                player::SyncEvent::Applied { lang, delay } => {
+                    self.extsubs.set_delay(&key, &lang, delay, false);
+                    self.message = Some(sk::applied_notice(delay));
+                }
+                player::SyncEvent::Nudged { lang, delay } => {
+                    self.extsubs.set_delay(&key, &lang, delay, true);
+                    self.message = Some(sk::nudged_notice(delay));
+                }
+                player::SyncEvent::Unsure { .. } => self.message = Some(sk::UNSURE_NOTICE.to_string()),
+            }
+        }
+        if let Err(e) = self.extsubs.save_if_dirty() {
+            self.message = Some(safe_text(&format!("Could not save subtitles: {e:#}")));
+        }
+    }
+
+    /// The CC menu `x`: forget the imported track `lang` of the playing video.
+    fn remove_imported(&mut self, lang: &str) {
+        let Some(pb) = self.playback.as_ref() else { return };
+        let key = pb.key().to_string();
+        let stored = self.extsubs.for_key(&key).iter().find(|s| s.lang.eq_ignore_ascii_case(lang)).map(|s| s.lang.clone());
+        let Some(stored) = stored else { return };
+        self.extsubs.remove(&key, &stored);
+        if let Err(e) = self.extsubs.save_if_dirty() {
+            self.message = Some(safe_text(&format!("Could not save subtitles: {e:#}")));
+        } else {
+            let name = subtitles::language_name(&stored).unwrap_or(&stored);
+            self.message = Some(crate::state::subkeys::removed_notice(name));
+        }
+        if let Ok(p) = &mut self.player {
+            p.refresh_imported(Self::imported_tracks(&self.extsubs, pb));
+        }
+    }
+
     /// Load `pb` now (click/Enter, or a zap that became due). Cancels any
     /// pending zap.
     fn start(&mut self, pb: Playback) {
@@ -977,6 +1024,7 @@ impl App {
                 return;
             }
         }
+        self.drain_sync();
         self.zap.cancel();
         self.save_position();
         let was_recording = self.recorder.is_some();
@@ -2706,6 +2754,21 @@ impl App {
                 }
             }
         }
+        // Z / X nudge the selected imported subtitles; not consumed otherwise.
+        let imported_on = self.player.as_ref().is_ok_and(|p| p.current_imported().is_some());
+        let vod = self.playback.as_ref().is_some_and(|p| !p.is_live() && !p.is_local());
+        let (zp, xp) = ctx.input(|i| (i.key_pressed(Key::Z), i.key_pressed(Key::X)));
+        let tab_focused = self.focused_tab.is_some();
+        let help_open = self.help.is_some();
+        if let Some(step) = subkeys::nudge(typing, tab_focused, self.sub_menu, help_open, vod && imported_on, zp, xp) {
+            let key = if step < 0.0 { Key::Z } else { Key::X };
+            if ctx.input_mut(|i| i.consume_key(M::NONE, key)) {
+                if let Ok(p) = &mut self.player {
+                    p.nudge(step);
+                }
+                self.drain_sync();
+            }
+        }
         // Shift+P = the continue button (not while typing or in the subtitle menu).
         if !typing && !self.sub_menu && self.view == View::Browse && ctx.input_mut(|i| i.consume_key(M::SHIFT, Key::P)) {
             self.continue_recent();
@@ -3122,6 +3185,7 @@ impl App {
             let mut toggle_fs = false;
             let mut toggle_sub = false;
             let mut pick_sub: Option<Option<i64>> = None;
+            let mut remove_sub: Option<String> = None;
             let mut bar_job: Option<(egui::Rect, Option<(f64, Option<f64>)>)> = None;
             // "Next episode" offer clicked: Some(true) = play now, Some(false) = cancel.
             let mut offer: Option<bool> = None;
@@ -3248,11 +3312,17 @@ impl App {
                                           // instead of growing over the controls.
                                           let max_h = (sbtn.top() - rect.top() - 30.0).max(104.0);
                                           egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
-                                            let labels: Vec<(Option<i64>, String)> =
-                                                std::iter::once((None, "Off".to_string()))
-                                                    .chain(tracks.iter().map(|t| (Some(t.id), subtitles::label(t))))
+                                            // (id, label, language when it is an imported track)
+                                            let labels: Vec<(Option<i64>, String, Option<String>)> =
+                                                std::iter::once((None, "Off".to_string(), None))
+                                                    .chain(tracks.iter().map(|t| {
+                                                        let imp = (t.title.as_deref() == Some(subtitles::IMPORTED_TITLE))
+                                                            .then(|| t.lang.clone())
+                                                            .flatten();
+                                                        (Some(t.id), subtitles::label(t), imp)
+                                                    }))
                                                     .collect();
-                                            for (i, (id, text)) in labels.iter().enumerate() {
+                                            for (i, (id, text, imp)) in labels.iter().enumerate() {
                                                 let (row, resp) =
                                                     ui.allocate_exact_size(egui::vec2(210.0, 26.0), egui::Sense::click());
                                                 if resp.hovered() {
@@ -3271,6 +3341,24 @@ impl App {
                                                     egui::FontId::proportional(14.0),
                                                     egui::Color32::WHITE,
                                                 );
+                                                // Imported rows: a small x removes the track.
+                                                let mut x_hit = false;
+                                                if let Some(lang) = imp {
+                                                    let xr = egui::Rect::from_center_size(
+                                                        row.right_center() - egui::vec2(34.0, 0.0),
+                                                        egui::vec2(16.0, 16.0),
+                                                    );
+                                                    let xi = ui.interact(xr, egui::Id::unique(format!("sub_x{i}")), egui::Sense::click());
+                                                    let c = egui::Color32::from_white_alpha(if xi.hovered() { 255 } else { 140 });
+                                                    let (m, s) = (xr.center(), 3.5);
+                                                    let st = egui::Stroke::new(1.5, c);
+                                                    ui.painter().line_segment([m + egui::vec2(-s, -s), m + egui::vec2(s, s)], st);
+                                                    ui.painter().line_segment([m + egui::vec2(-s, s), m + egui::vec2(s, -s)], st);
+                                                    if xi.on_hover_text("Remove imported subtitles").clicked() {
+                                                        remove_sub = Some(lang.clone());
+                                                        x_hit = true;
+                                                    }
+                                                }
                                                 if *id == current {
                                                     // Dot: the track in use.
                                                     ui.painter().circle_filled(
@@ -3279,7 +3367,7 @@ impl App {
                                                         egui::Color32::WHITE,
                                                     );
                                                 }
-                                                if resp.clicked() {
+                                                if resp.clicked() && !x_hit {
                                                     pick_sub = Some(*id);
                                                 }
                                             }
@@ -3460,6 +3548,9 @@ impl App {
                 let choice = p.select_sub(id);
                 self.sub_menu = false;
                 self.remember_sub(choice);
+            }
+            if let Some(lang) = remove_sub {
+                self.remove_imported(&lang);
             }
             if toggle_pause {
                 self.toggle_pause();
@@ -3960,6 +4051,7 @@ impl eframe::App for App {
             self.save_position();
         }
         self.update_cursor(&ctx);
+        self.drain_sync();
         self.handle_keys(&ctx);
         self.fire_zap();
 

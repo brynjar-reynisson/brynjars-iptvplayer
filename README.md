@@ -104,7 +104,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   connection to the provider, opened when you first hover the bar; if the provider refuses
   it, the bar works without previews.
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
-  playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). For series the choice is remembered per show and matched in later
+  playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). **Z** / **X** move imported subtitles 0.1 s earlier / later. For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.
 - Next episode: during the closing credits of an episode a **Next episode in 8** button
   appears at the video's bottom right and counts down; at 0 the next episode starts (the

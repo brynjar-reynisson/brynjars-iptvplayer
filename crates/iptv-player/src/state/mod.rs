@@ -16,6 +16,7 @@ pub mod recs;
 pub mod sched_form;
 pub mod seek;
 pub mod skip_intro;
+pub mod subkeys;
 pub mod epg;
 pub mod export;
 pub mod titles;

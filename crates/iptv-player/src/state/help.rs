@@ -99,6 +99,7 @@ pub const KEYS: &[Section] = &[
             row("Left / Right", "Jump 10 seconds back / forward"),
             row("Shift+Right", "Next episode (the >> button)"),
             row("C", "Subtitle menu: Up/Down + Enter pick, Esc closes"),
+            row("Z  X", "Subtitles earlier / later by 0.1 s (imported subtitles)"),
             row(
                 "Enter",
                 "\"Skip intro\" button: skip it; \"Next episode in N\" offer: play it now (Esc keeps watching)",
@@ -171,6 +172,13 @@ mod tests {
                 assert_eq!(n, names.len(), "duplicate in {}", s.title);
             }
         }
+    }
+
+    #[test]
+    fn help_table_lists_the_new_keys() {
+        let section = KEYS.iter().find(|s| s.title == "While a movie or episode plays").unwrap();
+        let r = section.rows.iter().find(|r| r.name == "Z  X").expect("Z  X row");
+        assert!(r.what.contains("earlier / later by 0.1 s"));
     }
 
     #[test]
