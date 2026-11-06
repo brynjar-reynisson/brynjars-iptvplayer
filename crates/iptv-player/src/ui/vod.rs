@@ -196,6 +196,7 @@ pub fn episodes(
     titles: Option<&iptv::episode_titles::Titles>,
     view: &mut ListView,
     scroll_to: Option<usize>,
+    has_subs: &dyn Fn(usize) -> Option<String>,
 ) -> Option<RowAction> {
     let rows = open.rows();
     list(ui, "episodes", rows.len(), view, scroll_to, |ui, i| match rows[i] {
@@ -204,7 +205,10 @@ pub fn episodes(
             row(ui, RowLook { text: &text, selected: false, playing: false, star: false, greyed: true })
         }
         EpisodeRow::Episode(e) => {
-            let text = episode_text(lib, open.show, e, titles);
+            let mut text = episode_text(lib, open.show, e, titles);
+            if let Some(mark) = has_subs(e) {
+                text = format!("{text}  {mark}");
+            }
             row(
                 ui,
                 RowLook {

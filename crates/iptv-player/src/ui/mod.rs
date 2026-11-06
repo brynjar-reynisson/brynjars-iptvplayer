@@ -10,8 +10,10 @@
 
 pub mod epg;
 pub mod export;
+pub mod filedialog;
 pub mod fonts;
 pub mod help;
+pub mod import;
 pub mod live;
 pub mod player;
 pub mod previews;
@@ -39,6 +41,7 @@ use iptv::handoff;
 use iptv::rec_merge;
 use iptv::tasks;
 use iptv::extsubs::ExtSubs;
+use iptv::subimport::Target;
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
@@ -63,7 +66,7 @@ use crate::state::export::{ExportDialog, Exports, Submit};
 use crate::state::sched_form::SchedForm;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
-    playing_title, visible_counts, vod_groups, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
+    playing_title, visible_counts, vod_groups, EpisodeRow, Hidden, SearchList, SearchRequest, SearchWorker, SeriesBrowser, VodGroup,
 };
 use crate::state::zap::{Debounce, ZAP_DELAY};
 use crate::state::seek::{self, SeekState};
@@ -338,6 +341,8 @@ struct App {
     /// Export as MKV: the dialog, its error line, the running job, the file
     /// name shown in the progress line and the ffmpeg lookup (cached).
     export_dialog: Option<ExportDialog>,
+    /// The "Import subtitles..." dialog (modal, like the export dialog).
+    import_dialog: Option<import::ImportDialog>,
     export_error: Option<String>,
     exports: Exports,
     export_name: String,
@@ -536,6 +541,7 @@ impl App {
             recs_view: ListView::default(),
             recs_reloaded: Instant::now(),
             export_dialog: None,
+            import_dialog: None,
             export_error: None,
             exports: Exports::default(),
             export_name: String::new(),
@@ -846,6 +852,112 @@ impl App {
 
     // ---- playback ----------------------------------------------------------
 
+    /// The imported subtitle tracks stored for what `pb` plays (none for live
+    /// and local recordings).
+    fn imported_tracks(extsubs: &ExtSubs, pb: &Playback) -> Vec<ImportedTrack> {
+        if pb.is_live() || pb.is_local() {
+            return Vec::new();
+        }
+        extsubs
+            .for_key(pb.key())
+            .iter()
+            .map(|s| ImportedTrack {
+                lang: s.lang.clone(),
+                path: extsubs.path_of(s),
+                delay: s.delay,
+                manual: s.manual,
+                starts: extsubs.cue_starts_of(s),
+            })
+            .collect()
+    }
+
+    /// The mark after an episode's name: `+ eng isl` when subtitles were imported.
+    fn subs_mark(extsubs: &ExtSubs, lib: &Library, entry: usize) -> Option<String> {
+        let subs = extsubs.for_key(&favorite_key(lib.entry(entry)));
+        if subs.is_empty() {
+            return None;
+        }
+        let langs: Vec<&str> = subs.iter().map(|s| s.lang.as_str()).collect();
+        Some(format!("+ {}", langs.join(" ")))
+    }
+
+    /// (name, key) of the movie an import from the Movies tab applies to: the
+    /// selected result, else the playing movie.
+    fn import_movie_target(&self) -> Option<(String, String)> {
+        let lib = self.shown_lib.as_ref()?;
+        if let Some(e) = self.movies.list().current() {
+            let entry = lib.entry(e);
+            return Some((entry.name.clone(), favorite_key(entry)));
+        }
+        self.playback
+            .as_ref()
+            .filter(|p| !p.is_live() && !p.is_local())
+            .map(|p| (p.name().to_string(), p.key().to_string()))
+    }
+
+    /// Opens the import dialog for the open show (`series`) or the movie target.
+    fn open_import(&mut self, series: bool) {
+        let Some(lib) = self.shown_lib.clone() else { return };
+        let scope = if series {
+            let Some(open) = self.series.open() else { return };
+            let mut targets = Vec::new();
+            for r in open.rows() {
+                if let EpisodeRow::Episode(e) = r {
+                    let entry = lib.entry(*e);
+                    if let Some(er) = iptv::series::parse_episode(&entry.name) {
+                        targets.push(Target { key: favorite_key(entry), season: er.season, episode: er.episode });
+                    }
+                }
+            }
+            import::Scope::Show { name: open.name.clone(), targets }
+        } else {
+            let Some((name, key)) = self.import_movie_target() else { return };
+            import::Scope::Movie { name, key }
+        };
+        self.import_dialog = Some(import::ImportDialog::new(scope));
+    }
+
+    /// Imports `files` for the dialog's scope and moves the dialog on.
+    fn run_import(&mut self, files: Vec<PathBuf>, default_lang: Option<String>) {
+        let Some(d) = &mut self.import_dialog else { return };
+        let lang = default_lang.as_deref();
+        let mut extra = String::new();
+        let report = match &d.scope {
+            import::Scope::Show { targets, .. } => iptv::subimport::import_show(&mut self.extsubs, &files, targets, lang),
+            import::Scope::Movie { key, .. } => {
+                if files.len() > 1 {
+                    extra = " Only the first file was used.".to_string();
+                }
+                iptv::subimport::import_movie(&mut self.extsubs, key, &files[0], lang)
+            }
+        };
+        if !report.need_language.is_empty() && default_lang.is_none() {
+            d.ask_language(report.need_language.clone(), report.message.clone());
+        } else {
+            d.finish(format!("{}{extra}", report.message));
+        }
+        if let Err(e) = self.extsubs.save_if_dirty() {
+            self.message = Some(safe_text(&format!("Could not save subtitles: {e:#}")));
+        }
+        if report.imported > 0 {
+            if let (Some(pb), Ok(p)) = (self.playback.as_ref(), self.player.as_mut()) {
+                if !pb.is_live() && !pb.is_local() && !self.extsubs.for_key(pb.key()).is_empty() {
+                    p.set_imported(Self::imported_tracks(&self.extsubs, pb));
+                }
+            }
+        }
+    }
+
+    /// Draws the import dialog (if open) and acts on it.
+    fn import_ui(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.import_dialog else { return };
+        match import::dialog(ctx, d) {
+            import::Action::None => {}
+            import::Action::Close => self.import_dialog = None,
+            import::Action::Run { files, default_lang } => self.run_import(files, default_lang),
+        }
+    }
+
     /// Load `pb` now (click/Enter, or a zap that became due). Cancels any
     /// pending zap.
     fn start(&mut self, pb: Playback) {
@@ -876,22 +988,7 @@ impl App {
                 p.play_from(pb.url(), pb.is_live(), resume);
                 let pref = Self::sub_show(&pb).and_then(|show| self.settings.sub_pref(&show).cloned());
                 p.set_want_sub(pref);
-                let imported = if pb.is_live() || pb.is_local() {
-                    Vec::new()
-                } else {
-                    self.extsubs
-                        .for_key(pb.key())
-                        .iter()
-                        .map(|s| ImportedTrack {
-                            lang: s.lang.clone(),
-                            path: self.extsubs.path_of(s),
-                            delay: s.delay,
-                            manual: s.manual,
-                            starts: self.extsubs.cue_starts_of(s),
-                        })
-                        .collect()
-                };
-                p.set_imported(imported);
+                p.set_imported(Self::imported_tracks(&self.extsubs, &pb));
             }
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
@@ -2456,7 +2553,7 @@ impl App {
             return;
         }
         // The export dialog is modal: it reads its own Enter/Esc.
-        if self.export_dialog.is_some() {
+        if self.export_dialog.is_some() || self.import_dialog.is_some() {
             return;
         }
         // The "channel changed" popup is modal too: Enter, Esc or Space close it.
@@ -3612,6 +3709,10 @@ impl App {
                     let hint = format!("Type to search {} movies.", vis.map_or(lib.movies().len(), |v| v.0));
                     let all_hidden = vis.is_some_and(|v| v.0 == 0) && !lib.movies().is_empty();
                     vod::result_note(ui, self.movies.query(), self.movies.searching(), n, &hint, all_hidden);
+                    let can_import = self.import_movie_target().is_some();
+                    if ui.add_enabled(can_import, egui::Button::new("Import subtitles...")).clicked() {
+                        self.open_import(false);
+                    }
                     let a = vod::movies(
                         ui,
                         &lib,
@@ -3731,9 +3832,14 @@ impl App {
                                 self.series_back();
                             }
                             ui.strong(&open.name);
+                            if ui.button("Import subtitles...").clicked() {
+                                self.open_import(true);
+                            }
                         });
                         let titles = self.titles.get(&open.name);
-                        let a = vod::episodes(ui, &lib, &open, playing, &self.favs, titles.as_deref(), &mut self.episode_view, scroll_to);
+                        let extsubs = &self.extsubs;
+                        let marks = |e: usize| Self::subs_mark(extsubs, &lib, e);
+                        let a = vod::episodes(ui, &lib, &open, playing, &self.favs, titles.as_deref(), &mut self.episode_view, scroll_to, &marks);
                         if let Some(RowAction::Click(i) | RowAction::DoubleClick(i)) = a {
                             if let Some(e) = self.series.open_mut().and_then(|o| o.set_cursor(i)) {
                                 if Some(e) != playing {
@@ -3908,6 +4014,7 @@ impl eframe::App for App {
         self.url_prompt_ui(&ctx);
         self.notice_ui(&ctx);
         self.export_ui(&ctx);
+        self.import_ui(&ctx);
 
         // egui-winit calls `set_cursor_visible(true)` whenever the egui cursor
         // icon changes or the pointer re-enters (e.g. after Alt+Tab), undoing
