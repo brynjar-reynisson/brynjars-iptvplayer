@@ -45,6 +45,8 @@ pub struct ExtSubs {
     items: BTreeMap<String, Vec<ExtSub>>,
     dirty: bool,
     blocked: Option<String>,
+    /// Replaced/removed copies, deleted once the saved index no longer lists them.
+    pending_delete: Vec<String>,
 }
 
 pub fn path_in(dir: &Path) -> PathBuf {
@@ -63,7 +65,7 @@ impl ExtSubs {
 
     fn load_with(dir: &Path, mover: impl Fn(&Path, &Path) -> std::io::Result<()>) -> ExtSubs {
         let path = path_in(dir);
-        let mut s = ExtSubs { dir: dir.to_path_buf(), next_id: 1, items: BTreeMap::new(), dirty: false, blocked: None };
+        let mut s = ExtSubs { dir: dir.to_path_buf(), next_id: 1, items: BTreeMap::new(), dirty: false, blocked: None, pending_delete: Vec::new() };
         let unreadable = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return s,
             Err(_) => true,
@@ -104,6 +106,9 @@ impl ExtSubs {
     /// of `key`, replacing the same key+language. In memory plus the copy on
     /// disk; call [`save_if_dirty`](Self::save_if_dirty) for the index.
     pub fn add(&mut self, key: &str, lang: &str, bytes: &[u8]) -> Result<()> {
+        if let Some(msg) = &self.blocked {
+            bail!("{msg}");
+        }
         if bytes.len() > MAX_FILE_BYTES {
             bail!("subtitle file is too large ({} bytes, max {MAX_FILE_BYTES})", bytes.len());
         }
@@ -131,25 +136,28 @@ impl ExtSubs {
             }
         };
         if let Some(old) = old {
-            let _ = std::fs::remove_file(folder.join(old.file));
+            self.pending_delete.push(old.file);
         }
         self.dirty = true;
         Ok(())
     }
 
     pub fn remove(&mut self, key: &str, lang: &str) {
+        if self.blocked.is_some() {
+            return;
+        }
         let Some(list) = self.items.get_mut(key) else { return };
         let Some(i) = list.iter().position(|s| s.lang == lang) else { return };
         let old = list.remove(i);
         if list.is_empty() {
             self.items.remove(key);
         }
-        let _ = std::fs::remove_file(self.folder().join(old.file));
+        self.pending_delete.push(old.file);
         self.dirty = true;
     }
 
     pub fn set_delay(&mut self, key: &str, lang: &str, delay: f64, manual: bool) {
-        if !delay.is_finite() {
+        if !delay.is_finite() || self.blocked.is_some() {
             return;
         }
         if let Some(s) = self.items.get_mut(key).and_then(|l| l.iter_mut().find(|s| s.lang == lang)) {
@@ -189,6 +197,10 @@ impl ExtSubs {
         .context("serializing subtitles index")?;
         crate::fsutil::atomic_write(&path, &json).with_context(|| format!("writing {}", path.display()))?;
         self.dirty = false;
+        let folder = self.folder();
+        for f in std::mem::take(&mut self.pending_delete) {
+            let _ = std::fs::remove_file(folder.join(f));
+        }
         Ok(())
     }
 }
@@ -233,12 +245,14 @@ mod tests {
         let old = s.path_of(&s.for_key("k")[0]);
         s.add("k", "eng", &srt(4)).unwrap();
         s.add("k", "isl", &srt(1)).unwrap();
+        s.save_if_dirty().unwrap();
         assert!(!old.exists());
         assert_eq!(s.for_key("k").len(), 2);
         let e = s.for_key("k").iter().find(|x| x.lang == "eng").unwrap().clone();
         assert_eq!((e.delay, e.manual), (0.0, false));
         assert_eq!(s.cue_starts_of(&e).len(), 4);
         s.remove("k", "eng");
+        s.save_if_dirty().unwrap();
         assert_eq!(s.for_key("k").len(), 1);
         assert!(!s.path_of(&e).exists());
     }
@@ -289,9 +303,34 @@ mod tests {
         let mut s = ExtSubs::load_with(d.path(), |_, _| {
             Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "locked"))
         });
-        s.add("k", "eng", &srt(1)).unwrap();
-        assert!(s.save_if_dirty().unwrap_err().to_string().contains("subtitles.json"));
+        let err = s.add("k", "eng", &srt(1)).unwrap_err();
+        assert!(err.to_string().contains("subtitles.json"));
+        assert!(s.for_key("k").is_empty());
+        assert!(!d.path().join("subtitles").exists());
+        s.save_if_dirty().unwrap(); // nothing changed, nothing to write
         assert_eq!(std::fs::read(&f).unwrap(), b"{oops");
+    }
+
+    #[test]
+    fn replaced_copy_is_deleted_only_after_the_index_is_saved() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = ExtSubs::load(d.path());
+        s.add("k", "eng", &srt(2)).unwrap();
+        s.add("j", "eng", &srt(2)).unwrap();
+        s.save_if_dirty().unwrap();
+        let old = s.path_of(&s.for_key("k")[0]);
+        let gone = s.path_of(&s.for_key("j")[0]);
+        s.add("k", "eng", &srt(3)).unwrap();
+        s.remove("j", "eng");
+        let r = ExtSubs::load(d.path());
+        assert_eq!(r.for_key("k")[0].file, "00000001.srt");
+        assert_eq!(r.for_key("j").len(), 1);
+        assert!(old.exists() && gone.exists());
+        s.save_if_dirty().unwrap();
+        assert!(!old.exists() && !gone.exists());
+        let r = ExtSubs::load(d.path());
+        assert_eq!(r.for_key("k")[0].file, "00000003.srt");
+        assert!(r.for_key("j").is_empty());
     }
 
     #[test]

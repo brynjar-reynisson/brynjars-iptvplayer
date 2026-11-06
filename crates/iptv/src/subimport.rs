@@ -173,11 +173,17 @@ pub fn import_show(
     let default = resolve_default(default_lang);
     let mut report = Report::default();
     let mut failed = Vec::new();
+    let mut duplicates = plan.duplicates.clone();
+    let mut used: HashSet<(&str, &str)> = HashSet::new();
     for (file, key) in &plan.matched {
         let Some(lang) = parse_name(&name_of(file)).lang.or(default) else {
             report.need_language.push(file.clone());
             continue;
         };
+        if !used.insert((key.as_str(), lang)) {
+            duplicates.push(file.clone());
+            continue;
+        }
         match store_one(store, key, lang, file) {
             Ok(()) => report.imported += 1,
             Err(_) => failed.push(file.clone()),
@@ -188,7 +194,7 @@ pub fn import_show(
         files.len(),
         &[
             ("Not matched", &plan.unmatched),
-            ("Duplicates", &plan.duplicates),
+            ("Duplicates", &duplicates),
             ("Need a language", &report.need_language),
             ("Failed", &failed),
         ],
@@ -282,6 +288,19 @@ mod tests {
         let bad = import_show(&mut store, &[write(d.path(), "Show.S01E01.x.srt")], &targets, Some("klingon"));
         assert_eq!(bad.imported, 0);
         assert_eq!(bad.need_language.len(), 1);
+    }
+
+    #[test]
+    fn named_and_unnamed_language_files_resolving_to_one_language_are_duplicates() {
+        let d = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut store = ExtSubs::load(data.path());
+        let a = write(d.path(), "Show.S02E06.en.srt");
+        let b = write(d.path(), "Show.S02E06.srt");
+        let r = import_show(&mut store, &[a, b], &[tgt("k", 2, 6)], Some("eng"));
+        assert_eq!(r.imported, 1);
+        assert_eq!(r.message, "Imported 1 of 2. Duplicates (1): Show.S02E06.srt.");
+        assert_eq!(store.for_key("k").len(), 1);
     }
 
     #[test]
