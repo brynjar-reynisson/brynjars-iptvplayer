@@ -27,12 +27,17 @@ Built and unit-tested; the GUI, mpv and the Windows dialog could not be driven a
 - [ ] An unmatched file and a duplicate are listed in the result message.
 - [ ] Windows file dialog: multi-select, Cancel, very many files.
 - [ ] Import a second language while the first plays; re-import of the selected language.
+- [ ] Pick the reference (first embedded) track in the CC menu while an imported track plays: it must switch (real mpv refuses a track that is also the secondary one, so the app clears the reference first), and auto-sync must resume if the imported track is selected again.
+- [ ] Import a whole series folder (about 30 files): note any freeze (the import runs on the UI thread with an fsync per file; estimate 0.3-0.6 s for 30 files).
+- [ ] Watch for `slow frame` lines (stderr with `--console`) with imported subtitles on a 4K stream (`Player::update` reads `track-list` every frame).
+- [ ] Two entries of the same episode (language-prefixed duplicates such as `NC - ` / `SE:`): both get the imported track and the mark.
+- [ ] A single file without an episode in its name, chosen in a show: attaches to the selected episode, else the playing one, else says `Select an episode first.`
 
 Open verifications:
 
 - (a) Does `secondary-sub-start` ignore `sub-delay`? mpv also has `secondary-sub-delay`. If it does not ignore it, Apply would move its own reference.
 - (b) Unsure rate on dense files: a dense file (~1.7 s between lines) can fail the 1.5x rival rule at 25 lines even for a true match (matched 25 vs rival 22 in a synthetic test), while real episode files (3-5 s between lines) passed with 70-100 lines offline. The recheck at 60 lines is the second chance. Tuning options: tolerance 0.5 s -> 0.3 s, or the rival rule.
-- (c) Picking an embedded track before the first PLAYBACK_RESTART makes the per-generation block skip adding imported files for that load (`select_sub` sets `sub_gen` early). Seen in the Task 6 re-review, not verified at run time.
+- (c) Fixed: `select_sub` sets `sub_gen` only while the status is Playing, so a pick during loading no longer makes the per-generation block skip adding imported files and applying `want_sub`. Still to verify at run time: pick an embedded track while the video is loading (right after a click) and check that the imported tracks are still in the CC menu afterwards.
 - (d) The `set_sub(None)` fallback when a re-added selected track is not found.
 
 Ideas: embed the imported track when exporting a movie to MKV; `.vtt` / `.ass` input.
@@ -40,7 +45,7 @@ Ideas: embed the imported track when exporting a movie to MKV; `.vtt` / `.ass` i
 Known small gaps:
 
 - subsync: residual picks the earliest file start in the window rather than the nearest; `partial_cmp().unwrap()` panics on NaN (also in autosync); duplicated window lookup.
-- extsubs: `file` from `subtitles.json` is joined unchecked (a hand-edited `../x` escapes `subtitles/`); `import_*` drop the failure reason (`Err(_)`); `CODES` duplicates the `normalize_lang` table; `remove`/`set_delay` return silently when the index is blocked.
+- extsubs: `file` from `subtitles.json` is joined unchecked (a hand-edited `../x` escapes `subtitles/`); `CODES` duplicates the `normalize_lang` table; `set_delay` returns silently when the index is blocked.
 - ext_sub_demo: weak "did not select" check; fixed temp dir name; no ffmpeg timeout; wall-clock window assumes real-time playback; `set_sub_delay` formats NaN/inf.
 - autosync: a wrong-peak test with >= 25 lines is missing; untested: manual() after Apply, recheck after Unsure/Apply, burst past 60 lines; `compute` returns `Option<Option<f64>>`.
 - player: per-frame `sid`/`track-list` reads while imported tracks exist; mpv may keep `secondary-sid` across `loadfile`; "imported subtitle missing" logs on every reconnect; `Player` is growing (candidate for a `state::` module).

@@ -107,12 +107,15 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). **Z** / **X** move imported subtitles 0.1 s earlier / later. For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.
 - Import subtitles (`.srt` files you already have, played with the stream; nothing is embedded or
-  re-encoded). Open a show in the Series tab (or use the Movies tab) and press **Import
-  subtitles...** in the search row. Pick **files** or a **folder**. A file is matched to an
-  episode by the season/episode in its name: `Example.Show.S02E06.en.srt`, `example show s02e06.srt`
-  and `Example Show 2x06.srt` all mean season 2, episode 6 (movies take the first file you
-  pick). The language comes from the name (`.en.`, `.da.`, `English`, ...) or is asked once for
-  the files that have none. The result message lists files that matched no episode and
+  re-encoded). Open a show in the Series tab and press **Import subtitles...** in the open
+  show's header row (in the Movies tab it sits under the result note). Pick **files** or a
+  **folder**. A file is matched to an episode by the season/episode in its name:
+  `Example.Show.S02E06.en.srt`, `example show s02e06.srt` and `Example Show 2x06.srt` all mean
+  season 2, episode 6, and the file is attached to every entry of that episode (movies take the
+  first file you pick). One single file without an episode in its name goes to the selected
+  (else the playing) episode of the open show. The language comes from the name when it is the
+  last word before `.srt` (`.en.`, `.da.`, `English`, optionally followed by `forced`, `sdh`, `hi`
+  or `cc`) or is asked once for the files that have none. The result message lists files that matched no episode and
   duplicates. Imported tracks appear in the **CC** menu as `<Language> (imported)`; the choice
   is remembered per show like the built-in tracks.
   - Automatic sync: the file's timing is compared with an embedded subtitle track of the video
