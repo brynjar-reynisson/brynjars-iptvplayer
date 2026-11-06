@@ -36,6 +36,38 @@ pub struct ImportDialog {
     pub done: Vec<String>,
     /// Appended to the final message (for example "Only the first file was used.").
     pub note: String,
+    /// The files came from the file dialog (not from a folder).
+    pub picked_files: bool,
+}
+
+/// Where a single chosen file goes in a show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleAttach {
+    /// The usual matching by the episode marker in the file names.
+    Normal,
+    /// Attach to this episode (favorite key), whatever the name says.
+    Key(String),
+    /// No episode to attach to: tell the user.
+    NeedEpisode,
+}
+
+/// One file picked in the file dialog whose name has no episode marker goes
+/// to the open show's cursor episode, else to the playing episode of that
+/// show, else nowhere. Anything else is matched by name.
+pub fn single_file_attach(
+    file_count: usize,
+    picked_files: bool,
+    name_has_marker: bool,
+    cursor_key: Option<&str>,
+    playing_key: Option<&str>,
+) -> SingleAttach {
+    if file_count != 1 || !picked_files || name_has_marker {
+        return SingleAttach::Normal;
+    }
+    match cursor_key.or(playing_key) {
+        Some(k) => SingleAttach::Key(k.to_string()),
+        None => SingleAttach::NeedEpisode,
+    }
 }
 
 /// The text of the result stage: earlier rounds, then this round's message,
@@ -71,7 +103,7 @@ fn lang_label(code: &str) -> String {
 
 impl ImportDialog {
     pub fn new(scope: Scope) -> ImportDialog {
-        ImportDialog { scope, stage: Stage::Choose, done: Vec::new(), note: String::new() }
+        ImportDialog { scope, stage: Stage::Choose, done: Vec::new(), note: String::new(), picked_files: false }
     }
 
     pub fn heading(&self) -> String {
@@ -114,6 +146,7 @@ pub fn dialog(ctx: &egui::Context, d: &mut ImportDialog) -> Action {
     if let Some(v) = picked {
         d.stage = Stage::Choose;
         if !v.is_empty() {
+            d.picked_files = true;
             return Action::Run { files: v, default_lang: None };
         }
     }
@@ -141,7 +174,7 @@ pub fn dialog(ctx: &egui::Context, d: &mut ImportDialog) -> Action {
                 ui.add_space(6.0);
                 ui.label(match &d.scope {
                     Scope::Show { .. } => {
-                        "Choose .srt files named like the episodes (S01E02, 1x02 or 102). A language in the name (en, Icelandic...) is picked up."
+                        "Choose .srt files named like the episodes (S01E02 or 1x02). A language in the name (en, Icelandic...) is picked up."
                     }
                     Scope::Movie { .. } => "Choose an .srt file for this movie. A language in the name (en, Icelandic...) is picked up.",
                 });
@@ -153,7 +186,7 @@ pub fn dialog(ctx: &egui::Context, d: &mut ImportDialog) -> Action {
                     if ui.add_enabled(!picking, egui::Button::new("Choose folder...")).clicked() {
                         next = Some(Stage::Folder(FolderTree::open_at(None)));
                     }
-                    if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                    if ui.add_enabled(!picking, egui::Button::new("Cancel")).on_hover_text("Esc").clicked() {
                         action = Action::Close;
                     }
                 });
@@ -251,6 +284,7 @@ pub fn dialog(ctx: &egui::Context, d: &mut ImportDialog) -> Action {
                     if files.is_empty() {
                         next = Some(Stage::Result("No .srt files in that folder.".to_string()));
                     } else {
+                        d.picked_files = false;
                         action = Action::Run { files, default_lang: None };
                     }
                 }
@@ -342,6 +376,22 @@ mod tests {
             Stage::Result(t) => assert_eq!(t, "Imported 1 subtitle. Only the first file was used."),
             _ => panic!("expected the result stage"),
         }
+    }
+
+    #[test]
+    fn single_file_without_a_marker_goes_to_the_cursor_then_the_playing_episode() {
+        use SingleAttach::*;
+        assert_eq!(single_file_attach(1, true, false, Some("c"), Some("p")), Key("c".into()));
+        assert_eq!(single_file_attach(1, true, false, None, Some("p")), Key("p".into()));
+        assert_eq!(single_file_attach(1, true, false, None, None), NeedEpisode);
+    }
+
+    #[test]
+    fn marker_several_files_or_a_folder_use_the_normal_path() {
+        use SingleAttach::*;
+        assert_eq!(single_file_attach(1, true, true, Some("c"), None), Normal);
+        assert_eq!(single_file_attach(2, true, false, Some("c"), None), Normal);
+        assert_eq!(single_file_attach(1, false, false, Some("c"), None), Normal);
     }
 
     #[test]

@@ -926,7 +926,23 @@ impl App {
         // what the playing entry has now, to tell afterwards whether it changed
         let before = self.playback.as_ref().map(|pb| Self::imported_tracks(&self.extsubs, pb)).unwrap_or_default();
         let report = match &d.scope {
-            import::Scope::Show { targets, .. } => iptv::subimport::import_show(&mut self.extsubs, &files, targets, lang),
+            import::Scope::Show { name, targets } => {
+                let marker = files.len() == 1
+                    && iptv::subimport::parse_name(&files[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+                        .season_episode
+                        .is_some();
+                let cursor_key = self.shown_lib.as_ref().zip(self.series.open()).and_then(|(lib, open)| {
+                    open.current().map(|e| favorite_key(lib.entry(e)))
+                });
+                let playing_key = self.playback.as_ref().and_then(recent_id).filter(|(show, _)| show == name).map(|(_, k)| k);
+                match import::single_file_attach(files.len(), d.picked_files, marker, cursor_key.as_deref(), playing_key.as_deref()) {
+                    import::SingleAttach::Normal => iptv::subimport::import_show(&mut self.extsubs, &files, targets, lang),
+                    import::SingleAttach::Key(k) => iptv::subimport::import_movie(&mut self.extsubs, &k, &files[0], lang),
+                    import::SingleAttach::NeedEpisode => {
+                        iptv::subimport::Report { message: "Select an episode first.".to_string(), ..Default::default() }
+                    }
+                }
+            }
             import::Scope::Movie { key, .. } => {
                 if files.len() > 1 {
                     d.note = "Only the first file was used.".to_string();
