@@ -106,6 +106,28 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 - Movies and episodes have a **CC** button (left of play/pause) that picks the subtitles while
   playback continues (also the **C** key; Up/Down + Enter or a click choose, Esc closes). **Z** / **X** move imported subtitles 0.1 s earlier / later. For series the choice is remembered per show and matched in later
   episodes (by language); stored in `settings.json`.
+- Import subtitles (`.srt` files you already have, played with the stream; nothing is embedded or
+  re-encoded). Open a show in the Series tab (or use the Movies tab) and press **Import
+  subtitles...** in the search row. Pick **files** or a **folder**. A file is matched to an
+  episode by the season/episode in its name: `Example.Show.S02E06.en.srt`, `example show s02e06.srt`
+  and `Example Show 2x06.srt` all mean season 2, episode 6 (movies take the first file you
+  pick). The language comes from the name (`.en.`, `.da.`, `English`, ...) or is asked once for
+  the files that have none. The result message lists files that matched no episode and
+  duplicates. Imported tracks appear in the **CC** menu as `<Language> (imported)`; the choice
+  is remembered per show like the built-in tracks.
+  - Automatic sync: the file's timing is compared with an embedded subtitle track of the video
+    (the reference), so it needs one. For the first couple of minutes the imported subtitles play
+    unshifted; once enough lines have been seen the offset is found and applied silently, with a
+    notice such as `Subtitles shifted -3.0 s (automatic)`. If no safe match is found the notice
+    says to adjust by hand. It never overrides a change you made by hand.
+  - **Z** / **X** move the subtitles 0.1 s earlier / later; the value is saved per file and used
+    next time.
+  - The **x** at the end of an imported row in the CC menu removes that imported subtitle (the
+    file copy is deleted).
+  - Limits: `.srt` only, UTF-8 or Windows-1252, at most 2 MiB per file and 2000 imported files.
+    Files are copied to `subtitles/` in the data directory (index `subtitles.json`).
+  - Export (movie to `.mkv`) does not embed imported subtitles; add them to the exported file with
+    the project skill `.claude/skills/add-subtitles`.
 - Next episode: during the closing credits of an episode a **Next episode in 8** button
   appears at the video's bottom right and counts down; at 0 the next episode starts (the
   last episode of a season continues with the next season). A click on it plays it now

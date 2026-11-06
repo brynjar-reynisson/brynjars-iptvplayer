@@ -14,6 +14,39 @@ Known gaps and ideas that were found during implementation and review but not do
 
 - **Episode titles, real show.** Open a real show: titles should appear within ~2 s and reopening it should be instant (cached). Also check how well Icelandic/Nordic shows are covered by TVmaze.
 
+## External subtitles, manual checks still to do (2026-11-06)
+
+Built and unit-tested; the GUI, mpv and the Windows dialog could not be driven automatically, so nothing below has been seen in the running app. Setup: local ffmpeg server + `--playlist-file` scratch data dir (see AGENTS.md), an episode file with a Danish-like embedded subtitle track and an external `Example.Show.S02E06.en.srt` that is 3.0 s late.
+
+- [ ] Import by file and by folder (Series open show, and Movies).
+- [ ] The CC menu lists `<Language> (imported)`; the choice is remembered per show.
+- [ ] After about 2 minutes the notice `Subtitles shifted -3.0 s (automatic)` appears and the line timing matches the reference.
+- [ ] Z / X change the delay; the value survives a restart.
+- [ ] A reconnect keeps the track and the delay.
+- [ ] The `x` in the CC menu removes the track at once.
+- [ ] An unmatched file and a duplicate are listed in the result message.
+- [ ] Windows file dialog: multi-select, Cancel, very many files.
+- [ ] Import a second language while the first plays; re-import of the selected language.
+
+Open verifications:
+
+- (a) Does `secondary-sub-start` ignore `sub-delay`? mpv also has `secondary-sub-delay`. If it does not ignore it, Apply would move its own reference.
+- (b) Unsure rate on dense files: a dense file (~1.7 s between lines) can fail the 1.5x rival rule at 25 lines even for a true match (matched 25 vs rival 22 in a synthetic test), while real episode files (3-5 s between lines) passed with 70-100 lines offline. The recheck at 60 lines is the second chance. Tuning options: tolerance 0.5 s -> 0.3 s, or the rival rule.
+- (c) Picking an embedded track before the first PLAYBACK_RESTART makes the per-generation block skip adding imported files for that load (`select_sub` sets `sub_gen` early). Seen in the Task 6 re-review, not verified at run time.
+- (d) The `set_sub(None)` fallback when a re-added selected track is not found.
+
+Ideas: embed the imported track when exporting a movie to MKV; `.vtt` / `.ass` input.
+
+Known small gaps:
+
+- subsync: residual picks the earliest file start in the window rather than the nearest; `partial_cmp().unwrap()` panics on NaN (also in autosync); duplicated window lookup.
+- extsubs: `file` from `subtitles.json` is joined unchecked (a hand-edited `../x` escapes `subtitles/`); `import_*` drop the failure reason (`Err(_)`); `CODES` duplicates the `normalize_lang` table; `remove`/`set_delay` return silently when the index is blocked.
+- ext_sub_demo: weak "did not select" check; fixed temp dir name; no ffmpeg timeout; wall-clock window assumes real-time playback; `set_sub_delay` formats NaN/inf.
+- autosync: a wrong-peak test with >= 25 lines is missing; untested: manual() after Apply, recheck after Unsure/Apply, burst past 60 lines; `compute` returns `Option<Option<f64>>`.
+- player: per-frame `sid`/`track-list` reads while imported tracks exist; mpv may keep `secondary-sid` across `loadfile`; "imported subtitle missing" logs on every reconnect; `Player` is growing (candidate for a `state::` module).
+- import UI: FNERR_BUFFERTOOSMALL looks like Cancel; Cancel enabled while the native dialog is open; null owner window; ~45 lines of folder-tree drawing duplicated from `ui/export.rs`; Esc in the language question hides the first round message; `subs_mark` per row per frame.
+- nudge/notices: `stop()` and `remove_imported` do not drain `poll_sync` first; Shift+Z/X also nudge; stored delay not rounded; per-show `sub_pref` may still name a removed imported track.
+
 ## Behaviour
 
 - **EPG gaps** (kept from the 2026-10-26 spike). The XMLTV file is downloaded on every start (no on-disk cache, ~2.6 MB, ~1-4 s in the background) and not refreshed by F5; a playlist URL set after start-up is only used after a restart; the panel shows only on the Live tab in the normal view (not Favorites, not fullscreen). Only 117 of 5,449 XMLTV channels had programmes, so most channels (e.g. many of the 38 `.is` ones: only `RUV.is`/`RUV2.is` were seen in the file) depend on `get_short_epg`; whether it covers the Icelandic channels still needs a look channel by channel. The short guide is requested once per channel per session, so "now" can go stale on a long-open channel until it is selected again after a restart (the XMLTV side keeps up through the clock). Ideas: cache the XMLTV on disk with a TTL, a Favorites/fullscreen variant, an on-screen "now" line in the channel list, re-requesting the short guide when the running programme ends. Times assume `get_short_epg` timestamps are unix and XMLTV carries its offset; checked only against SVT1.

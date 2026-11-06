@@ -1,6 +1,6 @@
 # External subtitles: import `.srt` files and keep them in sync
 
-Date: 2026-11-06. Status: design agreed in conversation, not yet built.
+Date: 2026-11-06. Status: built (2026-11-06). Not yet verified in the real app or on the real provider; the open items are listed in `docs/follow-ups.md` ("External subtitles, manual checks still to do").
 
 ## Intent and why
 
