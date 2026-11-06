@@ -475,13 +475,20 @@ impl Player {
         let choice = id
             .and_then(|id| self.sub_tracks().into_iter().find(|t| t.id == id))
             .map_or(SubChoice::Off, |t| SubChoice::of(&t));
+        // mpv refuses a track that is still selected in the other slot, so a
+        // pick of the current reference track needs the reference cleared
+        // first. `run_autosync` sets it again if an imported track stays
+        // selected (`clear_secondary` resets `secondary_gen`).
+        self.clear_secondary();
         self.sup.backend_mut().set_sub(id);
         self.apply_delay();
-        if self.selected_imported().is_none() {
-            self.clear_secondary();
-        }
         self.want_sub = Some(choice.clone());
-        self.sub_gen = self.sup.generation();
+        // Only a pick made while playing counts as the once-per-load
+        // application; during loading the per-generation block must still add
+        // the imported files and apply `want_sub`.
+        if self.sup.status() == Status::Playing {
+            self.sub_gen = self.sup.generation();
+        }
         choice
     }
 
@@ -522,6 +529,8 @@ impl Player {
             }
             if let Some(want) = &self.want_sub {
                 if let Some(sel) = pick(&self.sup.backend().sub_tracks(), want) {
+                    // never select a track that is also the secondary one
+                    self.sup.backend_mut().set_secondary_sub(None);
                     self.sup.backend_mut().set_sub(sel);
                 }
             }
@@ -702,6 +711,18 @@ mod tests {
         let mut s = Sim { on: false, gen_set: 0 };
         assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7));
         assert_eq!(s.frame(true, 2, Some(8)), SecStep::Set(8));
+    }
+
+    #[test]
+    fn picking_the_reference_track_clears_it_first_and_it_returns_for_an_imported_one() {
+        // `select_sub` clears the reference BEFORE `set_sub`, then the
+        // selection decides: an embedded pick wants no reference, an imported
+        // one gets it set again on the next frame.
+        let mut s = Sim { on: false, gen_set: 0 };
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7));
+        assert_eq!(s.frame(false, 1, None), SecStep::Clear, "cleared before the pick");
+        assert!(!s.on);
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7), "imported track picked again");
     }
 
     #[test]

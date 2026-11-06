@@ -99,6 +99,25 @@ fn main() -> anyhow::Result<()> {
         check(seen.iter().any(|s| (s - want).abs() < 0.05), &format!("secondary start {want} seen"), &mut all);
     }
 
+    // Picking the track that is the current reference: the app clears the
+    // secondary first (`Player::select_sub`). Informational: what mpv does
+    // when it is NOT cleared first.
+    if let (Some(x), Some(imp)) = (embedded_id, imported.first().map(|t| t.id)) {
+        b.set_sub(Some(imp));
+        b.set_secondary_sub(Some(x));
+        b.set_sub(Some(x));
+        println!(
+            "NOTE: selecting sid {x} while it is secondary-sid, without clearing first: sid reads {:?} (imported is {imp})",
+            b.current_sub()
+        );
+        b.set_secondary_sub(None);
+        b.set_sub(Some(imp));
+        b.set_secondary_sub(Some(x));
+        b.set_secondary_sub(None);
+        b.set_sub(Some(x));
+        check(b.current_sub() == Some(x), "selecting the former reference track works once the secondary is cleared first", &mut all);
+    }
+
     b.set_secondary_sub(None);
     b.load(vid, None, 2);
     check(pump_until_started(&mut b, 2, 15.0), "playing again after second load", &mut all);
