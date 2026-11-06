@@ -127,6 +127,23 @@ pub fn diff_imported(old: &[ImportedTrack], new: &[ImportedTrack]) -> Vec<(Strin
     out
 }
 
+/// The tracks to use after an import: unchanged languages keep the in-memory
+/// copy (its delay and manual flag may be newer than the stored one: auto-sync
+/// and nudges live only there), new and replaced ones take the incoming values,
+/// removed ones disappear. Order follows `new`.
+pub fn merge_imported(old: &[ImportedTrack], new: &[ImportedTrack]) -> Vec<ImportedTrack> {
+    let changes = diff_imported(old, new);
+    new.iter()
+        .map(|n| {
+            let unchanged = changes.iter().any(|(l, c)| *l == n.lang && *c == ImportChange::Unchanged);
+            match old.iter().find(|o| o.lang == n.lang).filter(|_| unchanged) {
+                Some(o) => o.clone(),
+                None => n.clone(),
+            }
+        })
+        .collect()
+}
+
 fn make_autosync(t: &ImportedTrack, supported: bool) -> Option<AutoSync> {
     (supported && !t.manual).then(|| AutoSync::new(t.starts.clone(), t.delay))
 }
@@ -262,7 +279,7 @@ impl Player {
     /// (re-selected, with their delay, when they were selected).
     pub fn refresh_imported(&mut self, tracks: Vec<ImportedTrack>) {
         let changes = diff_imported(&self.imported, &tracks);
-        let live = self.sup.status() == Status::Playing && self.sub_gen == self.sup.generation();
+        let live = self.sub_gen == self.sup.generation();
         let supported = !tracks.is_empty() && self.sup.backend().has_secondary_sub_start();
         let mut reselect: Option<String> = None;
         let mut selected_changed = false;
@@ -296,8 +313,10 @@ impl Player {
             }
         }
         // Rebuild the sync state: unchanged languages keep theirs.
+        let old_tracks = std::mem::take(&mut self.imported);
         let mut old_syncs: Vec<(String, Option<AutoSync>)> =
-            std::mem::take(&mut self.imported).into_iter().map(|t| t.lang).zip(std::mem::take(&mut self.syncs)).collect();
+            old_tracks.iter().map(|t| t.lang.clone()).zip(std::mem::take(&mut self.syncs)).collect();
+        let merged = merge_imported(&old_tracks, &tracks);
         self.syncs = tracks
             .iter()
             .map(|t| {
@@ -308,7 +327,7 @@ impl Player {
                 }
             })
             .collect();
-        self.imported = tracks;
+        self.imported = merged;
         if live {
             if let Some(lang) = reselect {
                 let id = self
@@ -318,13 +337,16 @@ impl Player {
                     .iter()
                     .find(|t| t.title.as_deref() == Some(IMPORTED_TITLE) && t.lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&lang)))
                     .map(|t| t.id);
+                if id.is_none() {
+                    eprintln!("imported subtitle: re-added track not found, subtitles off");
+                }
                 self.sup.backend_mut().set_sub(id);
             }
             if selected_changed {
                 // the reference must be set again for the new file
                 self.clear_secondary();
+                self.apply_delay();
             }
-            self.apply_delay();
         }
     }
 
@@ -601,6 +623,23 @@ mod tests {
         assert_eq!(diff_imported(&[a.clone()], &[a3]), vec![("eng".to_string(), Replaced)]);
         assert_eq!(diff_imported(&[a.clone(), b], &[a]), vec![("eng".into(), Unchanged), ("isl".into(), Removed)]);
         assert!(diff_imported(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn merge_imported_keeps_live_state_of_unchanged_languages() {
+        let old_eng = track("eng", 1.5, true);
+        let old_isl = track("isl", 0.0, false);
+        let old_dan = track("dan", 0.0, false);
+        let mut new_eng = track("eng", 0.0, false); // same file, stale store values
+        new_eng.delay = 0.2;
+        let mut new_isl = track("isl", 3.0, false); // replaced: other cues
+        new_isl.starts = vec![9.0];
+        let new_swe = track("swe", 0.7, false);
+        let m = merge_imported(&[old_eng, old_isl, old_dan], &[new_eng, new_isl.clone(), new_swe.clone()]);
+        assert_eq!(m.len(), 3, "dan is gone");
+        assert_eq!((m[0].lang.as_str(), m[0].delay, m[0].manual), ("eng", 1.5, true));
+        assert_eq!((m[1].delay, m[1].starts.clone()), (3.0, new_isl.starts));
+        assert_eq!((m[2].lang.as_str(), m[2].delay), ("swe", 0.7));
     }
 
     fn track(lang: &str, delay: f64, manual: bool) -> ImportedTrack {
