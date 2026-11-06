@@ -60,9 +60,44 @@ pub fn pick(tracks: &[SubTrack], want: &SubChoice) -> Option<Option<i64>> {
     best.map(|(_, id)| Some(id))
 }
 
+/// Title given to the mpv track of an imported (external) subtitle file.
+pub const IMPORTED_TITLE: &str = "Imported";
+
+/// Canonical 3-letter code of any language [`language_name`] knows (2- or
+/// 3-letter spelling, case-insensitive), e.g. `"en"` -> `"eng"`.
+pub fn normalize_lang(code: &str) -> Option<&'static str> {
+    Some(match code.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" => "eng",
+        "is" | "isl" | "ice" => "isl",
+        "da" | "dan" => "dan",
+        "sv" | "swe" => "swe",
+        "no" | "nor" | "nb" | "nob" => "nor",
+        "fi" | "fin" => "fin",
+        "de" | "deu" | "ger" => "deu",
+        "fr" | "fra" | "fre" => "fra",
+        "es" | "spa" => "spa",
+        "it" | "ita" => "ita",
+        "pt" | "por" => "por",
+        "nl" | "nld" | "dut" => "nld",
+        "pl" | "pol" => "pol",
+        "ru" | "rus" => "rus",
+        "tr" | "tur" => "tur",
+        "ar" | "ara" => "ara",
+        "he" | "heb" => "heb",
+        "ja" | "jpn" => "jpn",
+        "ko" | "kor" => "kor",
+        "zh" | "zho" | "chi" => "zho",
+        _ => return None,
+    })
+}
+
 /// Menu text: language name (or code), then the track title if it adds
-/// something, then "forced".
+/// something, then "forced". An imported track reads "<Language> (imported)".
 pub fn label(t: &SubTrack) -> String {
+    if t.title.as_deref() == Some(IMPORTED_TITLE) {
+        let lang = t.lang.as_deref().map(|l| language_name(l).map_or_else(|| l.to_string(), str::to_string));
+        return format!("{} (imported)", lang.unwrap_or_else(|| format!("Track {}", t.id)));
+    }
     let lang = t.lang.as_deref().map(|l| language_name(l).map_or_else(|| l.to_string(), str::to_string));
     let mut s = lang.clone().unwrap_or_else(|| format!("Track {}", t.id));
     if let Some(title) = t.title.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
@@ -158,6 +193,24 @@ mod tests {
         assert_eq!(label(&t(1, Some("en"), Some("English"), true)), "English (forced)");
         assert_eq!(label(&t(1, Some("xx"), None, false)), "xx");
         assert_eq!(label(&t(7, None, None, false)), "Track 7");
+    }
+
+    #[test]
+    fn normalize_lang_maps_two_and_three_letter_codes() {
+        assert_eq!(normalize_lang("en"), Some("eng"));
+        assert_eq!(normalize_lang(" ENG "), Some("eng"));
+        assert_eq!(normalize_lang("is"), Some("isl"));
+        assert_eq!(normalize_lang("ice"), Some("isl"));
+        assert_eq!(normalize_lang("zh"), Some("zho"));
+        assert_eq!(normalize_lang("xx"), None);
+        assert_eq!(normalize_lang("Icelandic"), None);
+    }
+
+    #[test]
+    fn imported_track_label_has_suffix() {
+        assert_eq!(label(&t(3, Some("isl"), Some(IMPORTED_TITLE), false)), "Icelandic (imported)");
+        assert_eq!(label(&t(3, Some("en"), Some(IMPORTED_TITLE), false)), "English (imported)");
+        assert_eq!(label(&t(3, Some("en"), Some("imported"), false)), "English - imported");
     }
 
     #[test]
