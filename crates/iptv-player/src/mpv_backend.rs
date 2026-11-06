@@ -944,6 +944,15 @@ impl MpvBackend {
         unsafe { sys::mpv_command(self.core.handle, argv.as_mut_ptr()) >= 0 }
     }
 
+    /// Remove a subtitle track from the loaded video (`sub-remove <id>`).
+    /// True on success.
+    pub fn sub_remove(&mut self, id: i64) -> bool {
+        let args = [CString::new("sub-remove").unwrap(), CString::new(id.to_string()).unwrap()];
+        let mut argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(ptr::null());
+        unsafe { sys::mpv_command(self.core.handle, argv.as_mut_ptr()) >= 0 }
+    }
+
     /// Global subtitle delay in seconds (positive = subtitles later).
     pub fn set_sub_delay(&mut self, secs: f64) {
         self.set_property("sub-delay", &format!("{secs:.3}"));

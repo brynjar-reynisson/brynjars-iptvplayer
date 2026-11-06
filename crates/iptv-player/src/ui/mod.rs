@@ -891,7 +891,8 @@ impl App {
         }
         self.playback
             .as_ref()
-            .filter(|p| !p.is_live() && !p.is_local())
+            .filter(|p| !p.is_local())
+            .filter(|p| import::movie_fallback_ok(p.entry_index().map(|i| p.library().entry(i).kind)))
             .map(|p| (p.name().to_string(), p.key().to_string()))
     }
 
@@ -921,12 +922,13 @@ impl App {
     fn run_import(&mut self, files: Vec<PathBuf>, default_lang: Option<String>) {
         let Some(d) = &mut self.import_dialog else { return };
         let lang = default_lang.as_deref();
-        let mut extra = String::new();
+        // what the playing entry has now, to tell afterwards whether it changed
+        let before = self.playback.as_ref().map(|pb| Self::imported_tracks(&self.extsubs, pb)).unwrap_or_default();
         let report = match &d.scope {
             import::Scope::Show { targets, .. } => iptv::subimport::import_show(&mut self.extsubs, &files, targets, lang),
             import::Scope::Movie { key, .. } => {
                 if files.len() > 1 {
-                    extra = " Only the first file was used.".to_string();
+                    d.note = "Only the first file was used.".to_string();
                 }
                 iptv::subimport::import_movie(&mut self.extsubs, key, &files[0], lang)
             }
@@ -934,15 +936,16 @@ impl App {
         if !report.need_language.is_empty() && default_lang.is_none() {
             d.ask_language(report.need_language.clone(), report.message.clone());
         } else {
-            d.finish(format!("{}{extra}", report.message));
+            d.finish(report.message.clone());
         }
         if let Err(e) = self.extsubs.save_if_dirty() {
             self.message = Some(safe_text(&format!("Could not save subtitles: {e:#}")));
         }
         if report.imported > 0 {
             if let (Some(pb), Ok(p)) = (self.playback.as_ref(), self.player.as_mut()) {
-                if !pb.is_live() && !pb.is_local() && !self.extsubs.for_key(pb.key()).is_empty() {
-                    p.set_imported(Self::imported_tracks(&self.extsubs, pb));
+                let after = Self::imported_tracks(&self.extsubs, pb);
+                if player::diff_imported(&before, &after).iter().any(|(_, c)| *c != player::ImportChange::Unchanged) {
+                    p.refresh_imported(after);
                 }
             }
         }

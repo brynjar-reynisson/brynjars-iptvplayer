@@ -34,6 +34,21 @@ pub struct ImportDialog {
     pub stage: Stage,
     /// Messages of earlier rounds (the language question comes after a first import).
     pub done: Vec<String>,
+    /// Appended to the final message (for example "Only the first file was used.").
+    pub note: String,
+}
+
+/// The text of the result stage: earlier rounds, then this round's message,
+/// then the note.
+pub fn compose_result(done: &[String], message: &str, note: &str) -> String {
+    let mut all: Vec<String> = done.to_vec();
+    all.push(if note.is_empty() { message.to_string() } else { format!("{message} {note}") });
+    all.join("\n")
+}
+
+/// A playing item may stand in for "the selected movie" only when it is a movie.
+pub fn movie_fallback_ok(kind: Option<iptv::playlist::Kind>) -> bool {
+    kind == Some(iptv::playlist::Kind::Movie)
 }
 
 /// What the user did this frame.
@@ -56,7 +71,7 @@ fn lang_label(code: &str) -> String {
 
 impl ImportDialog {
     pub fn new(scope: Scope) -> ImportDialog {
-        ImportDialog { scope, stage: Stage::Choose, done: Vec::new() }
+        ImportDialog { scope, stage: Stage::Choose, done: Vec::new(), note: String::new() }
     }
 
     pub fn heading(&self) -> String {
@@ -67,9 +82,8 @@ impl ImportDialog {
 
     /// Shows the result text (earlier rounds first).
     pub fn finish(&mut self, message: String) {
-        let mut all = std::mem::take(&mut self.done);
-        all.push(message);
-        self.stage = Stage::Result(all.join("\n"));
+        let done = std::mem::take(&mut self.done);
+        self.stage = Stage::Result(compose_result(&done, &message, &self.note));
     }
 
     /// The language question for these files; `earlier` is the first round's message.
@@ -304,4 +318,37 @@ pub fn dialog(ctx: &egui::Context, d: &mut ImportDialog) -> Action {
         d.stage = s;
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iptv::playlist::Kind;
+
+    #[test]
+    fn compose_result_appends_note_and_earlier_rounds() {
+        assert_eq!(compose_result(&[], "Imported 1.", ""), "Imported 1.");
+        assert_eq!(compose_result(&[], "Imported 1.", "Only the first file was used."), "Imported 1. Only the first file was used.");
+        assert_eq!(compose_result(&["First.".to_string()], "Second.", "Note."), "First.\nSecond. Note.");
+    }
+
+    #[test]
+    fn note_survives_the_language_question() {
+        let mut d = ImportDialog::new(Scope::Movie { name: "Invented Film".into(), key: "movie:1".into() });
+        d.note = "Only the first file was used.".into();
+        d.ask_language(vec![PathBuf::from("a.srt")], String::new());
+        d.finish("Imported 1 subtitle.".into());
+        match d.stage {
+            Stage::Result(t) => assert_eq!(t, "Imported 1 subtitle. Only the first file was used."),
+            _ => panic!("expected the result stage"),
+        }
+    }
+
+    #[test]
+    fn only_a_movie_may_stand_in_for_the_selection() {
+        assert!(movie_fallback_ok(Some(Kind::Movie)));
+        assert!(!movie_fallback_ok(Some(Kind::Series)));
+        assert!(!movie_fallback_ok(Some(Kind::Live)));
+        assert!(!movie_fallback_ok(None));
+    }
 }

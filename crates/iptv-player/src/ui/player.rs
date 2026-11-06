@@ -97,6 +97,36 @@ fn secondary_step(wants: bool, on: bool, attempted_gen: u32, generation: u32, re
     }
 }
 
+/// What an import did to one language of the playing entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportChange {
+    Unchanged,
+    New,
+    /// Same language, different file (the stored copy was replaced).
+    Replaced,
+    Removed,
+}
+
+/// Compares the tracks in use with the stored ones, per language (new tracks
+/// first in their order, then removed ones).
+pub fn diff_imported(old: &[ImportedTrack], new: &[ImportedTrack]) -> Vec<(String, ImportChange)> {
+    let mut out = Vec::new();
+    for n in new {
+        let c = match old.iter().find(|o| o.lang == n.lang) {
+            None => ImportChange::New,
+            Some(o) if o.path == n.path && o.starts == n.starts => ImportChange::Unchanged,
+            Some(_) => ImportChange::Replaced,
+        };
+        out.push((n.lang.clone(), c));
+    }
+    for o in old {
+        if !new.iter().any(|n| n.lang == o.lang) {
+            out.push((o.lang.clone(), ImportChange::Removed));
+        }
+    }
+    out
+}
+
 fn make_autosync(t: &ImportedTrack, supported: bool) -> Option<AutoSync> {
     (supported && !t.manual).then(|| AutoSync::new(t.starts.clone(), t.delay))
 }
@@ -224,6 +254,78 @@ impl Player {
         self.imported = tracks;
         self.secondary_gen = 0;
         self.events.clear();
+    }
+
+    /// An import finished while this entry plays: bring mpv and the sync state
+    /// up to date without a reload. Unchanged languages keep their auto-sync
+    /// state; new ones are added; replaced ones are removed and added again
+    /// (re-selected, with their delay, when they were selected).
+    pub fn refresh_imported(&mut self, tracks: Vec<ImportedTrack>) {
+        let changes = diff_imported(&self.imported, &tracks);
+        let live = self.sup.status() == Status::Playing && self.sub_gen == self.sup.generation();
+        let supported = !tracks.is_empty() && self.sup.backend().has_secondary_sub_start();
+        let mut reselect: Option<String> = None;
+        let mut selected_changed = false;
+        if live {
+            let sel_id = self.sup.backend().current_sub();
+            let mpv_tracks = self.sup.backend().sub_tracks();
+            for (lang, change) in &changes {
+                if matches!(change, ImportChange::Unchanged) {
+                    continue;
+                }
+                let existing = mpv_tracks
+                    .iter()
+                    .find(|t| t.title.as_deref() == Some(IMPORTED_TITLE) && t.lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(lang)))
+                    .map(|t| t.id);
+                if let Some(id) = existing {
+                    if sel_id == Some(id) {
+                        selected_changed = true;
+                        if matches!(change, ImportChange::Replaced) {
+                            reselect = Some(lang.clone());
+                        }
+                    }
+                    self.sup.backend_mut().sub_remove(id);
+                }
+                if matches!(change, ImportChange::New | ImportChange::Replaced) {
+                    if let Some(t) = tracks.iter().find(|t| t.lang == *lang) {
+                        if t.path.exists() {
+                            self.sup.backend_mut().sub_add(&t.path, &t.lang);
+                        }
+                    }
+                }
+            }
+        }
+        // Rebuild the sync state: unchanged languages keep theirs.
+        let mut old_syncs: Vec<(String, Option<AutoSync>)> =
+            std::mem::take(&mut self.imported).into_iter().map(|t| t.lang).zip(std::mem::take(&mut self.syncs)).collect();
+        self.syncs = tracks
+            .iter()
+            .map(|t| {
+                let kept = changes.iter().any(|(l, c)| *l == t.lang && matches!(c, ImportChange::Unchanged));
+                match old_syncs.iter().position(|(l, _)| *l == t.lang).filter(|_| kept) {
+                    Some(p) => old_syncs.swap_remove(p).1,
+                    None => make_autosync(t, supported),
+                }
+            })
+            .collect();
+        self.imported = tracks;
+        if live {
+            if let Some(lang) = reselect {
+                let id = self
+                    .sup
+                    .backend()
+                    .sub_tracks()
+                    .iter()
+                    .find(|t| t.title.as_deref() == Some(IMPORTED_TITLE) && t.lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&lang)))
+                    .map(|t| t.id);
+                self.sup.backend_mut().set_sub(id);
+            }
+            if selected_changed {
+                // the reference must be set again for the new file
+                self.clear_secondary();
+            }
+            self.apply_delay();
+        }
     }
 
     /// Index of the imported track that is selected in mpv now.
@@ -483,6 +585,23 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_imported_decides_per_language() {
+        let a = track("eng", 0.0, false);
+        let mut a2 = a.clone();
+        a2.starts = vec![9.0];
+        let mut a3 = a.clone();
+        a3.path = PathBuf::from("y.srt");
+        let b = track("isl", 0.0, false);
+        use ImportChange::*;
+        assert_eq!(diff_imported(&[a.clone()], &[a.clone()]), vec![("eng".to_string(), Unchanged)]);
+        assert_eq!(diff_imported(&[a.clone()], &[a.clone(), b.clone()]), vec![("eng".into(), Unchanged), ("isl".into(), New)]);
+        assert_eq!(diff_imported(&[a.clone()], &[a2]), vec![("eng".to_string(), Replaced)]);
+        assert_eq!(diff_imported(&[a.clone()], &[a3]), vec![("eng".to_string(), Replaced)]);
+        assert_eq!(diff_imported(&[a.clone(), b], &[a]), vec![("eng".into(), Unchanged), ("isl".into(), Removed)]);
+        assert!(diff_imported(&[], &[]).is_empty());
+    }
 
     fn track(lang: &str, delay: f64, manual: bool) -> ImportedTrack {
         ImportedTrack { lang: lang.into(), path: PathBuf::from("x.srt"), delay, manual, starts: vec![1.0, 2.0] }
