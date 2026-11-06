@@ -64,15 +64,18 @@ const CODES: [&str; 20] = [
     "heb", "jpn", "kor", "zho",
 ];
 
+/// Words that may follow the language: `Show.S02E06.en.sdh.srt`.
+const LANG_SUFFIXES: [&str; 4] = ["forced", "sdh", "hi", "cc"];
+
 /// "Icelandic" -> `isl` (English language names, case-insensitive).
 fn lang_by_name(token: &str) -> Option<&'static str> {
     CODES.into_iter().find(|c| crate::subtitles::language_name(c).is_some_and(|n| n.eq_ignore_ascii_case(token)))
 }
 
 /// Language (code or English name; see [`normalize_lang`]) and `S02E06` / `2x06` from a file name.
-/// A language token counts only as the last token before the extension or,
-/// when an episode marker is present, after the marker (so words of the show
-/// name like "is" or "it" are never read as languages).
+/// A language token counts only as the last token before the extension,
+/// optionally followed by one of `forced`, `sdh`, `hi`, `cc`. Episode-title
+/// words ("It.Begins") and words of the show name are never languages.
 pub fn parse_name(file_name: &str) -> NameInfo {
     let stem = match file_name.rsplit_once('.') {
         Some((s, ext)) if ext.eq_ignore_ascii_case("srt") => s,
@@ -80,11 +83,11 @@ pub fn parse_name(file_name: &str) -> NameInfo {
     };
     let tokens: Vec<&str> = stem.split(['.', ' ', '-', '_']).filter(|t| !t.is_empty()).collect();
     let found = tokens.iter().enumerate().find_map(|(i, t)| marker(t).map(|m| (i, m)));
-    let candidates: &[&str] = match found {
-        Some((i, _)) => &tokens[i + 1..],
-        None => tokens.last().map_or(&[], std::slice::from_ref),
-    };
-    let lang = candidates.iter().rev().find_map(|t| normalize_lang(t).or_else(|| lang_by_name(t)));
+    let mut end = tokens.len();
+    if end > 1 && LANG_SUFFIXES.iter().any(|w| tokens[end - 1].eq_ignore_ascii_case(w)) {
+        end -= 1;
+    }
+    let lang = tokens[..end].last().and_then(|t| normalize_lang(t).or_else(|| lang_by_name(t)));
     NameInfo { lang, season_episode: found.map(|(_, m)| m) }
 }
 
@@ -92,8 +95,10 @@ fn name_of(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Match files to episodes by season/episode. Files are taken in name order;
-/// for one episode the first file per language wins, later ones are duplicates.
+/// Match files to episodes by season/episode. Files are taken in name order.
+/// A file goes to EVERY target with its season/episode (one `matched` tuple
+/// per file and key); for one key the first file per language wins, later
+/// ones are duplicates. The same file on two different keys is no duplicate.
 pub fn plan_for_show(files: &[PathBuf], targets: &[Target]) -> Plan {
     let mut sorted: Vec<&PathBuf> = files.iter().collect();
     sorted.sort_by_key(|p| name_of(p));
@@ -101,18 +106,23 @@ pub fn plan_for_show(files: &[PathBuf], targets: &[Target]) -> Plan {
     let mut seen: HashSet<(String, Option<&'static str>)> = HashSet::new();
     for f in sorted {
         let info = parse_name(&name_of(f));
-        let target = info
-            .season_episode
-            .and_then(|(s, e)| targets.iter().find(|t| t.season == s && t.episode == e));
-        match target {
-            None => plan.unmatched.push(f.clone()),
-            Some(t) => {
-                if seen.insert((t.key.clone(), info.lang)) {
-                    plan.matched.push((f.clone(), t.key.clone()));
-                } else {
-                    plan.duplicates.push(f.clone());
-                }
+        let hits: Vec<&Target> = match info.season_episode {
+            Some((s, e)) => targets.iter().filter(|t| t.season == s && t.episode == e).collect(),
+            None => Vec::new(),
+        };
+        if hits.is_empty() {
+            plan.unmatched.push(f.clone());
+            continue;
+        }
+        let mut any = false;
+        for t in hits {
+            if seen.insert((t.key.clone(), info.lang)) {
+                plan.matched.push((f.clone(), t.key.clone()));
+                any = true;
             }
+        }
+        if !any {
+            plan.duplicates.push(f.clone());
         }
     }
     plan
@@ -132,27 +142,51 @@ pub fn srt_files_in(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn list(label: &str, files: &[PathBuf]) -> String {
+fn list(label: &str, names: &[String]) -> String {
     const MAX_NAMES: usize = 5;
-    let mut names: Vec<String> = files.iter().take(MAX_NAMES).map(|p| name_of(p)).collect();
-    if files.len() > MAX_NAMES {
-        names.push("...".into());
+    let mut shown: Vec<String> = names.iter().take(MAX_NAMES).cloned().collect();
+    if names.len() > MAX_NAMES {
+        shown.push("...".into());
     }
-    format!(" {label} ({}): {}.", files.len(), names.join(", "))
+    format!(" {label} ({}): {}.", names.len(), shown.join(", "))
 }
 
-fn build_message(imported: usize, total: usize, parts: &[(&str, &[PathBuf])]) -> String {
+fn names_of(files: &[PathBuf]) -> Vec<String> {
+    files.iter().map(|p| name_of(p)).collect()
+}
+
+fn build_message(imported: usize, total: usize, parts: &[(&str, Vec<String>)]) -> String {
     let mut m = format!("Imported {imported} of {total}.");
-    for (label, files) in parts {
-        if !files.is_empty() {
-            m.push_str(&list(label, files));
+    for (label, names) in parts {
+        if !names.is_empty() {
+            m.push_str(&list(label, names));
         }
     }
     m
 }
 
+/// A short, path-free reason for a failed import.
+fn short_reason(msg: &str) -> &'static str {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("too large") {
+        "too large"
+    } else if m.contains("no subtitle cues") {
+        "no subtitle lines found"
+    } else if m.contains("too many imported") {
+        "too many imported subtitles"
+    } else if m.contains("could not be read") {
+        "could not be read"
+    } else {
+        "could not be stored"
+    }
+}
+
+fn failed_label(file: &Path, reason: &str) -> String {
+    format!("{} ({})", name_of(file), short_reason(reason))
+}
+
 fn store_one(store: &mut ExtSubs, key: &str, lang: &str, file: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(file).map_err(|_| "could not be read".to_string())?;
     store.add(key, lang, &bytes).map_err(|e| e.to_string())
 }
 
@@ -172,31 +206,49 @@ pub fn import_show(
     let plan = plan_for_show(files, targets);
     let default = resolve_default(default_lang);
     let mut report = Report::default();
-    let mut failed = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     let mut duplicates = plan.duplicates.clone();
     let mut used: HashSet<(&str, &str)> = HashSet::new();
+    let mut done: HashSet<&PathBuf> = HashSet::new();
+    let mut failed_files: HashSet<&PathBuf> = HashSet::new();
+    let mut dup_files: Vec<&PathBuf> = Vec::new();
     for (file, key) in &plan.matched {
         let Some(lang) = parse_name(&name_of(file)).lang.or(default) else {
-            report.need_language.push(file.clone());
+            if !report.need_language.contains(file) {
+                report.need_language.push(file.clone());
+            }
             continue;
         };
         if !used.insert((key.as_str(), lang)) {
-            duplicates.push(file.clone());
+            dup_files.push(file);
             continue;
         }
         match store_one(store, key, lang, file) {
-            Ok(()) => report.imported += 1,
-            Err(_) => failed.push(file.clone()),
+            Ok(()) => {
+                done.insert(file);
+            }
+            Err(e) => {
+                if failed_files.insert(file) {
+                    failed.push(failed_label(file, &e));
+                }
+            }
         }
     }
+    // A file whose copies were all duplicates (none stored, none failed).
+    for f in dup_files {
+        if !done.contains(f) && !failed_files.contains(f) && !duplicates.contains(f) {
+            duplicates.push(f.clone());
+        }
+    }
+    report.imported = done.len();
     report.message = build_message(
         report.imported,
         files.len(),
         &[
-            ("Not matched", &plan.unmatched),
-            ("Duplicates", &duplicates),
-            ("Need a language", &report.need_language),
-            ("Failed", &failed),
+            ("Not matched", names_of(&plan.unmatched)),
+            ("Duplicates", names_of(&duplicates)),
+            ("Need a language", names_of(&report.need_language)),
+            ("Failed", failed),
         ],
     );
     report
@@ -205,16 +257,19 @@ pub fn import_show(
 /// Attach one file (any name) to a movie.
 pub fn import_movie(store: &mut ExtSubs, key: &str, file: &Path, default_lang: Option<&str>) -> Report {
     let mut report = Report::default();
-    let mut failed = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     match parse_name(&name_of(file)).lang.or(resolve_default(default_lang)) {
         None => report.need_language.push(file.to_path_buf()),
         Some(lang) => match store_one(store, key, lang, file) {
             Ok(()) => report.imported = 1,
-            Err(_) => failed.push(file.to_path_buf()),
+            Err(e) => failed.push(failed_label(file, &e)),
         },
     }
-    report.message =
-        build_message(report.imported, 1, &[("Need a language", &report.need_language), ("Failed", &failed)]);
+    report.message = build_message(
+        report.imported,
+        1,
+        &[("Need a language", names_of(&report.need_language)), ("Failed", failed)],
+    );
     report
 }
 
@@ -252,6 +307,71 @@ mod tests {
         assert_eq!((i.season_episode, i.lang), (Some((1, 2)), None));
         assert_eq!(parse_name("Is.srt").lang, Some("isl"));
         assert_eq!(parse_name("Is.It.Good.srt").lang, None);
+    }
+
+    #[test]
+    fn episode_title_words_are_not_languages() {
+        let i = parse_name("Show.S01E05.It.Begins.srt");
+        assert_eq!((i.season_episode, i.lang), (Some((1, 5)), None));
+        assert_eq!(parse_name("Show.S01E05.He.Is.No.De.Way.srt").lang, None);
+        // a language only as the last token, optionally before forced/sdh/hi/cc
+        let i = parse_name("Show.S02E06.en.sdh.srt");
+        assert_eq!((i.season_episode, i.lang), (Some((2, 6)), Some("eng")));
+        assert_eq!(parse_name("Show.S02E06.Icelandic.forced.srt").lang, Some("isl"));
+        assert_eq!(parse_name("Show.S02E06.en.title.srt").lang, None);
+        assert_eq!(parse_name("Show.S02E06.sdh.srt").lang, None);
+    }
+
+    #[test]
+    fn a_file_goes_to_every_target_with_its_episode() {
+        let d = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut store = ExtSubs::load(data.path());
+        let f = write(d.path(), "Show.S01E01.en.srt");
+        let targets = [tgt("a", 1, 1), tgt("b", 1, 1), tgt("c", 1, 2)];
+        let p = plan_for_show(std::slice::from_ref(&f), &targets);
+        assert_eq!(p.matched, vec![(f.clone(), "a".to_string()), (f.clone(), "b".to_string())]);
+        assert!(p.duplicates.is_empty());
+        let r = import_show(&mut store, &[f], &targets, None);
+        // FILES imported, not copies
+        assert_eq!(r.imported, 1);
+        assert_eq!(r.message, "Imported 1 of 1.");
+        let (a, b) = (store.for_key("a")[0].clone(), store.for_key("b")[0].clone());
+        assert_ne!(a.file, b.file, "separate store entries");
+        assert!(store.for_key("c").is_empty());
+    }
+
+    #[test]
+    fn two_files_for_one_episode_and_language_stay_duplicates_per_key() {
+        let d = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut store = ExtSubs::load(data.path());
+        let a = write(d.path(), "Show.S01E01.en.srt");
+        let b = write(d.path(), "Show.S01E01.v2.en.srt");
+        let r = import_show(&mut store, &[a, b], &[tgt("a", 1, 1), tgt("b", 1, 1)], None);
+        assert_eq!(r.imported, 1);
+        assert_eq!(r.message, "Imported 1 of 2. Duplicates (1): Show.S01E01.v2.en.srt.");
+        assert_eq!(store.for_key("a").len(), 1);
+        assert_eq!(store.for_key("b").len(), 1);
+    }
+
+    #[test]
+    fn failures_name_the_file_and_a_short_reason() {
+        let d = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut store = ExtSubs::load(data.path());
+        let bad = d.path().join("Show.S01E01.en.srt");
+        std::fs::write(&bad, b"just some text").unwrap();
+        let r = import_show(&mut store, &[bad.clone()], &[tgt("a", 1, 1)], None);
+        assert_eq!(r.imported, 0);
+        assert_eq!(r.message, "Imported 0 of 1. Failed (1): Show.S01E01.en.srt (no subtitle lines found).");
+        let m = import_movie(&mut store, "movie:1", &bad, None);
+        assert_eq!(m.message, "Imported 0 of 1. Failed (1): Show.S01E01.en.srt (no subtitle lines found).");
+        let big = d.path().join("big.en.srt");
+        std::fs::write(&big, vec![b'x'; crate::extsubs::MAX_FILE_BYTES + 1]).unwrap();
+        let m = import_movie(&mut store, "movie:1", &big, None);
+        assert_eq!(m.message, "Imported 0 of 1. Failed (1): big.en.srt (too large).");
+        assert!(!m.message.contains(d.path().to_string_lossy().as_ref()));
     }
 
     #[test]
