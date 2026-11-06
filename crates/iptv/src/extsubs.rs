@@ -142,18 +142,21 @@ impl ExtSubs {
         Ok(())
     }
 
-    pub fn remove(&mut self, key: &str, lang: &str) {
-        if self.blocked.is_some() {
-            return;
+    /// Forget the track. `Ok(false)` = there was none; `Err` = the index is
+    /// blocked (unreadable file), nothing was changed.
+    pub fn remove(&mut self, key: &str, lang: &str) -> Result<bool> {
+        if let Some(msg) = &self.blocked {
+            bail!("{msg}");
         }
-        let Some(list) = self.items.get_mut(key) else { return };
-        let Some(i) = list.iter().position(|s| s.lang == lang) else { return };
+        let Some(list) = self.items.get_mut(key) else { return Ok(false) };
+        let Some(i) = list.iter().position(|s| s.lang == lang) else { return Ok(false) };
         let old = list.remove(i);
         if list.is_empty() {
             self.items.remove(key);
         }
         self.pending_delete.push(old.file);
         self.dirty = true;
+        Ok(true)
     }
 
     pub fn set_delay(&mut self, key: &str, lang: &str, delay: f64, manual: bool) {
@@ -251,7 +254,8 @@ mod tests {
         let e = s.for_key("k").iter().find(|x| x.lang == "eng").unwrap().clone();
         assert_eq!((e.delay, e.manual), (0.0, false));
         assert_eq!(s.cue_starts_of(&e).len(), 4);
-        s.remove("k", "eng");
+        assert!(s.remove("k", "eng").unwrap());
+        assert!(!s.remove("k", "eng").unwrap(), "already gone");
         s.save_if_dirty().unwrap();
         assert_eq!(s.for_key("k").len(), 1);
         assert!(!s.path_of(&e).exists());
@@ -305,6 +309,7 @@ mod tests {
         });
         let err = s.add("k", "eng", &srt(1)).unwrap_err();
         assert!(err.to_string().contains("subtitles.json"));
+        assert!(s.remove("k", "eng").unwrap_err().to_string().contains("subtitles.json"));
         assert!(s.for_key("k").is_empty());
         assert!(!d.path().join("subtitles").exists());
         s.save_if_dirty().unwrap(); // nothing changed, nothing to write
@@ -321,7 +326,7 @@ mod tests {
         let old = s.path_of(&s.for_key("k")[0]);
         let gone = s.path_of(&s.for_key("j")[0]);
         s.add("k", "eng", &srt(3)).unwrap();
-        s.remove("j", "eng");
+        assert!(s.remove("j", "eng").unwrap());
         let r = ExtSubs::load(d.path());
         assert_eq!(r.for_key("k")[0].file, "00000001.srt");
         assert_eq!(r.for_key("j").len(), 1);

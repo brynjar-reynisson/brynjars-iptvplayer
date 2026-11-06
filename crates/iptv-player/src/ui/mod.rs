@@ -996,7 +996,11 @@ impl App {
         let key = pb.key().to_string();
         let stored = self.extsubs.for_key(&key).iter().find(|s| s.lang.eq_ignore_ascii_case(lang)).map(|s| s.lang.clone());
         let Some(stored) = stored else { return };
-        self.extsubs.remove(&key, &stored);
+        if let Err(e) = self.extsubs.remove(&key, &stored) {
+            // blocked index: nothing was removed, so no success notice
+            self.message = Some(safe_text(&format!("Could not remove the subtitles: {e:#}")));
+            return;
+        }
         if let Err(e) = self.extsubs.save_if_dirty() {
             self.message = Some(safe_text(&format!("Could not save subtitles: {e:#}")));
         } else {
