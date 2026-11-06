@@ -71,6 +71,32 @@ fn delay_for(selected: Option<(&str, &str)>, tracks: &[ImportedTrack]) -> f64 {
     }
 }
 
+/// What to do with mpv's secondary (reference) subtitle track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SecStep {
+    Nothing,
+    Set(i64),
+    Clear,
+}
+
+/// `wants`: an imported track with an auto-sync is selected. `attempted_gen`:
+/// generation the reference was last looked up for (0 = not since the
+/// selection moved here). A reference is (re)set once per generation and
+/// whenever the selection comes back to an imported track.
+fn secondary_needs_reference(wants: bool, attempted_gen: u32, generation: u32) -> bool {
+    wants && attempted_gen != generation
+}
+
+fn secondary_step(wants: bool, on: bool, attempted_gen: u32, generation: u32, reference: Option<i64>) -> SecStep {
+    if !wants {
+        return if on { SecStep::Clear } else { SecStep::Nothing };
+    }
+    match reference {
+        Some(id) if secondary_needs_reference(wants, attempted_gen, generation) => SecStep::Set(id),
+        _ => SecStep::Nothing,
+    }
+}
+
 fn make_autosync(t: &ImportedTrack, supported: bool) -> Option<AutoSync> {
     (supported && !t.manual).then(|| AutoSync::new(t.starts.clone(), t.delay))
 }
@@ -177,10 +203,12 @@ impl Player {
     }
 
     fn clear_secondary(&mut self) {
-        if self.secondary_on {
+        if secondary_step(false, self.secondary_on, self.secondary_gen, 0, None) == SecStep::Clear {
             self.sup.backend_mut().set_secondary_sub(None);
             self.secondary_on = false;
         }
+        // Coming back to an imported track must set the reference again.
+        self.secondary_gen = 0;
     }
 
     /// Imported subtitle files of the entry about to play (call right after
@@ -250,13 +278,14 @@ impl Player {
             return;
         };
         let generation = self.sup.generation();
-        if self.secondary_gen != generation {
-            self.secondary_gen = generation;
+        if secondary_needs_reference(true, self.secondary_gen, generation) {
             let prefer = self.want_sub.as_ref().and_then(|w| match w {
                 SubChoice::Track { lang, title, .. } if title.as_deref() != Some(IMPORTED_TITLE) => lang.clone(),
                 _ => None,
             });
-            if let Some(id) = pick_reference(&self.sup.backend().sub_tracks(), prefer.as_deref()) {
+            let reference = pick_reference(&self.sup.backend().sub_tracks(), prefer.as_deref());
+            self.secondary_gen = generation;
+            if let SecStep::Set(id) = secondary_step(true, self.secondary_on, 0, generation, reference) {
                 self.sup.backend_mut().set_secondary_sub(Some(id));
                 self.secondary_on = true;
             }
@@ -472,6 +501,70 @@ mod tests {
         let t = [track("eng", 1.5, false), track("fre", -2.0, true)];
         assert_eq!(delay_for(Some(("fre", IMPORTED_TITLE)), &t), -2.0);
         assert_eq!(delay_for(Some(("ENG", IMPORTED_TITLE)), &t), 1.5);
+    }
+
+    /// Drives the pure secondary-track logic like `run_autosync` /
+    /// `clear_secondary` do. Returns the step taken.
+    struct Sim {
+        on: bool,
+        gen_set: u32,
+    }
+    impl Sim {
+        fn frame(&mut self, wants: bool, generation: u32, reference: Option<i64>) -> SecStep {
+            if !wants {
+                let s = secondary_step(false, self.on, self.gen_set, 0, None);
+                self.on = false;
+                self.gen_set = 0;
+                return s;
+            }
+            if !secondary_needs_reference(true, self.gen_set, generation) {
+                return SecStep::Nothing;
+            }
+            self.gen_set = generation;
+            let s = secondary_step(true, self.on, 0, generation, reference);
+            if matches!(s, SecStep::Set(_)) {
+                self.on = true;
+            }
+            s
+        }
+    }
+
+    #[test]
+    fn reference_is_set_again_after_a_round_trip_in_one_generation() {
+        let mut s = Sim { on: false, gen_set: 0 };
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7));
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Nothing);
+        assert_eq!(s.frame(false, 1, Some(7)), SecStep::Clear);
+        assert_eq!(s.frame(false, 1, Some(7)), SecStep::Nothing);
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7));
+    }
+
+    #[test]
+    fn reference_is_set_again_after_a_reconnect() {
+        let mut s = Sim { on: false, gen_set: 0 };
+        assert_eq!(s.frame(true, 1, Some(7)), SecStep::Set(7));
+        assert_eq!(s.frame(true, 2, Some(8)), SecStep::Set(8));
+    }
+
+    #[test]
+    fn selection_off_clears_the_reference() {
+        assert_eq!(secondary_step(false, true, 3, 3, Some(7)), SecStep::Clear);
+        assert_eq!(secondary_step(false, false, 3, 3, Some(7)), SecStep::Nothing);
+    }
+
+    #[test]
+    fn no_reference_available_does_nothing() {
+        let mut s = Sim { on: false, gen_set: 0 };
+        assert_eq!(s.frame(true, 1, None), SecStep::Nothing);
+        assert_eq!(s.frame(true, 1, None), SecStep::Nothing);
+        assert!(!s.on);
+    }
+
+    #[test]
+    fn manual_track_wants_no_reference() {
+        // A manual track has no AutoSync, so `wants` is false for it.
+        let mut s = Sim { on: false, gen_set: 0 };
+        assert_eq!(s.frame(false, 1, Some(7)), SecStep::Nothing);
     }
 
     #[test]
