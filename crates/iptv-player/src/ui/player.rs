@@ -1,14 +1,16 @@
 //! Video playback: `Supervisor<MpvBackend>` + the libmpv GL renderer, drawn
 //! into an arbitrary rect with a status overlay. Never shows the URL.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use iptv::subtitles::{pick, SubChoice, SubTrack};
+use iptv::subtitles::{pick, pick_reference, SubChoice, SubTrack, IMPORTED_TITLE};
 use iptv::supervisor::{Status, Supervisor};
 
 use crate::mpv_backend::{GlInit, MpvBackend, MpvOptions, MpvRenderer};
+use crate::state::autosync::{AutoSync, Step};
 use crate::state::status_text;
 
 /// Streams taller than this (1080p) get [`TALL_TUNING`].
@@ -36,6 +38,43 @@ pub const TALL_TUNING: [(&str, &str); 10] = [
 /// How often the playback stats of a tall stream are logged.
 const STATS_EVERY: Duration = Duration::from_secs(5);
 
+/// An imported .srt of the playing entry, added to mpv on every load.
+#[derive(Debug, Clone)]
+pub struct ImportedTrack {
+    /// Canonical 3-letter language code.
+    pub lang: String,
+    pub path: PathBuf,
+    /// Seconds added to every cue.
+    pub delay: f64,
+    /// Set by hand: never auto-synced.
+    pub manual: bool,
+    /// Cue start times of the file (for auto-sync).
+    pub starts: Vec<f64>,
+}
+
+/// What the auto-sync / nudge did, for the app to report and persist.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncEvent {
+    Applied { lang: String, delay: f64 },
+    Unsure { lang: String },
+    Nudged { lang: String, delay: f64 },
+}
+
+/// The sub-delay to use for the selected track (lang, title): the imported
+/// track's delay, 0 for embedded tracks or none.
+fn delay_for(selected: Option<(&str, &str)>, tracks: &[ImportedTrack]) -> f64 {
+    match selected {
+        Some((lang, title)) if title == IMPORTED_TITLE => {
+            tracks.iter().find(|t| t.lang.eq_ignore_ascii_case(lang)).map_or(0.0, |t| t.delay)
+        }
+        _ => 0.0,
+    }
+}
+
+fn make_autosync(t: &ImportedTrack, supported: bool) -> Option<AutoSync> {
+    (supported && !t.manual).then(|| AutoSync::new(t.starts.clone(), t.delay))
+}
+
 pub struct Player {
     sup: Supervisor<MpvBackend>,
     renderer: Arc<MpvRenderer>,
@@ -55,6 +94,16 @@ pub struct Player {
     stats_at: Instant,
     /// For log timestamps.
     t0: Instant,
+    /// Imported subtitle files of the playing entry.
+    imported: Vec<ImportedTrack>,
+    /// Parallel to `imported`.
+    syncs: Vec<Option<AutoSync>>,
+    /// The secondary (reference) track is set in mpv.
+    secondary_on: bool,
+    /// Generation the secondary track was set for.
+    secondary_gen: u32,
+    warned_no_sync: bool,
+    events: Vec<SyncEvent>,
 }
 
 impl Player {
@@ -77,7 +126,7 @@ impl Player {
             .iter()
             .filter_map(|(k, _)| backend.property(k).map(|v| (*k, v)))
             .collect::<Vec<_>>();
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, tune_gen: 0, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, tune_gen: 0, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now(), imported: Vec::new(), syncs: Vec::new(), secondary_on: false, secondary_gen: 0, warned_no_sync: false, events: Vec::new() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -92,6 +141,9 @@ impl Player {
             self.paused = false;
         }
         self.want_sub = None;
+        self.clear_secondary();
+        self.imported.clear();
+        self.syncs.clear();
         if self.tuned {
             // A new stream starts untuned again; it is tuned when its size is known.
             let b = self.sup.backend_mut();
@@ -120,7 +172,110 @@ impl Player {
             self.sup.backend_mut().set_pause(false);
             self.paused = false;
         }
+        self.clear_secondary();
         self.sup.stop();
+    }
+
+    fn clear_secondary(&mut self) {
+        if self.secondary_on {
+            self.sup.backend_mut().set_secondary_sub(None);
+            self.secondary_on = false;
+        }
+    }
+
+    /// Imported subtitle files of the entry about to play (call right after
+    /// `set_want_sub`); replaces all imported state.
+    pub fn set_imported(&mut self, tracks: Vec<ImportedTrack>) {
+        self.clear_secondary();
+        let supported = !tracks.is_empty() && self.sup.backend().has_secondary_sub_start();
+        if !tracks.is_empty() && !supported && !self.warned_no_sync {
+            self.warned_no_sync = true;
+            eprintln!("subtitle auto-sync off: mpv lacks secondary-sub-start");
+        }
+        self.syncs = tracks.iter().map(|t| make_autosync(t, supported)).collect();
+        self.imported = tracks;
+        self.secondary_gen = 0;
+        self.events.clear();
+    }
+
+    /// Index of the imported track that is selected in mpv now.
+    fn selected_imported(&self) -> Option<usize> {
+        if self.imported.is_empty() {
+            return None;
+        }
+        let id = self.sup.backend().current_sub()?;
+        let tracks = self.sup.backend().sub_tracks();
+        let t = tracks.iter().find(|t| t.id == id)?;
+        if t.title.as_deref() != Some(IMPORTED_TITLE) {
+            return None;
+        }
+        let lang = t.lang.as_deref()?;
+        self.imported.iter().position(|i| i.lang.eq_ignore_ascii_case(lang))
+    }
+
+    pub fn current_imported(&self) -> Option<&ImportedTrack> {
+        self.selected_imported().map(|i| &self.imported[i])
+    }
+
+    /// Set mpv's sub-delay for the selected track (0 for embedded ones).
+    fn apply_delay(&mut self) {
+        let tracks = self.sup.backend().sub_tracks();
+        let sel = self.sup.backend().current_sub().and_then(|id| tracks.iter().find(|t| t.id == id));
+        let d = delay_for(sel.and_then(|t| Some((t.lang.as_deref()?, t.title.as_deref()?))), &self.imported);
+        self.sup.backend_mut().set_sub_delay(d);
+    }
+
+    /// Move the selected imported track's timing by `step` seconds by hand.
+    pub fn nudge(&mut self, step: f64) -> bool {
+        let Some(i) = self.selected_imported() else { return false };
+        let delay = self.imported[i].delay + step;
+        self.imported[i].delay = delay;
+        self.imported[i].manual = true;
+        self.syncs[i] = None;
+        self.sup.backend_mut().set_sub_delay(delay);
+        self.events.push(SyncEvent::Nudged { lang: self.imported[i].lang.clone(), delay });
+        true
+    }
+
+    /// Events (auto-sync results, nudges) since the last call.
+    pub fn poll_sync(&mut self) -> Vec<SyncEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Reference track + auto-sync feeding for the selected imported track.
+    fn run_autosync(&mut self) {
+        let sel = self.selected_imported().filter(|&i| self.syncs[i].is_some());
+        let Some(i) = sel else {
+            self.clear_secondary();
+            return;
+        };
+        let generation = self.sup.generation();
+        if self.secondary_gen != generation {
+            self.secondary_gen = generation;
+            let prefer = self.want_sub.as_ref().and_then(|w| match w {
+                SubChoice::Track { lang, title, .. } if title.as_deref() != Some(IMPORTED_TITLE) => lang.clone(),
+                _ => None,
+            });
+            if let Some(id) = pick_reference(&self.sup.backend().sub_tracks(), prefer.as_deref()) {
+                self.sup.backend_mut().set_secondary_sub(Some(id));
+                self.secondary_on = true;
+            }
+        }
+        if !self.secondary_on {
+            return;
+        }
+        let start = self.sup.backend().secondary_sub_start();
+        let Some(sync) = self.syncs[i].as_mut() else { return };
+        sync.observe(start);
+        match sync.step() {
+            Step::Nothing => {}
+            Step::Apply(d) => {
+                self.sup.backend_mut().set_sub_delay(d);
+                self.imported[i].delay = d;
+                self.events.push(SyncEvent::Applied { lang: self.imported[i].lang.clone(), delay: d });
+            }
+            Step::Unsure => self.events.push(SyncEvent::Unsure { lang: self.imported[i].lang.clone() }),
+        }
     }
 
     /// User pause: mpv `pause` property only (the backend never reports it
@@ -168,6 +323,10 @@ impl Player {
             .and_then(|id| self.sub_tracks().into_iter().find(|t| t.id == id))
             .map_or(SubChoice::Off, |t| SubChoice::of(&t));
         self.sup.backend_mut().set_sub(id);
+        self.apply_delay();
+        if self.selected_imported().is_none() {
+            self.clear_secondary();
+        }
         self.want_sub = Some(choice.clone());
         self.sub_gen = self.sup.generation();
         choice
@@ -198,11 +357,25 @@ impl Player {
         // Apply the wanted subtitles once per load, as soon as it plays.
         if self.sup.status() == Status::Playing && self.sub_gen != self.sup.generation() {
             self.sub_gen = self.sup.generation();
+            // A new load forgets added files and the secondary track.
+            self.secondary_on = false;
+            for t in &self.imported {
+                if t.path.exists() {
+                    self.sup.backend_mut().sub_add(&t.path, &t.lang);
+                } else {
+                    let name = t.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    eprintln!("imported subtitle missing: {name}");
+                }
+            }
             if let Some(want) = &self.want_sub {
                 if let Some(sel) = pick(&self.sup.backend().sub_tracks(), want) {
                     self.sup.backend_mut().set_sub(sel);
                 }
             }
+            self.apply_delay();
+        }
+        if self.sup.status() == Status::Playing && !self.imported.is_empty() {
+            self.run_autosync();
         }
         // Tall (above 1080p) video: tune the decoder and renderer once per
         // stream when its size is known. A reconnect (new generation, same
@@ -275,5 +448,36 @@ impl Player {
     pub fn shutdown(&mut self, gl: Option<&eframe::glow::Context>) {
         self.sup.stop();
         self.renderer.destroy(gl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(lang: &str, delay: f64, manual: bool) -> ImportedTrack {
+        ImportedTrack { lang: lang.into(), path: PathBuf::from("x.srt"), delay, manual, starts: vec![1.0, 2.0] }
+    }
+
+    #[test]
+    fn delay_resets_for_embedded_tracks() {
+        let t = [track("eng", 1.5, false)];
+        assert_eq!(delay_for(Some(("eng", "Commentary")), &t), 0.0);
+        assert_eq!(delay_for(Some(("fre", IMPORTED_TITLE)), &t), 0.0);
+        assert_eq!(delay_for(None, &t), 0.0);
+    }
+
+    #[test]
+    fn delay_follows_the_selected_imported_track() {
+        let t = [track("eng", 1.5, false), track("fre", -2.0, true)];
+        assert_eq!(delay_for(Some(("fre", IMPORTED_TITLE)), &t), -2.0);
+        assert_eq!(delay_for(Some(("ENG", IMPORTED_TITLE)), &t), 1.5);
+    }
+
+    #[test]
+    fn manual_track_gets_no_autosync() {
+        assert!(make_autosync(&track("eng", 0.0, true), true).is_none());
+        assert!(make_autosync(&track("eng", 0.0, false), false).is_none());
+        assert!(make_autosync(&track("eng", 0.0, false), true).is_some());
     }
 }

@@ -38,6 +38,7 @@ use iptv::schedule::{self, Schedule, Schedules, DAY_NAMES};
 use iptv::handoff;
 use iptv::rec_merge;
 use iptv::tasks;
+use iptv::extsubs::ExtSubs;
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
@@ -76,7 +77,7 @@ const SEEK_BAR_H: f32 = 28.0;
 /// How long the preview stays above the dot after an arrow-key seek.
 const KEY_PREVIEW: Duration = Duration::from_millis(1500);
 use live::{ListView, RowAction};
-use player::Player;
+use player::{ImportedTrack, Player};
 
 /// Command-line options.
 pub struct Options {
@@ -398,6 +399,8 @@ struct App {
     fav_view: ListView,
     /// `settings.json` (hidden movie/series groups).
     settings: Settings,
+    /// Imported subtitle files (`subtitles.json`).
+    extsubs: ExtSubs,
     hidden: Hidden,
     movies: SearchList,
     series: SeriesBrowser,
@@ -469,6 +472,7 @@ impl App {
         }
         let restore = last_view.get().cloned();
         let settings = Settings::load(&opts.data_dir);
+        let extsubs = ExtSubs::load(&opts.data_dir);
         // Leftovers of an export that was killed: best effort, off the UI thread.
         if let Some(dir) = settings.export_dir().map(PathBuf::from).filter(|d| d.is_dir()) {
             std::thread::spawn(move || iptv::export::sweep_parts(&dir));
@@ -574,6 +578,7 @@ impl App {
             channel_view: ListView::default(),
             fav_view: ListView::default(),
             settings,
+            extsubs,
             hidden,
             movies: SearchList::new(SearchScope::Movies),
             series: SeriesBrowser::default(),
@@ -871,6 +876,22 @@ impl App {
                 p.play_from(pb.url(), pb.is_live(), resume);
                 let pref = Self::sub_show(&pb).and_then(|show| self.settings.sub_pref(&show).cloned());
                 p.set_want_sub(pref);
+                let imported = if pb.is_live() || pb.is_local() {
+                    Vec::new()
+                } else {
+                    self.extsubs
+                        .for_key(pb.key())
+                        .iter()
+                        .map(|s| ImportedTrack {
+                            lang: s.lang.clone(),
+                            path: self.extsubs.path_of(s),
+                            delay: s.delay,
+                            manual: s.manual,
+                            starts: self.extsubs.cue_starts_of(s),
+                        })
+                        .collect()
+                };
+                p.set_imported(imported);
             }
             Err(e) => self.message = Some(format!("Playback unavailable: {e}")),
         }
