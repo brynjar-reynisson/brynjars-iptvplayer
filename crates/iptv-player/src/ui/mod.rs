@@ -2036,9 +2036,9 @@ impl App {
                 skip_intro::Action::None => {}
                 skip_intro::Action::Scan { job, which, times } => {
                     let (name, url, episode, suffix) = match which {
-                        Which::Own => ("own", Some(&self.intro_urls.0), Some(&self.intro_names.0), "intro"),
+                        Which::Own | Which::OwnMore => ("own", Some(&self.intro_urls.0), Some(&self.intro_names.0), "intro"),
                         Which::Refine => ("refine", Some(&self.intro_urls.0), Some(&self.intro_names.0), "intro"),
-                        Which::Reference => {
+                        Which::Reference | Which::ReferenceMore => {
                             ("reference", self.intro_urls.1.as_ref(), self.intro_names.1.as_ref(), "intro-ref")
                         }
                     };

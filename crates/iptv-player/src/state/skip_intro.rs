@@ -1,6 +1,6 @@
 //! Skip-intro flow (pure). See the module tests for the sequence.
 
-use iptv::intro::{find_intro, find_intro_pair, is_blank, scan_times, Prints, INTRO_STEP_SECS};
+use iptv::intro::{extend_times, find_intro_pair, is_blank, scan_times, Prints, INTRO_STEP_SECS};
 
 pub const REFINE_SECS: f64 = 24.0;
 pub const MAX_EXTEND_SECS: f64 = 20.0;
@@ -10,7 +10,11 @@ pub const REF_MARGIN_SECS: f64 = 8.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Which {
     Own,
+    /// More frames of the playing episode: its intro was still running at the
+    /// end of the previous scan.
+    OwnMore,
     Reference,
+    ReferenceMore,
     Refine,
 }
 
@@ -19,6 +23,18 @@ pub enum Action {
     None,
     Scan { job: u64, which: Which, times: Vec<f64> },
     SaveReference(Prints),
+}
+
+/// Merge a scan's frames into the ones already taken, time-sorted.
+fn merge(into: &mut Prints, more: Prints) {
+    into.extend(more);
+    into.sort_by(|a, b| a.0.total_cmp(&b.0));
+}
+
+/// Did a matched run of `prints` end at its last sample (`span_end` = last
+/// matched time + half a step)? Then the intro may go on beyond the scan.
+fn touches_end(span_end: f64, prints: &Prints) -> bool {
+    prints.last().is_some_and(|(last, _)| span_end - INTRO_STEP_SECS / 2.0 >= last - 0.5)
 }
 
 /// Frame times (1 s steps) for the refinement scan: from the last matched
@@ -124,7 +140,10 @@ pub struct SkipIntro {
     next_job: u64,
     stored: Option<Prints>,
     has_neighbour: bool,
-    own: Option<Prints>,
+    own: Prints,
+    /// The neighbour episode's frames (first time for a show, or a stored
+    /// reference that did not match).
+    reference: Option<Prints>,
     /// Refine scan queued behind a `SaveReference`.
     pending: Option<Action>,
     /// Intro span in the own timeline (start, end) once found.
@@ -139,7 +158,7 @@ impl Default for SkipIntro {
 
 impl SkipIntro {
     pub fn new() -> SkipIntro {
-        SkipIntro { phase: Phase::Off, next_job: 0, stored: None, has_neighbour: false, own: None, pending: None, span: None }
+        SkipIntro { phase: Phase::Off, next_job: 0, stored: None, has_neighbour: false, own: Vec::new(), reference: None, pending: None, span: None }
     }
 
     /// An episode starts. Neither a stored reference nor a neighbour = Off.
@@ -193,30 +212,13 @@ impl SkipIntro {
             _ => return Action::None,
         };
         match which {
-            Which::Own => {
-                if let Some(stored) = self.stored.take() {
-                    match find_intro(&prints, &stored) {
-                        Some(span) => self.start_refine(span.start, span.end, duration),
-                        None => self.off(),
-                    }
-                } else if self.has_neighbour {
-                    self.own = Some(prints);
-                    self.scan(Which::Reference, scan_times(duration))
-                } else {
-                    self.off()
-                }
+            Which::Own | Which::OwnMore => {
+                merge(&mut self.own, prints);
+                self.evaluate(duration)
             }
-            Which::Reference => {
-                let own = self.own.take().unwrap_or_default();
-                match find_intro_pair(&own, &prints) {
-                    Some((span, ref_span)) => {
-                        // The Refine scan is queued; the next `update` returns it.
-                        let scan = self.start_refine(span.start, span.end, duration);
-                        self.pending = Some(scan);
-                        Action::SaveReference(intro_window(prints, ref_span.start, ref_span.end))
-                    }
-                    None => self.off(),
-                }
+            Which::Reference | Which::ReferenceMore => {
+                merge(self.reference.get_or_insert_with(Vec::new), prints);
+                self.evaluate(duration)
             }
             Which::Refine => {
                 let (start, end) = self.span.unwrap_or((0.0, 0.0));
@@ -224,6 +226,64 @@ impl SkipIntro {
                 Action::None
             }
         }
+    }
+
+    /// Decide with the frames taken so far: match the playing episode against
+    /// the stored reference, else against the neighbour episode (also when the
+    /// stored reference does not match: a new season may have a new title
+    /// sequence, and the neighbour's intro then replaces it). A matched run
+    /// that reaches the end of a scan asks for more frames first.
+    fn evaluate(&mut self, duration: f64) -> Action {
+        if let Some(found) = self.stored.as_ref().map(|s| find_intro_pair(&self.own, s)) {
+            match found {
+                Some((span, _)) => {
+                    if let Some(more) = self.more_own(span.end, duration) {
+                        return more;
+                    }
+                    return self.start_refine(span.start, span.end, duration);
+                }
+                None => self.stored = None,
+            }
+        }
+        if !self.has_neighbour {
+            return self.off();
+        }
+        let Some(reference) = &self.reference else {
+            return self.scan(Which::Reference, scan_times(duration));
+        };
+        let ref_edge = |end: f64| touches_end(end, reference).then(|| reference.last().map_or(0.0, |p| p.0));
+        match find_intro_pair(&self.own, reference).map(|(s, r)| (s, r, ref_edge(r.end))) {
+            Some((span, ref_span, ref_edge)) => {
+                if let Some(more) = self.more_own(span.end, duration) {
+                    return more;
+                }
+                if let Some(last) = ref_edge {
+                    let times = extend_times(last, duration);
+                    if !times.is_empty() {
+                        return self.scan(Which::ReferenceMore, times);
+                    }
+                }
+                let reference = self.reference.take().unwrap_or_default();
+                // The Refine scan is queued; the next `update` returns it.
+                let scan = self.start_refine(span.start, span.end, duration);
+                self.pending = Some(scan);
+                Action::SaveReference(intro_window(reference, ref_span.start, ref_span.end))
+            }
+            None => self.off(),
+        }
+    }
+
+    /// An extension scan of the playing episode when its intro ran to the end
+    /// of what was scanned (and there is more to scan).
+    fn more_own(&mut self, span_end: f64, duration: f64) -> Option<Action> {
+        if !touches_end(span_end, &self.own) {
+            return None;
+        }
+        let times = extend_times(self.own.last().map_or(0.0, |p| p.0), duration);
+        if times.is_empty() {
+            return None;
+        }
+        Some(self.scan(Which::OwnMore, times))
     }
 
     fn start_refine(&mut self, start: f64, end: f64, duration: f64) -> Action {
@@ -456,6 +516,102 @@ mod tests {
         let (start, end) = s.span().unwrap();
         assert_eq!(start, START);
         assert!(end >= END && end <= END + REF_MARGIN_SECS, "end {end}");
+    }
+
+    fn tail(p: Prints, from: f64) -> Prints {
+        p.into_iter().filter(|(t, _)| *t >= from).collect()
+    }
+
+    #[test]
+    fn an_intro_running_past_the_scan_end_extends_the_own_scan() {
+        // 40 intro frames (12..170 s); the first scan stops at 128 s.
+        let mut s = SkipIntro::new();
+        s.arm(Some(episode(40, 150, 60)), false);
+        let job = job_of(&s.update(Some(2700.0)));
+        let a = s.on_result(job, episode(40, 100, 33), 2700.0);
+        let (more, times) = match a {
+            Action::Scan { job, which: Which::OwnMore, times } => (job, times),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(times.first(), Some(&132.0));
+        assert_eq!(times.last(), Some(&248.0));
+        // The rest arrives: now the whole intro is known.
+        let a = s.on_result(more, tail(episode(40, 100, 60), 132.0), 2700.0);
+        match a {
+            Action::Scan { which: Which::Refine, times, .. } => assert_eq!(times, refine_times(170.0, 2700.0)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_intro_that_ends_inside_the_scan_is_not_extended() {
+        let mut s = SkipIntro::new();
+        s.arm(Some(episode(20, 150, 40)), false);
+        let job = job_of(&s.update(Some(2700.0)));
+        let a = s.on_result(job, episode(20, 100, 40), 2700.0);
+        assert!(matches!(a, Action::Scan { which: Which::Refine, .. }), "{a:?}");
+    }
+
+    #[test]
+    fn a_stored_reference_that_does_not_match_falls_back_to_the_neighbour() {
+        // e.g. a new season with a re-cut title sequence
+        let mut s = SkipIntro::new();
+        s.arm(Some(unrelated(200)), true);
+        let job = job_of(&s.update(Some(2700.0)));
+        let a = s.on_result(job, episode(20, 100, 40), 2700.0);
+        let ref_job = match a {
+            Action::Scan { job, which: Which::Reference, .. } => job,
+            other => panic!("{other:?}"),
+        };
+        let a = s.on_result(ref_job, episode(20, 150, 40), 2700.0);
+        assert!(matches!(a, Action::SaveReference(_)), "the new reference replaces the old one: {a:?}");
+        assert!(matches!(s.update(Some(2700.0)), Action::Scan { which: Which::Refine, .. }));
+    }
+
+    #[test]
+    fn a_neighbour_intro_running_past_its_scan_end_extends_the_reference_scan() {
+        let mut s = SkipIntro::new();
+        s.arm(None, true);
+        let job = job_of(&s.update(Some(2700.0)));
+        let ref_job = job_of(&s.on_result(job, episode(40, 100, 60), 2700.0));
+        let a = s.on_result(ref_job, episode(40, 150, 33), 2700.0);
+        let more = match a {
+            Action::Scan { job, which: Which::ReferenceMore, times } => {
+                assert_eq!(times.first(), Some(&132.0));
+                job
+            }
+            other => panic!("{other:?}"),
+        };
+        let Action::SaveReference(saved) = s.on_result(more, tail(episode(40, 150, 60), 132.0), 2700.0) else {
+            panic!("expected SaveReference")
+        };
+        // The whole intro (12..170) plus the margin was kept, not just the first part.
+        assert_eq!(saved.last().map(|p| p.0), Some(176.0));
+    }
+
+    #[test]
+    fn extensions_stop_at_the_cap() {
+        // intro frames run to the end of every scan: after the cap there is no more scan
+        let mut s = SkipIntro::new();
+        s.arm(Some(episode(200, 150, 200)), false);
+        let mut job = job_of(&s.update(Some(2700.0)));
+        let mut have = 100; // 0..396 s
+        let mut rounds = 0;
+        loop {
+            let a = s.on_result(job, episode(200, 100, have), 2700.0);
+            match a {
+                Action::Scan { job: j, which: Which::OwnMore, times } => {
+                    rounds += 1;
+                    assert!(*times.last().unwrap() <= 640.0);
+                    job = j;
+                    have = (times.last().unwrap() / 4.0) as usize + 1;
+                }
+                Action::Scan { which: Which::Refine, .. } => break,
+                other => panic!("{other:?}"),
+            }
+            assert!(rounds < 10);
+        }
+        assert!(rounds >= 1);
     }
 
     #[test]

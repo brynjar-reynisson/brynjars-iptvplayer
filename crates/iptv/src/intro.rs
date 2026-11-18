@@ -2,7 +2,13 @@
 //! Pure functions, no I/O.
 
 pub const INTRO_STEP_SECS: f64 = 4.0;
-pub const INTRO_SCAN_SECS: f64 = 240.0;
+/// How far into an episode the first intro scan looks. Season 3 of one show
+/// opens with a cold open of up to ~6 minutes before the title sequence.
+pub const INTRO_SCAN_SECS: f64 = 400.0;
+/// An intro still running at the end of a scan extends it by this much...
+pub const EXTEND_SECS: f64 = 120.0;
+/// ...but never beyond this many seconds into the episode.
+pub const MAX_SCAN_SECS: f64 = 640.0;
 pub const MIN_INTRO_SECS: f64 = 20.0;
 pub const MATCH_DIST: f64 = 12.0;
 /// Frames whose brightest and darkest cell differ by less than this are flat
@@ -114,6 +120,23 @@ pub fn scan_times(duration: f64) -> Vec<f64> {
         }
         v.push(t);
         i += 1;
+    }
+    v
+}
+
+/// Sample times after `last` (the last sampled time) for extending a scan whose
+/// intro was still running at its end: `EXTEND_SECS` more, never beyond
+/// `MAX_SCAN_SECS` or `duration - 3`. Empty when there is nothing left to scan.
+pub fn extend_times(last: f64, duration: f64) -> Vec<f64> {
+    if !duration.is_finite() || !last.is_finite() {
+        return Vec::new();
+    }
+    let limit = (last + EXTEND_SECS).min(MAX_SCAN_SECS).min(duration - 3.0);
+    let mut v = Vec::new();
+    let mut t = last + INTRO_STEP_SECS;
+    while t <= limit {
+        v.push(t);
+        t += INTRO_STEP_SECS;
     }
     v
 }
@@ -319,14 +342,27 @@ mod tests {
     }
 
     #[test]
-    fn scan_times_cover_four_minutes() {
+    fn scan_times_cover_the_first_400_seconds() {
         let t = scan_times(2700.0);
         assert_eq!(&t[..2], &[0.0, 4.0]);
-        assert_eq!(*t.last().unwrap(), 240.0);
-        assert_eq!(t.len(), 61);
+        assert_eq!(*t.last().unwrap(), 400.0);
+        assert_eq!(t.len(), 101);
         assert_eq!(*scan_times(100.0).last().unwrap(), 96.0);
         assert!(scan_times(29.0).is_empty());
         assert!(scan_times(f64::NAN).is_empty());
+    }
+
+    #[test]
+    fn extend_times_continue_after_the_last_sample_within_the_caps() {
+        let t = extend_times(400.0, 2700.0);
+        assert_eq!(t.first(), Some(&404.0));
+        assert_eq!(t.last(), Some(&520.0));
+        assert_eq!(t.len(), 30);
+        // the hard cap and the end of the file
+        assert_eq!(extend_times(600.0, 2700.0).last(), Some(&640.0));
+        assert!(extend_times(640.0, 2700.0).is_empty());
+        assert_eq!(extend_times(400.0, 410.0).last(), Some(&404.0));
+        assert!(extend_times(400.0, f64::NAN).is_empty());
     }
 
     #[test]
