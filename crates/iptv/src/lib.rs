@@ -29,3 +29,4 @@ pub mod subsync;
 pub mod subimport;
 pub mod extsubs;
 pub mod share;
+pub mod share_server;
