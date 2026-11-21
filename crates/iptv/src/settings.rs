@@ -40,7 +40,7 @@ const MAX_SUB_PREFS: usize = 1000;
 
 /// Settings store. Each instance is an in-memory copy; `save` rewrites the
 /// whole file.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Settings {
     dir: PathBuf,
     /// Group titles (e.g. `Movies: Arabic`) hidden from Movies/Series results,
@@ -57,6 +57,21 @@ pub struct Settings {
     /// Set when an unreadable settings.json could not be moved aside; `save`
     /// then refuses so the original is never overwritten.
     blocked: Option<String>,
+}
+
+impl std::fmt::Debug for Settings {
+    // Manual: `share_token` is a secret and must never reach a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("dir", &self.dir)
+            .field("hidden_groups", &self.hidden_groups)
+            .field("sub_prefs", &self.sub_prefs)
+            .field("autoplay_next", &self.autoplay_next)
+            .field("export_dir", &self.export_dir)
+            .field("share_token", &self.share_token.as_ref().map(|_| "<redacted>"))
+            .field("blocked", &self.blocked)
+            .finish()
+    }
 }
 
 pub fn path_in(dir: &Path) -> PathBuf {
@@ -351,5 +366,16 @@ mod tests {
         s.save().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert!(v.get("share_token").is_none());
+    }
+
+    #[test]
+    fn debug_never_shows_the_share_token() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Settings::load(d.path());
+        s.set_share_token("0123456789abcdef0123456789abcdef");
+        let text = format!("{:?}", s);
+        assert!(!text.contains("0123456789abcdef"));
+        assert!(text.contains("<redacted>"));
+        assert!(!format!("{:?}", Settings::load(d.path())).contains("<redacted>"));
     }
 }

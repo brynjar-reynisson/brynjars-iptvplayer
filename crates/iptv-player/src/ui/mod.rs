@@ -1612,7 +1612,7 @@ impl App {
             Some(e) => format!("Sharing: {link} (link copied; could not save the token: {e})"),
         });
         self.share_server = Some(server);
-        self.share_awake = Some(KeepAwake::new());
+        self.share_awake = Some(KeepAwake::with_display());
         self.share_ffmpeg = Some(ffmpeg);
         self.share_tap_port = tap_port;
         self.sharer = Sharer::new();

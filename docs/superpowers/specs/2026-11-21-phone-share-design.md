@@ -4,7 +4,7 @@ Status: implemented (2026-11-21), branch `feature/phone-share`; plan: `docs/supe
 
 ## Intent
 The user wants to leave the computer while an important live game plays and keep watching it on a phone, in the
-phone's browser, through a name they route themselves (`iptv.breynisson.org` -> `localhost:<port>`). The PC keeps
+phone's browser, through a name they route themselves (`iptv.example.org` -> `localhost:<port>`). The PC keeps
 playing in the player; the phone shows the same channel. A delay of 6-10 s is fine. Used rarely (one match), by the
 user alone.
 

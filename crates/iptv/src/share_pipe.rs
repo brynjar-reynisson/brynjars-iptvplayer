@@ -83,14 +83,14 @@ pub fn segment_count(dir: &Path) -> u64 {
     seq.saturating_add(listed)
 }
 
-/// Delete the share files (`seg-*.ts`, `live.m3u8`, `ffmpeg.log`) directly in
-/// `dir`; nothing else, no recursion.
+/// Delete the share files (`seg-*.ts`, `live.m3u8`) directly in `dir`; nothing
+/// else, no recursion. `ffmpeg.log` is kept on purpose (diagnostics after a
+/// stop; `Pipe::start` truncates it on the next start).
 pub fn sweep(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let ours = name == "live.m3u8"
-            || name == "ffmpeg.log"
             || (name.starts_with("seg-") && name.ends_with(".ts"));
         if ours && e.file_type().is_ok_and(|t| t.is_file()) {
             let _ = std::fs::remove_file(e.path());
@@ -125,7 +125,7 @@ mod tests {
         let mut left: Vec<String> =
             std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, vec!["keep.txt".to_string(), "sub".to_string()]);
+        assert_eq!(left, vec!["ffmpeg.log".to_string(), "keep.txt".to_string(), "sub".to_string()]);
         assert!(d.join("sub").join("seg-3.ts").exists());
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn share_host_trims_and_rejects_scheme() {
         assert_eq!(load_with("").unwrap().share_host, None);
-        assert_eq!(load_with("share_host = \" iptv.breynisson.org \"\n").unwrap().share_host.as_deref(), Some("iptv.breynisson.org"));
+        assert_eq!(load_with("share_host = \" iptv.example.org \"\n").unwrap().share_host.as_deref(), Some("iptv.example.org"));
         assert_eq!(load_with("share_host = \"host-1.org:8443\"\n").unwrap().share_host.as_deref(), Some("host-1.org:8443"));
         assert_eq!(load_with("share_host = \"  \"\n").unwrap().share_host, None);
         for extra in ["share_host = \"https://x.org\"\n", "share_host = \"a b\"\n", "share_host = \"x.org/p\"\n", "share_host = 5\n"] {

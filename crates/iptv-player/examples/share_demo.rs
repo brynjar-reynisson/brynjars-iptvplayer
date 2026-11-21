@@ -202,6 +202,17 @@ fn ffprobe_codecs(file: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).replace("\r", "").lines().map(str::trim).collect::<Vec<_>>().join(",")
 }
 
+/// Kills every ffmpeg of the demo (source and pipe, found by their ports) when
+/// dropped, so a panic or an early `?` never leaves one behind.
+struct Cleanup;
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        kill_ffmpeg(&format!("127.0.0.1:{SRC_PORT}"));
+        kill_ffmpeg(&format!("127.0.0.1:{TAP_PORT}"));
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     for p in [SRC_PORT, SHARE_PORT, TAP_PORT] {
         if !port_free(p) {
@@ -213,6 +224,7 @@ fn main() -> anyhow::Result<()> {
         println!("ffmpeg not found");
         std::process::exit(2);
     };
+    let _cleanup = Cleanup;
     let data = std::env::temp_dir().join("share-demo");
     let _ = std::fs::remove_dir_all(&data);
     let share_dir = data.join("share");
@@ -345,6 +357,7 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     } else {
         println!("RESULT: {} CHECK(S) FAILED", c.failed);
+        drop(_cleanup); // process::exit skips destructors
         std::process::exit(1);
     }
 }

@@ -233,7 +233,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   or if a card cannot be made, the pieces are just glued together with no card; then the shown
   length of a recording that was handed over between the app and the recorder can be wrong (hours
   too long), because their timestamps differ. With ffmpeg the join makes them continuous. Shorter gaps get no card.
-  Providers like yours allow one connection per account (a second one makes the provider cut the
+  Many providers allow only one connection per account (a second one makes the provider cut the
   first, over and over), so only one of "the app" and "the recorder" ever holds it: if the app is
   open and playing when a window opens (it claims the recording up to 45 seconds before, so the
   recorder never connects at the first second), and it is the scheduled channel, the app records it itself (badge
@@ -270,7 +270,7 @@ channel to a phone browser. The app copies a link to the clipboard; open it on t
 page plays the channel (a delay of 6-10 seconds is normal). Press S again, Esc, or close the app to
 stop; nothing stays behind (no ffmpeg, no open port, no video files).
 
-- **No second connection.** Providers like yours allow one connection per account, so sharing
+- **No second connection.** Many providers allow only one connection per account, so sharing
   does not open one. It copies the stream the player already receives (through a local
   ffmpeg that cuts it into small HLS pieces, without re-encoding) and a tiny web server on
   `127.0.0.1:8480` hands those out. The pieces are kept in `share/` in the data directory
@@ -283,6 +283,13 @@ stop; nothing stays behind (no ffmpeg, no open port, no video files).
   stream, so both must be free). Without `share_host` the link is `http://localhost:8480/...`.
 - **The link contains a secret** (a random 128-bit token kept in `settings.json`). Anyone who has the
   link can watch while sharing is on, so do not post it. Wrong or missing token = an empty 404.
+  The token is part of the URL, so it also appears in the access logs of your reverse proxy.
+- **Changing the link.** There is no "new link" button yet. Close the app, delete the
+  `share_token` entry from `settings.json`, and start sharing again: a new token is made and
+  the old link stops working.
+- **Before an important game.** Make sure no scheduled recording overlaps it: a scheduled
+  recording that starts ends sharing, and the phone then just shows "waiting". Keep the PC on AC
+  power: while sharing is on the display is kept on too (otherwise Windows may suspend the PC).
 - **Limits.** Live channels only (not movies or episodes); viewing only (no controls for the phone);
   no transcoding, so the phone must be able to play the channel's H.264/AAC (HEVC or 4K channels
   show no picture on most phones); needs `ffmpeg` (next to `iptv-player.exe` or on the PATH); the PC must
