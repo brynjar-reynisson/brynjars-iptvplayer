@@ -343,6 +343,8 @@ struct App {
     share_ffmpeg: Option<PathBuf>,
     share_tap_port: u16,
     share_budget: RestartBudget,
+    /// Player generation of the last pipe start.
+    share_pipe_gen: Option<u32>,
     /// Last `segment_count` read and when (read at most every 500 ms).
     share_segs: (Instant, u64),
     /// Player generation the recorder last saw (a change = the stream reloaded).
@@ -558,6 +560,7 @@ impl App {
             share_ffmpeg: None,
             share_tap_port: 0,
             share_budget: RestartBudget::default(),
+            share_pipe_gen: None,
             share_segs: (Instant::now(), 0),
             rec_gen: 0,
             rec_free: None,
@@ -1614,6 +1617,7 @@ impl App {
         self.share_tap_port = tap_port;
         self.sharer = Sharer::new();
         self.share_budget = RestartBudget::default();
+        self.share_pipe_gen = None;
         self.share_segs = (Instant::now() - Duration::from_secs(1), 0);
         eprintln!("share: started");
     }
@@ -1672,7 +1676,9 @@ impl App {
                 if let Some(mut old) = self.share_pipe.take() {
                     old.stop();
                 }
-                if restart && self.share_budget.record(now) {
+                let gen = p.generation();
+                let prev = self.share_pipe_gen.replace(gen);
+                if restart && self.share_budget.on_restart(now, prev, gen) {
                     self.stop_share(Some("Sharing stopped: ffmpeg keeps failing (see share/ffmpeg.log)".into()));
                     return;
                 }

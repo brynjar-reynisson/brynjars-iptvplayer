@@ -189,6 +189,19 @@ impl RestartBudget {
         self.times.len() >= MAX_RESTARTS
     }
 
+    /// A restart of the pipe at player generation `gen`; `prev_gen` is the
+    /// generation of the previous start. The same generation means the pipe
+    /// died or stalled (counts); a new one is a channel switch or reconnect
+    /// (does not count, clears the history). True = too many failures.
+    pub fn on_restart(&mut self, now: Instant, prev_gen: Option<u32>, gen: u32) -> bool {
+        if prev_gen == Some(gen) {
+            self.record(now)
+        } else {
+            self.reset();
+            false
+        }
+    }
+
     /// Segments appeared: the pipe works, forget earlier failures.
     pub fn reset(&mut self) {
         self.times.clear();
@@ -426,6 +439,33 @@ mod tests {
         assert_eq!(s.state_name(), "live");
         s.poll(t + PIPE_WAIT + ms(600), inp(true, 2, true, 5)); // StopPipe
         assert!(!s.is_live());
+    }
+
+    #[test]
+    fn restarts_count_only_for_the_same_generation() {
+        let t = Instant::now();
+        let at = |k: u64| t + Duration::from_secs(k);
+        // Zapping: a new generation each time never trips.
+        let mut b = RestartBudget::default();
+        for k in 0..20u32 {
+            assert!(!b.on_restart(at(k as u64), Some(k), k + 1));
+        }
+        // The same generation 5 times trips on the 5th.
+        let mut b = RestartBudget::default();
+        for k in 0..MAX_RESTARTS - 1 {
+            assert!(!b.on_restart(at(k as u64 * 3), Some(7), 7));
+        }
+        assert!(b.on_restart(at(13), Some(7), 7));
+        // A zap in between clears the failures.
+        let mut b = RestartBudget::default();
+        for k in 0..MAX_RESTARTS - 1 {
+            assert!(!b.on_restart(at(k as u64), Some(7), 7));
+        }
+        assert!(!b.on_restart(at(5), Some(7), 8));
+        for k in 0..MAX_RESTARTS - 1 {
+            assert!(!b.on_restart(at(6 + k as u64), Some(8), 8));
+        }
+        assert!(b.on_restart(at(11), Some(8), 8));
     }
 
     #[test]
