@@ -4,7 +4,7 @@
 use crate::share::{self, Route, Viewers};
 use anyhow::Context;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PAGE: &str = include_str!("../assets/share.html");
@@ -33,7 +34,6 @@ struct Shared {
 
 pub struct Server {
     shared: Arc<Shared>,
-    addr: SocketAddr,
     accept: Option<JoinHandle<()>>,
 }
 
@@ -49,7 +49,6 @@ impl Server {
                 anyhow::anyhow!("could not listen on port {port}: {e}")
             }
         })?;
-        let addr = listener.local_addr().context("local address")?;
         let shared = Arc::new(Shared {
             token,
             dir,
@@ -63,7 +62,7 @@ impl Server {
             .name("share-accept".into())
             .spawn(move || accept_loop(listener, sh))
             .context("start share thread")?;
-        Ok(Server { shared, addr, accept: Some(accept) })
+        Ok(Server { shared, accept: Some(accept) })
     }
 
     pub fn set_status(&self, channel: &str, live: bool) {
@@ -83,9 +82,14 @@ impl Server {
     fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.accept.take() {
-            // Wake the blocking accept().
-            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(500));
-            let _ = h.join();
+            // The accept loop polls the stop flag every ACCEPT_POLL; wait at most 2 s, then detach.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -97,11 +101,25 @@ impl Drop for Server {
 }
 
 fn accept_loop(listener: TcpListener, sh: Arc<Shared>) {
-    for conn in listener.incoming() {
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    loop {
         if sh.stop.load(Ordering::SeqCst) {
             break;
         }
-        let Ok(stream) = conn else { continue };
+        let stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            Err(_) => {
+                std::thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+        };
+        let _ = stream.set_nonblocking(false);
         if sh.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             sh.active.fetch_sub(1, Ordering::SeqCst);
             let _ = stream.shutdown(Shutdown::Both);
@@ -432,6 +450,33 @@ mod tests {
         s.stop();
         assert!(t.elapsed() < Duration::from_secs(2));
         TcpListener::bind(("127.0.0.1", port)).expect("port free after stop");
+    }
+
+    #[test]
+    fn stop_is_bounded_and_drop_releases_the_port() {
+        let (s, port, _d) = start("bounded");
+        // An idle client holding a connection must not delay stop.
+        let _c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let t = Instant::now();
+        s.stop();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let (s2, port2, _d2) = start("dropped");
+        drop(s2);
+        TcpListener::bind(("127.0.0.1", port2)).expect("port free after drop");
+    }
+
+    #[test]
+    fn tap_overlay_is_above_waiting_and_hides_it() {
+        let page = include_str!("../assets/share.html");
+        let z = |sel: &str| -> u32 {
+            let i = page.find(sel).expect(sel);
+            let rest = &page[i..page[i..].find('}').map(|e| i + e).unwrap()];
+            let k = rest.find("z-index:").expect("z-index");
+            rest[k + 8..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+        };
+        assert!(z("#tap {") > z("#wait {"));
+        assert!(page.contains("if (on) { wait.hidden = true; }"));
+        assert!(page.contains("if (on) { tap.hidden = true; }"));
     }
 
     #[test]

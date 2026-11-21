@@ -15,8 +15,8 @@
   video { width: 100%; max-height: 100%; background: #000; }
   .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
              font-size: 20px; text-align: center; padding: 16px; box-sizing: border-box; }
-  #tap { background: rgba(0,0,0,.55); cursor: pointer; }
-  #wait { background: #000; }
+  #tap { background: rgba(0,0,0,.55); cursor: pointer; z-index: 3; }
+  #wait { background: #000; z-index: 2; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -41,8 +41,9 @@
   var attached = false;
   var live = false;
 
-  function showWait(on) { wait.hidden = !on; }
-  function showTap(on) { tap.hidden = !on; }
+  // Never both: waiting = no stream yet; tap = stream is there, only a user gesture is missing.
+  function showWait(on) { wait.hidden = !on; if (on) { tap.hidden = true; } }
+  function showTap(on) { tap.hidden = !on; if (on) { wait.hidden = true; } }
 
   function destroy() {
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
@@ -53,7 +54,10 @@
   function tryPlay() {
     var p = v.play();
     if (p && p.then) {
-      p.then(function () { showTap(false); }, function () { showTap(true); });
+      p.then(function () { showTap(false); }, function (e) {
+        // Only a blocked autoplay needs the tap; an abort (stream torn down) does not.
+        if (attached && e && e.name === 'NotAllowedError') { showTap(true); }
+      });
     }
   }
 
