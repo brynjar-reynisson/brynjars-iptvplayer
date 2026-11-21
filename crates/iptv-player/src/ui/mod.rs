@@ -68,7 +68,7 @@ use iptv::intros::Intros;
 use crate::state::epg::EpgLoader;
 use crate::state::titles::{TitleLoader, TVMAZE_URL};
 use crate::state::recs::RecList;
-use crate::state::export::{ExportDialog, Exports, Submit};
+use crate::state::export::{ExportDialog, Exports, Submit, Toast};
 use crate::state::sched_form::SchedForm;
 use crate::state::playback::{enter_action, queue_zap, rebase_pending, EnterAction, Playback};
 use crate::state::vod::{
@@ -343,6 +343,8 @@ struct App {
     share_ffmpeg: Option<PathBuf>,
     share_tap_port: u16,
     share_budget: RestartBudget,
+    /// "Sharing link copied to clipboard", shown for `TOAST_SECS` after sharing starts.
+    share_toast: Option<Toast>,
     /// Player generation of the last pipe start.
     share_pipe_gen: Option<u32>,
     /// Last `segment_count` read and when (read at most every 500 ms).
@@ -560,6 +562,7 @@ impl App {
             share_ffmpeg: None,
             share_tap_port: 0,
             share_budget: RestartBudget::default(),
+            share_toast: None,
             share_pipe_gen: None,
             share_segs: (Instant::now(), 0),
             rec_gen: 0,
@@ -1425,6 +1428,14 @@ impl App {
             Some((false, _)) => self.exports.toast = None,
             None => {}
         }
+        match self.share_toast.as_ref().map(|t| (t.visible(now), t.text.clone())) {
+            Some((true, text)) => {
+                export::toast(ctx, &text);
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Some((false, _)) => self.share_toast = None,
+            None => {}
+        }
         if self.exports.busy() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -1611,6 +1622,7 @@ impl App {
             None => format!("Sharing: {link} (link copied)"),
             Some(e) => format!("Sharing: {link} (link copied; could not save the token: {e})"),
         });
+        self.share_toast = Some(Toast::new("Sharing link copied to clipboard".into(), Instant::now()));
         self.share_server = Some(server);
         self.share_awake = Some(KeepAwake::with_display());
         self.share_ffmpeg = Some(ffmpeg);
