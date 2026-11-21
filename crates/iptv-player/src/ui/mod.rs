@@ -45,6 +45,11 @@ use iptv::subimport::Target;
 use iptv::settings::Settings;
 use iptv::subtitles;
 use iptv::supervisor::Status;
+use iptv::awake::KeepAwake;
+use iptv::share::{self, tap_url};
+use iptv::share_pipe::{self, Pipe as SharePipe};
+use iptv::share_server::Server as ShareServer;
+use crate::state::share::{ShareInput, ShareStep, Sharer};
 
 use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
@@ -329,6 +334,16 @@ struct App {
     rec_dir: PathBuf,
     /// The running recording of the playing live channel.
     recorder: Option<Recorder>,
+    /// Phone share: the web server (Some = sharing is on), its ffmpeg pipe,
+    /// the state machine and what keeps the computer awake meanwhile.
+    share_server: Option<ShareServer>,
+    share_pipe: Option<SharePipe>,
+    sharer: Sharer,
+    share_awake: Option<KeepAwake>,
+    share_ffmpeg: Option<PathBuf>,
+    share_tap_port: u16,
+    /// Last `segment_count` read and when (read at most every 500 ms).
+    share_segs: (Instant, u64),
     /// Player generation the recorder last saw (a change = the stream reloaded).
     rec_gen: u32,
     /// Free disk space, read every `REC_DISK_EVERY` while recording.
@@ -535,6 +550,13 @@ impl App {
             last_view,
             rec_dir: recordings::dir_in(&data_dir_for_rec),
             recorder: None,
+            share_server: None,
+            share_pipe: None,
+            sharer: Sharer::new(),
+            share_awake: None,
+            share_ffmpeg: None,
+            share_tap_port: 0,
+            share_segs: (Instant::now(), 0),
             rec_gen: 0,
             rec_free: None,
             rec_free_at: Instant::now(),
@@ -1234,6 +1256,8 @@ impl App {
         let Ok(p) = &self.player else { return };
         let gen = p.generation();
         if self.recorder.is_none() {
+            // Both use `stream-record`: the schedule wins.
+            self.stop_share(Some("Sharing stopped: a scheduled recording starts.".into()));
             if let Err(e) = std::fs::create_dir_all(&self.rec_dir) {
                 self.message = Some(safe_text(&format!("Cannot create the recordings folder: {e}")));
                 self.sched_refused = Some(s.id.clone());
@@ -1416,6 +1440,10 @@ impl App {
             self.stop_record(Some("Recording stopped.".into()));
             return;
         }
+        if self.share_server.is_some() {
+            self.message = Some("Stop sharing first: recording and sharing cannot run together.".into());
+            return;
+        }
         let Some(pb) = self.playback.as_ref().filter(|p| p.is_live()) else {
             self.message = Some("Recording starts from a playing live channel.".into());
             return;
@@ -1500,11 +1528,177 @@ impl App {
         }
     }
 
+    // ---- phone share -------------------------------------------------------
+
+    fn share_dir(&self) -> PathBuf {
+        self.data_dir.join("share")
+    }
+
+    /// S / the share button: serve the playing live channel to a phone, or stop.
+    fn toggle_share(&mut self) {
+        if self.share_server.is_some() {
+            self.stop_share(Some("Sharing stopped.".into()));
+            return;
+        }
+        if !self.playback.as_ref().is_some_and(Playback::is_live) {
+            self.message = Some("Sharing starts from a playing live channel.".into());
+            return;
+        }
+        let Ok(p) = &self.player else { return };
+        if p.status() != Status::Playing {
+            self.message = Some("Wait until the channel plays, then share.".into());
+            return;
+        }
+        if self.recorder.is_some() {
+            self.message = Some("Stop the recording first: recording and sharing cannot run together.".into());
+            return;
+        }
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = rec_merge::find_ffmpeg();
+        }
+        let Some(ffmpeg) = self.ffmpeg.clone() else {
+            self.message = Some("Sharing needs ffmpeg: put ffmpeg.exe beside iptv-player.exe or on the PATH".into());
+            return;
+        };
+        let (port, host) = match iptv::config::load(&self.data_dir) {
+            Ok(c) => (c.share_port, c.share_host),
+            Err(_) => (iptv::config::DEFAULT_SHARE_PORT, None),
+        };
+        let Some(tap_port) = port.checked_add(1) else {
+            self.message = Some("share_port is too high: the next port is needed for the stream.".into());
+            return;
+        };
+        let mut save_err = None;
+        let token = match self.settings.share_token() {
+            Some(t) if share::is_valid_token(t) => t.to_string(),
+            _ => match share::new_token() {
+                Ok(t) => {
+                    self.settings.set_share_token(&t);
+                    if let Err(e) = self.settings.save() {
+                        save_err = Some(safe_text(&format!("{e:#}")));
+                    }
+                    t
+                }
+                Err(e) => {
+                    self.message = Some(safe_text(&format!("Cannot create the share token: {e:#}")));
+                    return;
+                }
+            },
+        };
+        let dir = self.share_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let server = match ShareServer::start(port, token.clone(), dir) {
+            Ok(s) => s,
+            Err(e) => {
+                self.message = Some(safe_text(&format!("Cannot start sharing: {e:#}")));
+                return;
+            }
+        };
+        let link = share::link(host.as_deref(), port, &token);
+        self.ctx.copy_text(link.clone());
+        self.message = Some(match save_err {
+            None => format!("Sharing: {link} (link copied)"),
+            Some(e) => format!("Sharing: {link} (link copied; could not save the token: {e})"),
+        });
+        self.share_server = Some(server);
+        self.share_awake = Some(KeepAwake::new());
+        self.share_ffmpeg = Some(ffmpeg);
+        self.share_tap_port = tap_port;
+        self.sharer = Sharer::new();
+        self.share_segs = (Instant::now() - Duration::from_secs(1), 0);
+        eprintln!("share: started");
+    }
+
+    /// End sharing (if on): ffmpeg, tap, server and the sleep lock go; the
+    /// share folder is cleared. `msg` replaces the status message.
+    fn stop_share(&mut self, msg: Option<String>) {
+        let Some(server) = self.share_server.take() else { return };
+        if let Some(mut pipe) = self.share_pipe.take() {
+            pipe.stop();
+        }
+        if let Ok(p) = &mut self.player {
+            p.set_stream_record(None);
+        }
+        server.stop();
+        share_pipe::sweep(&self.share_dir());
+        self.share_awake = None;
+        self.sharer = Sharer::new();
+        eprintln!("share: stopped");
+        if msg.is_some() {
+            self.message = msg;
+        }
+    }
+
+    /// Every frame while sharing: feed the state machine, start/stop the pipe
+    /// and the tap, report the status to the web page.
+    fn update_share(&mut self) {
+        if self.share_server.is_none() {
+            return;
+        }
+        let name = match self.playback.as_ref().filter(|p| p.is_live()) {
+            Some(pb) => pb.name().to_string(),
+            None => {
+                self.stop_share(Some("Sharing stopped.".into()));
+                return;
+            }
+        };
+        let now = Instant::now();
+        if now.duration_since(self.share_segs.0) >= Duration::from_millis(500) {
+            self.share_segs = (now, share_pipe::segment_count(&self.share_dir()));
+        }
+        let pipe_alive = self.share_pipe.as_mut().is_some_and(|p| p.alive());
+        let Ok(p) = &mut self.player else { return };
+        let step = self.sharer.poll(
+            now,
+            ShareInput {
+                live_playing: p.status() == Status::Playing,
+                generation: p.generation(),
+                pipe_alive,
+                segments: self.share_segs.1,
+            },
+        );
+        match step {
+            ShareStep::Nothing | ShareStep::Stop(_) => {}
+            ShareStep::StartPipe { restart } => {
+                if let Some(mut old) = self.share_pipe.take() {
+                    old.stop();
+                }
+                let dir = self.data_dir.join("share");
+                if !restart {
+                    share_pipe::sweep(&dir); // first pipe of the session: no stale segments
+                }
+                let ffmpeg = self.share_ffmpeg.clone().unwrap_or_default();
+                match SharePipe::start(&ffmpeg, self.share_tap_port, &dir, restart) {
+                    Ok(pipe) => self.share_pipe = Some(pipe),
+                    Err(e) => {
+                        self.stop_share(Some(safe_text(&format!("Sharing stopped: {e:#}"))));
+                        return;
+                    }
+                }
+            }
+            ShareStep::StartTap => {
+                p.set_stream_record(Some(std::path::Path::new(&tap_url(self.share_tap_port))));
+            }
+            ShareStep::StopPipe => {
+                if let Some(mut pipe) = self.share_pipe.take() {
+                    pipe.stop();
+                }
+                p.set_stream_record(None);
+            }
+        }
+        if let Some(s) = &self.share_server {
+            s.set_status(&name, self.sharer.is_live());
+        }
+    }
+
     /// Space / the pause button. Not while recording: a paused player stops
     /// reading the stream once its buffer is full, which would leave a gap.
+    /// The same holds for sharing (the phone would stall and the pipe restart).
     fn toggle_pause(&mut self) {
         if self.recorder.is_some() {
             self.message = Some("Pause is off while recording.".into());
+        } else if self.share_server.is_some() {
+            self.message = Some("Pause is off while sharing.".into());
         } else if let Ok(p) = &mut self.player {
             p.toggle_pause();
         }
@@ -2301,6 +2495,7 @@ impl App {
             self.stop_record(Some(msg.into()));
         }
         self.release_pre_claim();
+        self.stop_share(Some("Sharing stopped.".into()));
         // Stopped on purpose: a live channel is not started again next time.
         self.last_view.clear_live();
         self.save_last_view();
@@ -2848,6 +3043,14 @@ impl App {
         {
             self.toggle_record();
         }
+        // S shares the playing live channel with a phone / stops sharing.
+        if !typing
+            && !self.sub_menu
+            && self.playback.as_ref().is_some_and(Playback::is_live)
+            && ctx.input_mut(|i| i.consume_key(M::NONE, Key::S))
+        {
+            self.toggle_share();
+        }
         if sub_key {
             self.toggle_sub_menu();
         }
@@ -3215,6 +3418,8 @@ impl App {
             let mut next_clicked = false;
             // Record / stop button clicked.
             let mut toggle_rec = false;
+            // Share button clicked.
+            let mut toggle_sh = false;
             // Export button (movies/episodes) clicked.
             let mut export_clicked = false;
             match (&self.player, &self.playback) {
@@ -3254,6 +3459,7 @@ impl App {
                     }
                     p.show(ui, rect, &title, show_title);
                     self.rec_badge(ui, rect);
+                    self.share_badge(ui, rect);
                     // A running export (started from the player or the Recordings
                     // tab) shows its progress over the video, bottom left.
                     if self.exports.busy() {
@@ -3429,6 +3635,39 @@ impl App {
                         if r_resp.on_hover_text(tip).clicked() {
                             toggle_rec = true;
                         }
+                        // Share button, left of it: a broadcast dot with two arcs
+                        // (outlined; filled white while sharing).
+                        let sbtn = btn.translate(egui::vec2(-114.0, 0.0));
+                        if sbtn.left() >= rect.left() + 4.0 {
+                            let sh_resp = ui.interact(sbtn, egui::Id::unique("share_btn"), egui::Sense::click());
+                            let sa = if sh_resp.hovered() { 230 } else { 140 };
+                            let sp = ui.painter_at(rect);
+                            let on = self.share_server.is_some();
+                            let white = egui::Color32::from_white_alpha(sa);
+                            let c = sbtn.center();
+                            if on {
+                                sp.rect_filled(sbtn, 4.0, white);
+                            } else {
+                                sp.rect_filled(sbtn, 4.0, egui::Color32::from_black_alpha(sa / 2));
+                                sp.rect_stroke(sbtn, 4.0, egui::Stroke::new(1.0, white), egui::StrokeKind::Inside);
+                            }
+                            let ink = if on { egui::Color32::BLACK } else { white };
+                            sp.circle_filled(c + egui::vec2(-6.0, 0.0), 2.5, ink);
+                            for r in [6.0_f32, 10.0] {
+                                // arcs opening to the right, as short polylines
+                                let pts: Vec<egui::Pos2> = (-4..=4)
+                                    .map(|i| {
+                                        let a = i as f32 * 0.17;
+                                        c + egui::vec2(-6.0 + r * a.cos(), r * a.sin())
+                                    })
+                                    .collect();
+                                sp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, ink)));
+                            }
+                            let tip = if on { "Stop sharing (S)" } else { "Share this channel with your phone (S)" };
+                            if sh_resp.on_hover_text(tip).clicked() {
+                                toggle_sh = true;
+                            }
+                        }
                     }
                     // Play/pause button, left of it: shows the action a click performs.
                     if chrome {
@@ -3578,6 +3817,9 @@ impl App {
             if toggle_rec {
                 self.toggle_record();
             }
+            if toggle_sh {
+                self.toggle_share();
+            }
             if export_clicked {
                 self.open_export_playing();
             }
@@ -3620,6 +3862,25 @@ impl App {
         let bg = egui::Rect::from_min_size(egui::pos2(rect.right() - 12.0 - size.x, rect.top() + 12.0), size);
         painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(180));
         painter.circle_filled(egui::pos2(bg.left() + 13.0, bg.center().y), 5.0, egui::Color32::from_rgb(230, 60, 60));
+        painter.galley(egui::pos2(bg.left() + 24.0, bg.top() + 6.0), galley, egui::Color32::WHITE);
+    }
+
+    /// "SHARING  2 viewers" at the video's top right (below the REC badge).
+    fn share_badge(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(server) = &self.share_server else { return };
+        let text = if self.sharer.is_live() {
+            let n = server.viewers();
+            format!("SHARING  {n} viewer{}", if n == 1 { "" } else { "s" })
+        } else {
+            "SHARING  waiting for the stream".to_string()
+        };
+        let painter = ui.painter_at(rect);
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(16.0), egui::Color32::WHITE);
+        let size = egui::vec2(galley.size().x + 34.0, galley.size().y + 12.0);
+        let top = if self.recorder.is_some() { 12.0 + 36.0 } else { 12.0 };
+        let bg = egui::Rect::from_min_size(egui::pos2(rect.right() - 12.0 - size.x, rect.top() + top), size);
+        painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(180));
+        painter.circle_filled(egui::pos2(bg.left() + 13.0, bg.center().y), 5.0, egui::Color32::from_rgb(70, 160, 255));
         painter.galley(egui::pos2(bg.left() + 24.0, bg.top() + 6.0), galley, egui::Color32::WHITE);
     }
 
@@ -4058,6 +4319,7 @@ impl eframe::App for App {
         }
         self.update_skip_intro();
         self.update_recording();
+        self.update_share();
         self.update_schedule_window();
         if ctx.input(|i| i.viewport().close_requested()) {
             // Safety net: if teardown after the window closes ever blocks,
@@ -4175,6 +4437,7 @@ impl eframe::App for App {
         });
         self.exports.kill_blocking();
         self.stop_record(None);
+        self.stop_share(None);
         self.release_pre_claim();
         self.save_position();
         if let Ok(p) = &mut self.player {

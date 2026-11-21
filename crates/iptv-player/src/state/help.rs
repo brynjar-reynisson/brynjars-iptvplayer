@@ -72,6 +72,7 @@ pub const KEYS: &[Section] = &[
             row("Right  Enter", "From the country list: back into the channels, plays the first"),
             row("Esc", "Leave the country list, or cancel a pending channel switch"),
             row("R", "Record the playing channel / stop recording (also the red button on the video); max 3 hours, needs 10 GB free; Esc or switching channel stops it; no pause while recording"),
+            row("S", "Share the playing channel with your phone (also the button on the video; see README); Esc or switching to a non-live item stops it; no recording or pause while sharing"),
         ],
     },
     Section {
@@ -115,7 +116,9 @@ pub const SETTINGS: &[Section] = &[
             row("playlist_url", "Your M3U playlist address. Required (the app asks for it at startup while empty), keep it private"),
             row("user_agent", "Sent on the playlist download and every stream. Default VLC/3.0.20 LibVLC/3.0.20"),
             row("top_countries", "Live countries listed first, comma separated, e.g. \"Iceland, United Kingdom\" (after F5 or restart)"),
-            row("theme", "\"black\" (default: black background, white text) or \"standard\" (egui dark look); after a restart"),
+            row("share_port", "Phone share web server port, 1024-65535 (default 8480; the tap uses the next port)"),
+            row("share_host", "Public host name of the share link, e.g. iptv.example.org (default: localhost with the port above)"),
+            row("theme","\"black\" (default: black background, white text) or \"standard\" (egui dark look); after a restart"),
         ],
     },
     Section {
