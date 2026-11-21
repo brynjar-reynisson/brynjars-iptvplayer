@@ -166,6 +166,35 @@ impl Sharer {
     }
 }
 
+/// True when nothing listens on `127.0.0.1:port` (binds and drops at once).
+pub fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Pipe restarts allowed within `RESTART_WINDOW` before sharing gives up.
+pub const MAX_RESTARTS: usize = 5;
+pub const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// Counts restarts of a pipe that never produced segments.
+#[derive(Debug, Default)]
+pub struct RestartBudget {
+    times: Vec<Instant>,
+}
+
+impl RestartBudget {
+    /// Record a restart; true = too many within the window.
+    pub fn record(&mut self, now: Instant) -> bool {
+        self.times.retain(|t| now.saturating_duration_since(*t) < RESTART_WINDOW);
+        self.times.push(now);
+        self.times.len() >= MAX_RESTARTS
+    }
+
+    /// Segments appeared: the pipe works, forget earlier failures.
+    pub fn reset(&mut self) {
+        self.times.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +426,28 @@ mod tests {
         assert_eq!(s.state_name(), "live");
         s.poll(t + PIPE_WAIT + ms(600), inp(true, 2, true, 5)); // StopPipe
         assert!(!s.is_live());
+    }
+
+    #[test]
+    fn port_free_sees_a_held_port() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(!port_free(port));
+        drop(l);
+        assert!(port_free(port));
+    }
+
+    #[test]
+    fn restart_budget_trips_on_fast_repeats_only() {
+        let t = Instant::now();
+        let mut b = RestartBudget::default();
+        for k in 0..MAX_RESTARTS - 1 {
+            assert!(!b.record(t + Duration::from_secs(k as u64 * 3)));
+        }
+        assert!(b.record(t + Duration::from_secs(13)));
+        let mut slow = RestartBudget::default();
+        for k in 0..20 {
+            assert!(!slow.record(t + Duration::from_secs(k * 30)));
+        }
     }
 }

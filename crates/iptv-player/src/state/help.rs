@@ -118,7 +118,7 @@ pub const SETTINGS: &[Section] = &[
             row("top_countries", "Live countries listed first, comma separated, e.g. \"Iceland, United Kingdom\" (after F5 or restart)"),
             row("share_port", "Phone share web server port, 1024-65535 (default 8480; the tap uses the next port)"),
             row("share_host", "Public host name of the share link, e.g. iptv.example.org (default: localhost with the port above)"),
-            row("theme","\"black\" (default: black background, white text) or \"standard\" (egui dark look); after a restart"),
+            row("theme", "\"black\" (default: black background, white text) or \"standard\" (egui dark look); after a restart"),
         ],
     },
     Section {

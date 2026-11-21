@@ -49,7 +49,7 @@ use iptv::awake::KeepAwake;
 use iptv::share::{self, tap_url};
 use iptv::share_pipe::{self, Pipe as SharePipe};
 use iptv::share_server::Server as ShareServer;
-use crate::state::share::{ShareInput, ShareStep, Sharer};
+use crate::state::share::{port_free, RestartBudget, ShareInput, ShareStep, Sharer};
 
 use crate::state::autoplay::{Autoplay, NextFail, Step, OFFER_SECS};
 use crate::state::data::{Action, DataState, Phase, RefreshState, SourceStatus};
@@ -342,6 +342,7 @@ struct App {
     share_awake: Option<KeepAwake>,
     share_ffmpeg: Option<PathBuf>,
     share_tap_port: u16,
+    share_budget: RestartBudget,
     /// Last `segment_count` read and when (read at most every 500 ms).
     share_segs: (Instant, u64),
     /// Player generation the recorder last saw (a change = the stream reloaded).
@@ -556,6 +557,7 @@ impl App {
             share_awake: None,
             share_ffmpeg: None,
             share_tap_port: 0,
+            share_budget: RestartBudget::default(),
             share_segs: (Instant::now(), 0),
             rec_gen: 0,
             rec_free: None,
@@ -1568,6 +1570,12 @@ impl App {
             self.message = Some("share_port is too high: the next port is needed for the stream.".into());
             return;
         };
+        if !port_free(tap_port) {
+            self.message = Some(format!(
+                "Cannot start sharing: port {tap_port} is already in use (it carries the stream to the web server). Change share_port in config.toml."
+            ));
+            return;
+        }
         let mut save_err = None;
         let token = match self.settings.share_token() {
             Some(t) if share::is_valid_token(t) => t.to_string(),
@@ -1605,6 +1613,7 @@ impl App {
         self.share_ffmpeg = Some(ffmpeg);
         self.share_tap_port = tap_port;
         self.sharer = Sharer::new();
+        self.share_budget = RestartBudget::default();
         self.share_segs = (Instant::now() - Duration::from_secs(1), 0);
         eprintln!("share: started");
     }
@@ -1663,7 +1672,11 @@ impl App {
                 if let Some(mut old) = self.share_pipe.take() {
                     old.stop();
                 }
-                let dir = self.data_dir.join("share");
+                if restart && self.share_budget.record(now) {
+                    self.stop_share(Some("Sharing stopped: ffmpeg keeps failing (see share/ffmpeg.log)".into()));
+                    return;
+                }
+                let dir = self.share_dir();
                 if !restart {
                     share_pipe::sweep(&dir); // first pipe of the session: no stale segments
                 }
@@ -1685,6 +1698,9 @@ impl App {
                 }
                 p.set_stream_record(None);
             }
+        }
+        if self.sharer.is_live() {
+            self.share_budget.reset();
         }
         if let Some(s) = &self.share_server {
             s.set_status(&name, self.sharer.is_live());
