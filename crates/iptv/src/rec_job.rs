@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::awake::KeepAwake;
 use crate::handoff;
 use crate::recordings::{self, Recorder, Step, StopReason};
 use crate::rec_merge;
@@ -46,33 +47,6 @@ impl Log {
             let _ = f.write_all(line.as_bytes());
         }
     }
-}
-
-/// Keeps the computer from sleeping while alive.
-struct KeepAwake;
-
-impl KeepAwake {
-    fn new() -> KeepAwake {
-        #[cfg(windows)]
-        unsafe {
-            SetThreadExecutionState(0x8000_0001); // ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-        }
-        KeepAwake
-    }
-}
-
-impl Drop for KeepAwake {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        unsafe {
-            SetThreadExecutionState(0x8000_0000); // ES_CONTINUOUS
-        }
-    }
-}
-
-#[cfg(windows)]
-extern "system" {
-    fn SetThreadExecutionState(flags: u32) -> u32;
 }
 
 /// Run schedule `id` once (now). `Ok` also when there is nothing to do
