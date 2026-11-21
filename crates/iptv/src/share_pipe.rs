@@ -66,6 +66,23 @@ pub fn has_segments(dir: &Path) -> bool {
     })
 }
 
+/// Monotonic count of segments the pipe has written: `#EXT-X-MEDIA-SEQUENCE`
+/// (0 if absent) plus the listed segments; 0 when the playlist is missing.
+pub fn segment_count(dir: &Path) -> u64 {
+    let Ok(t) = std::fs::read_to_string(dir.join("live.m3u8")) else { return 0 };
+    let mut seq = 0u64;
+    let mut listed = 0u64;
+    for l in t.lines() {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            seq = v.trim().parse().unwrap_or(0);
+        } else if l.starts_with("seg-") && l.ends_with(".ts") {
+            listed += 1;
+        }
+    }
+    seq.saturating_add(listed)
+}
+
 /// Delete the share files (`seg-*.ts`, `live.m3u8`, `ffmpeg.log`) directly in
 /// `dir`; nothing else, no recursion.
 pub fn sweep(dir: &Path) {
@@ -121,6 +138,42 @@ mod tests {
         assert!(!has_segments(&d));
         std::fs::write(d.join("live.m3u8"), "#EXTM3U\n#EXTINF:2.0,\nseg-0.ts\n").unwrap();
         assert!(has_segments(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn segment_count_is_sequence_plus_listed() {
+        let d = scratch("count");
+        assert_eq!(segment_count(&d), 0);
+        let w = |t: &str| std::fs::write(d.join("live.m3u8"), t).unwrap();
+        w("#EXTM3U
+#EXTINF:2.0,
+seg-0.ts
+#EXTINF:2.0,
+seg-1.ts
+");
+        assert_eq!(segment_count(&d), 2);
+        w("#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:5
+#EXTINF:2.0,
+seg-5.ts
+#EXTINF:2.0,
+seg-6.ts
+#EXTINF:2.0,
+seg-7.ts
+");
+        assert_eq!(segment_count(&d), 8);
+        // rolling window: listed count constant, sequence grows
+        w("#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:6
+#EXTINF:2.0,
+seg-6.ts
+#EXTINF:2.0,
+seg-7.ts
+#EXTINF:2.0,
+seg-8.ts
+");
+        assert_eq!(segment_count(&d), 9);
         let _ = std::fs::remove_dir_all(&d);
     }
 
