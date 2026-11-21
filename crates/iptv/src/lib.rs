@@ -28,3 +28,4 @@ pub mod export;
 pub mod subsync;
 pub mod subimport;
 pub mod extsubs;
+pub mod share;
