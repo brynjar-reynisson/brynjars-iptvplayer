@@ -23,6 +23,8 @@ struct SettingsFile {
     autoplay_next: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     export_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    share_token: Option<String>,
 }
 
 struct Parsed {
@@ -30,6 +32,7 @@ struct Parsed {
     sub_prefs: BTreeMap<String, SubChoice>,
     autoplay_next: Option<bool>,
     export_dir: Option<String>,
+    share_token: Option<String>,
 }
 
 /// Most shows with a remembered subtitle choice.
@@ -49,6 +52,8 @@ pub struct Settings {
     autoplay_next: Option<bool>,
     /// Folder the last recording export went to.
     export_dir: Option<String>,
+    /// Secret path segment of the phone-share link (32 hex characters).
+    share_token: Option<String>,
     /// Set when an unreadable settings.json could not be moved aside; `save`
     /// then refuses so the original is never overwritten.
     blocked: Option<String>,
@@ -66,7 +71,7 @@ fn parse(bytes: &[u8]) -> Option<Parsed> {
     let mut g = f.hidden_groups;
     g.sort();
     g.dedup();
-    Some(Parsed { hidden_groups: g, sub_prefs: f.sub_prefs, autoplay_next: f.autoplay_next, export_dir: f.export_dir })
+    Some(Parsed { hidden_groups: g, sub_prefs: f.sub_prefs, autoplay_next: f.autoplay_next, export_dir: f.export_dir, share_token: f.share_token })
 }
 
 impl Settings {
@@ -78,7 +83,7 @@ impl Settings {
 
     fn load_with(dir: &Path, mover: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Settings {
         let path = path_in(dir);
-        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), sub_prefs: BTreeMap::new(), autoplay_next: None, export_dir: None, blocked: None };
+        let mut s = Settings { dir: dir.to_path_buf(), hidden_groups: Vec::new(), sub_prefs: BTreeMap::new(), autoplay_next: None, export_dir: None, share_token: None, blocked: None };
         let unreadable = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return s,
             Err(_) => true,
@@ -88,6 +93,7 @@ impl Settings {
                     s.sub_prefs = p.sub_prefs;
                     s.autoplay_next = p.autoplay_next;
                     s.export_dir = p.export_dir;
+                    s.share_token = p.share_token;
                     false
                 }
                 None => true,
@@ -136,6 +142,16 @@ impl Settings {
         self.export_dir = Some(dir.to_string());
     }
 
+    /// The phone-share token, if one was generated.
+    pub fn share_token(&self) -> Option<&str> {
+        self.share_token.as_deref()
+    }
+
+    /// Remember the share token (in memory; call `save`).
+    pub fn set_share_token(&mut self, token: &str) {
+        self.share_token = Some(token.to_string());
+    }
+
     pub fn sub_pref(&self, show: &str) -> Option<&SubChoice> {
         self.sub_prefs.get(&show.to_lowercase())
     }
@@ -161,6 +177,7 @@ impl Settings {
             sub_prefs: self.sub_prefs.clone(),
             autoplay_next: self.autoplay_next,
             export_dir: self.export_dir.clone(),
+            share_token: self.share_token.clone(),
         })
         .context("serializing settings")?;
         crate::fsutil::atomic_write(&path, &json).with_context(|| format!("writing {}", path.display()))
@@ -311,5 +328,28 @@ mod tests {
         s.save().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert!(v.get("export_dir").is_none());
+    }
+
+    #[test]
+    fn share_token_round_trips_and_keeps_version_1() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("settings.json");
+        let mut s = Settings::load(d.path());
+        assert_eq!(s.share_token(), None);
+        s.set_share_token("0123456789abcdef0123456789abcdef");
+        s.save().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        let mut g = Settings::load(d.path());
+        assert_eq!(g.share_token(), Some("0123456789abcdef0123456789abcdef"));
+        g.set_hidden("Movies: A", true);
+        g.save().unwrap();
+        assert_eq!(Settings::load(d.path()).share_token(), Some("0123456789abcdef0123456789abcdef"));
+        std::fs::write(&p, br#"{"version":1}"#).unwrap();
+        let s = Settings::load(d.path());
+        assert_eq!(s.share_token(), None);
+        s.save().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert!(v.get("share_token").is_none());
     }
 }

@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// UA is accepted.
 pub const DEFAULT_USER_AGENT: &str = "VLC/3.0.20 LibVLC/3.0.20";
 
+/// Default port of the phone-share web server (`share_port` in `config.toml`).
+pub const DEFAULT_SHARE_PORT: u16 = 8480;
+
 /// The `config.toml` written on first run (same text as `config.example.toml`,
 /// empty `playlist_url`).
 pub const DEFAULT_CONFIG: &str = include_str!("../../../config.example.toml");
@@ -39,6 +42,11 @@ pub struct Config {
     /// order, the rest alphabetically. The old single `top_country` key is
     /// still read when `top_countries` is absent.
     pub top_countries: Vec<String>,
+    /// Optional `share_port` key (1024-65535); missing = [`DEFAULT_SHARE_PORT`].
+    pub share_port: u16,
+    /// Optional `share_host` key: the public host name (optionally `:port`) the
+    /// share link shows; trimmed, blank/missing = `None`.
+    pub share_host: Option<String>,
 }
 
 /// Never prints the URL (it carries the account credentials).
@@ -48,6 +56,8 @@ impl std::fmt::Debug for Config {
             .field("playlist_url", &"<redacted>")
             .field("user_agent", &self.user_agent)
             .field("top_countries", &self.top_countries)
+            .field("share_port", &self.share_port)
+            .field("share_host", &self.share_host)
             .finish()
     }
 }
@@ -68,6 +78,37 @@ fn parse_user_agent(value: Option<&toml::Value>, path: &Path) -> anyhow::Result<
         anyhow::bail!("{}: `user_agent` must not contain control characters or line breaks", path.display());
     }
     Ok(ua.to_string())
+}
+
+/// `value` of the optional `share_port` key -> the port to listen on.
+fn parse_share_port(value: Option<&toml::Value>, path: &Path) -> anyhow::Result<u16> {
+    let Some(v) = value else { return Ok(DEFAULT_SHARE_PORT) };
+    let n = v
+        .as_integer()
+        .ok_or_else(|| anyhow::anyhow!("{}: `share_port` must be a number", path.display()))?;
+    match u16::try_from(n) {
+        Ok(p) if p >= 1024 => Ok(p),
+        _ => anyhow::bail!("{}: `share_port` must be between 1024 and 65535", path.display()),
+    }
+}
+
+/// `value` of the optional `share_host` key -> trimmed host (`name` or `name:port`).
+fn parse_share_host(value: Option<&toml::Value>, path: &Path) -> anyhow::Result<Option<String>> {
+    let Some(v) = value else { return Ok(None) };
+    let host = v
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{}: `share_host` must be a string", path.display()))?
+        .trim();
+    if host.is_empty() {
+        return Ok(None);
+    }
+    if !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')) || host.matches(':').count() > 1 {
+        anyhow::bail!(
+            "{}: `share_host` must be a host name like iptv.example.org (optionally with :port), without http:// or a path",
+            path.display()
+        );
+    }
+    Ok(Some(host.to_string()))
 }
 
 /// Data directory: CLI `--data-dir`, then env `IPTV_DATA_DIR`, then the exe's directory.
@@ -112,7 +153,9 @@ pub fn load(dir: &Path) -> anyhow::Result<Config> {
                 .collect(),
         }
     };
-    Ok(Config { playlist_url, user_agent, top_countries })
+    let share_port = parse_share_port(value.get("share_port"), &path)?;
+    let share_host = parse_share_host(value.get("share_host"), &path)?;
+    Ok(Config { playlist_url, user_agent, top_countries, share_port, share_host })
 }
 
 fn is_placeholder(url: &str) -> bool {
@@ -245,11 +288,37 @@ mod tests {
     }
 
     #[test]
+    fn share_port_defaults_and_validates() {
+        assert_eq!(DEFAULT_SHARE_PORT, 8480);
+        assert_eq!(load_with("").unwrap().share_port, 8480);
+        assert_eq!(load_with("share_port = 9000\n").unwrap().share_port, 9000);
+        for extra in ["share_port = 80\n", "share_port = 70000\n", "share_port = \"x\"\n"] {
+            let err = format!("{:#}", load_with(extra).unwrap_err());
+            assert!(err.contains("share_port") && err.contains("config.toml"), "{err}");
+            assert!(!err.contains("host.invalid") && !err.contains("USER") && !err.contains("PASS"), "{err}");
+        }
+    }
+
+    #[test]
+    fn share_host_trims_and_rejects_scheme() {
+        assert_eq!(load_with("").unwrap().share_host, None);
+        assert_eq!(load_with("share_host = \" iptv.breynisson.org \"\n").unwrap().share_host.as_deref(), Some("iptv.breynisson.org"));
+        assert_eq!(load_with("share_host = \"host-1.org:8443\"\n").unwrap().share_host.as_deref(), Some("host-1.org:8443"));
+        assert_eq!(load_with("share_host = \"  \"\n").unwrap().share_host, None);
+        for extra in ["share_host = \"https://x.org\"\n", "share_host = \"a b\"\n", "share_host = \"x.org/p\"\n", "share_host = 5\n"] {
+            let err = format!("{:#}", load_with(extra).unwrap_err());
+            assert!(err.contains("share_host"), "{err}");
+        }
+    }
+
+    #[test]
     fn debug_hides_playlist_url() {
         let c = Config {
             playlist_url: "http://host.invalid/get.php?username=USER&password=PASS".into(),
             user_agent: DEFAULT_USER_AGENT.into(),
             top_countries: Vec::new(),
+            share_port: DEFAULT_SHARE_PORT,
+            share_host: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("host.invalid") && !d.contains("USER") && !d.contains("PASS") && !d.contains("://"), "{d}");

@@ -17,3 +17,8 @@ user_agent = "VLC/3.0.20 LibVLC/3.0.20"
 # Optional: look of the app, applied after a restart. The default is "black" (black background,
 # white text). Set theme = "standard" for the plain dark look instead.
 # theme = "standard"
+
+# Optional: phone share (Share button / key S). The port the share web server listens on
+# (127.0.0.1 only, 1024-65535; default 8480), and the public host name shown in the share link.
+# share_port = 8480
+# share_host = "iptv.example.org"
