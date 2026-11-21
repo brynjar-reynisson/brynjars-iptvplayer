@@ -1,6 +1,6 @@
 # Phone share (watch the playing live channel in a phone browser)
 
-Status: draft for approval, 2026-11-21.
+Status: implemented (2026-11-21), branch `feature/phone-share`; plan: `docs/superpowers/plans/2026-11-21-phone-share.md`.
 
 ## Intent
 The user wants to leave the computer while an important live game plays and keep watching it on a phone, in the

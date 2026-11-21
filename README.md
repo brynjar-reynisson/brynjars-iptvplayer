@@ -263,6 +263,34 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 - A refresh that would shrink the playlist to less than half its cached size is
   refused. A "Force refresh" button overrides that.
 
+## Watching on your phone
+
+Press **S** (or the **Share** button at the bottom right of a playing live channel) to serve that
+channel to a phone browser. The app copies a link to the clipboard; open it on the phone and the
+page plays the channel (a delay of 6-10 seconds is normal). Press S again, Esc, or close the app to
+stop; nothing stays behind (no ffmpeg, no open port, no video files).
+
+- **No second connection.** Providers like yours allow one connection per account, so sharing
+  does not open one. It copies the stream the player already receives (through a local
+  ffmpeg that cuts it into small HLS pieces, without re-encoding) and a tiny web server on
+  `127.0.0.1:8480` hands those out. The pieces are kept in `share/` in the data directory
+  (only the last eight, deleted when sharing stops).
+- **Setup.** The server only listens on this PC. Route your own name to `localhost:8480` with a
+  reverse proxy or tunnel of your choice (for example `iptv.example.org` -> `localhost:8480`) and put
+  that name in `config.toml` as `share_host = "iptv.example.org"` so the copied link uses it. TLS (https)
+  is the proxy's job, and it should forward `X-Forwarded-For` so the SHARING badge can count
+  viewers. `share_port` changes the port (the next port is used inside the PC to carry the
+  stream, so both must be free). Without `share_host` the link is `http://localhost:8480/...`.
+- **The link contains a secret** (a random 128-bit token kept in `settings.json`). Anyone who has the
+  link can watch while sharing is on, so do not post it. Wrong or missing token = an empty 404.
+- **Limits.** Live channels only (not movies or episodes); viewing only (no controls for the phone);
+  no transcoding, so the phone must be able to play the channel's H.264/AAC (HEVC or 4K channels
+  show no picture on most phones); needs `ffmpeg` (next to `iptv-player.exe` or on the PATH); the PC must
+  stay on and the app must keep playing (sleep is blocked while sharing is on); Pause is off
+  while sharing (a paused player would stall the phone); upstream bandwidth must cover about the
+  stream's bitrate for each viewer; recording and sharing exclude each other (both use mpv's
+  stream-record), and a scheduled recording that starts ends sharing. Sharing is off at every start.
+
 ## Developer flags
 
 - The release build is a windowed app and does not open a console window. If you start
@@ -289,6 +317,8 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 - `cargo test --workspace` runs the unit tests. With `IPTV_SAMPLE=<path to a real
   .m3u>`, `cargo test --release --workspace -- --ignored --nocapture` runs the parse,
   library-build, cache and search performance tests.
+- `cargo run --release -p iptv-player --example share_demo` is the headless check of the phone share
+  (real libmpv and ffmpeg, ports 8483-8485 on 127.0.0.1; prints `RESULT: ALL CHECKS OK`).
 - `cargo run -p iptv-player --example retry_demo` runs a headless end-to-end retry check
   against local ffmpeg/HTTP servers (needs `ffmpeg` on PATH and ports 8097-8099).
   `retry_demo --url-from-playlist <file.m3u> <group-title> <index> <secs>` plays one
@@ -338,3 +368,5 @@ If you want a very different workflow, then you're better off forking this repo 
 ## License
 
 MIT, see `LICENSE`. The release zip also contains `libmpv-2.dll` (mpv), which has its own license terms (LGPL/GPL, depending on the build): see <https://mpv.io/>.
+
+The phone share page bundles [hls.js](https://github.com/video-dev/hls.js) 1.5.17 (Apache-2.0, (c) Dailymotion); its notice is in `crates/iptv/assets/HLSJS-LICENSE.txt`.
