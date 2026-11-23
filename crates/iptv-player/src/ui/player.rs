@@ -152,6 +152,7 @@ pub struct Player {
     sup: Supervisor<MpvBackend>,
     renderer: Arc<MpvRenderer>,
     paused: bool,
+    muted: bool,
     last_status: Status,
     /// Subtitle choice to (re)apply on every load of the current video.
     want_sub: Option<SubChoice>,
@@ -199,7 +200,7 @@ impl Player {
             .iter()
             .filter_map(|(k, _)| backend.property(k).map(|v| (*k, v)))
             .collect::<Vec<_>>();
-        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, tune_gen: 0, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now(), imported: Vec::new(), syncs: Vec::new(), secondary_on: false, secondary_gen: 0, warned_no_sync: false, events: Vec::new() })
+        Ok(Player { sup: Supervisor::new(backend), renderer, paused: false, muted: false, last_status: Status::Idle, want_sub: None, sub_gen: 0, tune_gen: 0, tuned: false, tall_defaults, stats_at: Instant::now(), t0: Instant::now(), imported: Vec::new(), syncs: Vec::new(), secondary_on: false, secondary_gen: 0, warned_no_sync: false, events: Vec::new() })
     }
 
     /// Start (or switch to) a stream. Clears a user pause.
@@ -490,6 +491,17 @@ impl Player {
             self.sub_gen = self.sup.generation();
         }
         choice
+    }
+
+    /// Mute / unmute the local sound (mpv `mute`: the stream itself, and so
+    /// recording and sharing, is untouched). Survives channel changes.
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.sup.backend_mut().set_mute(self.muted);
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted
     }
 
     pub fn paused(&self) -> bool {

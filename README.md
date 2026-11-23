@@ -88,7 +88,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
   app downloads the provider's XMLTV guide and the stream-to-guide-channel list, and asks
   `get_short_epg` for each channel you select. The richer of the two answers is shown, and the
   panel's last line names the source. Many channels have no guide data at all.
-- **F** toggles a favorite. **Space** pauses. The **[ ]** button at the video's
+- **F** toggles a favorite. **Space** pauses. **M** (or the speaker button next to play/pause) mutes the local sound only: recording and sharing keep the audio. The **[ ]** button at the video's
   bottom right (or **F11** / **Alt+Enter**) makes the player fill the whole screen, without
   the channel list. **Esc** goes back to how it was before. In full screen the mouse cursor hides after 3 seconds without movement and returns as soon as you move it. The channel or episode title at the top left and the buttons at the bottom right also hide after 5 seconds in full screen (the next-episode offer stays), and show again when you move the mouse or switch channel. Otherwise **Esc** leaves the filter box, or stops
   playback and leaves the player view. **F5** refreshes the playlist.
@@ -266,7 +266,7 @@ groups, subtitle choices, autoplay) live in the data directory. The app looks fo
 ## Watching on your phone
 
 Press **S** (or the **Share** button at the bottom right of a playing live channel) to serve that
-channel to a phone browser. The app copies a link to the clipboard; open it on the phone and the
+channel to a phone or tablet browser (the button's tooltip reads "Share to another device"). The app copies a link to the clipboard; open it on the phone and the
 page plays the channel (a delay of 6-10 seconds is normal). Press S again, Esc, or close the app to
 stop; nothing stays behind (no ffmpeg, no open port, no video files).
 

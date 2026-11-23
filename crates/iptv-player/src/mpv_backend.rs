@@ -895,6 +895,13 @@ impl MpvBackend {
         unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
     }
 
+    /// Silence the local audio output only. `mute` does not touch the demuxer,
+    /// so `stream-record` (recording, phone share) still gets the full stream.
+    pub fn set_mute(&mut self, mute: bool) {
+        let (n, v) = (CString::new("mute").unwrap(), CString::new(if mute { "yes" } else { "no" }).unwrap());
+        unsafe { sys::mpv_set_property_string(self.core.handle, n.as_ptr(), v.as_ptr()) };
+    }
+
     /// Subtitle tracks of the loaded file (empty until it is open).
     pub fn sub_tracks(&self) -> Vec<SubTrack> {
         let h = self.core.handle;

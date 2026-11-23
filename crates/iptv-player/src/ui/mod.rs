@@ -1738,6 +1738,13 @@ impl App {
         }
     }
 
+    /// M / the mute button: local sound only (recording and sharing unaffected).
+    fn toggle_mute(&mut self) {
+        if let Ok(p) = &mut self.player {
+            p.toggle_mute();
+        }
+    }
+
     /// Read, in the background, which schedules have their Windows task.
     fn refresh_task_status(&mut self) {
         let ids: Vec<String> = self.schedules.items().iter().map(|s| s.id.clone()).collect();
@@ -3069,6 +3076,14 @@ impl App {
         if back {
             self.series_back();
         }
+        // M mutes / unmutes the local sound.
+        if !typing
+            && !self.sub_menu
+            && self.playback.is_some()
+            && ctx.input_mut(|i| i.consume_key(M::NONE, Key::M))
+        {
+            self.toggle_mute();
+        }
         // R records the playing live channel / stops the recording.
         if !typing
             && !self.sub_menu
@@ -3439,6 +3454,7 @@ impl App {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
             let mut toggle_pause = false;
+            let mut toggle_mute = false;
             let mut toggle_fs = false;
             let mut toggle_sub = false;
             let mut pick_sub: Option<Option<i64>> = None;
@@ -3470,7 +3486,7 @@ impl App {
                         )
                     };
                     let fav = if self.favs.contains(pb.key()) { "  · Favorite" } else { "" };
-                    let gone = if pb.in_playlist() { "" } else { "  (not in playlist)" };
+                    let gone = if pb.in_playlist() || pb.is_local() { "" } else { "  (not in playlist)" };
                     let base = pb
                         .entry_index()
                         .and_then(|e| playing_title(pb.library(), e, |show| self.titles.get(show)))
@@ -3530,7 +3546,7 @@ impl App {
                     let btn = egui::Rect::from_min_size(rect.right_bottom() - egui::vec2(44.0, 32.0), egui::vec2(32.0, 26.0));
                     // Subtitle button ("CC"), movies and episodes only, left of the play/pause button.
                     if chrome && !pb.is_live() {
-                        let sbtn = btn.translate(egui::vec2(-76.0, 0.0));
+                        let sbtn = btn.translate(egui::vec2(-114.0, 0.0));
                         let s_resp = ui.interact(sbtn, egui::Id::unique("sub_btn"), egui::Sense::click());
                         let tracks = if self.sub_menu || s_resp.hovered() { p.sub_tracks() } else { Vec::new() };
                         let current = p.current_sub();
@@ -3651,7 +3667,7 @@ impl App {
                     // Record button (live only, where "CC" sits for movies): a red
                     // dot starts recording, a white square stops it.
                     if chrome && pb.is_live() {
-                        let rbtn = btn.translate(egui::vec2(-76.0, 0.0));
+                        let rbtn = btn.translate(egui::vec2(-114.0, 0.0));
                         let r_resp = ui.interact(rbtn, egui::Id::unique("rec_btn"), egui::Sense::click());
                         let ra = if r_resp.hovered() { 230 } else { 140 };
                         let rp = ui.painter_at(rect);
@@ -3671,7 +3687,7 @@ impl App {
                         }
                         // Share button, left of it: a broadcast dot with two arcs
                         // (outlined; filled white while sharing).
-                        let sbtn = btn.translate(egui::vec2(-114.0, 0.0));
+                        let sbtn = btn.translate(egui::vec2(-152.0, 0.0));
                         if sbtn.left() >= rect.left() + 4.0 {
                             let sh_resp = ui.interact(sbtn, egui::Id::unique("share_btn"), egui::Sense::click());
                             let sa = if sh_resp.hovered() { 230 } else { 140 };
@@ -3697,15 +3713,57 @@ impl App {
                                     .collect();
                                 sp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, ink)));
                             }
-                            let tip = if on { "Stop sharing (S)" } else { "Share this channel with your phone (S)" };
+                            let tip = if on { "Stop sharing (S)" } else { "Share to another device (S)" };
                             if sh_resp.on_hover_text(tip).clicked() {
                                 toggle_sh = true;
                             }
                         }
                     }
+                    // Mute button (right of play/pause): a speaker, crossed out while
+                    // muted. Silences the local sound only.
+                    if chrome {
+                        let mbtn = btn.translate(egui::vec2(-38.0, 0.0));
+                        let m_resp = ui.interact(mbtn, egui::Id::unique("mute_btn"), egui::Sense::click());
+                        let muted = p.muted();
+                        let ma = if m_resp.hovered() { 230 } else { 140 };
+                        let mp = ui.painter_at(rect);
+                        mp.rect_filled(mbtn, 4.0, egui::Color32::from_black_alpha(ma / 2));
+                        let white = egui::Color32::from_white_alpha(ma);
+                        let c = mbtn.center();
+                        mp.add(egui::Shape::convex_polygon(
+                            vec![
+                                c + egui::vec2(-8.0, -3.0),
+                                c + egui::vec2(-4.0, -3.0),
+                                c + egui::vec2(1.0, -8.0),
+                                c + egui::vec2(1.0, 8.0),
+                                c + egui::vec2(-4.0, 3.0),
+                                c + egui::vec2(-8.0, 3.0),
+                            ],
+                            white,
+                            egui::Stroke::NONE,
+                        ));
+                        let stroke = egui::Stroke::new(2.0, white);
+                        if muted {
+                            mp.line_segment([c + egui::vec2(4.0, -4.0), c + egui::vec2(10.0, 4.0)], stroke);
+                            mp.line_segment([c + egui::vec2(4.0, 4.0), c + egui::vec2(10.0, -4.0)], stroke);
+                        } else {
+                            for r in [5.0_f32, 9.0] {
+                                let pts: Vec<egui::Pos2> = (-3..=3)
+                                    .map(|i| {
+                                        let a = i as f32 * 0.22;
+                                        c + egui::vec2(1.0 + r * a.cos(), r * a.sin())
+                                    })
+                                    .collect();
+                                mp.add(egui::Shape::line(pts, egui::Stroke::new(1.5, white)));
+                            }
+                        }
+                        if m_resp.on_hover_text(if muted { "Unmute (M)" } else { "Mute (M)" }).clicked() {
+                            toggle_mute = true;
+                        }
+                    }
                     // Play/pause button, left of it: shows the action a click performs.
                     if chrome {
-                        let pbtn = btn.translate(egui::vec2(-38.0, 0.0));
+                        let pbtn = btn.translate(egui::vec2(-76.0, 0.0));
                         let pb_resp = ui.interact(pbtn, egui::Id::unique("pause_btn"), egui::Sense::click());
                         let paused = p.paused();
                         let pa = if pb_resp.hovered() { 230 } else { 140 };
@@ -3732,7 +3790,7 @@ impl App {
                     // arrow onto a tray, in the slot left of "CC" (the ">>" button
                     // moves one slot further left when it shows too).
                     let has_next = self.next_cache.get(pb.library(), pb.entry_index(), &self.hidden).is_some();
-                    let xbtn = btn.translate(egui::vec2(if has_next { -152.0 } else { -114.0 }, 0.0));
+                    let xbtn = btn.translate(egui::vec2(if has_next { -190.0 } else { -152.0 }, 0.0));
                     let x_fits = xbtn.left() >= rect.left() + 4.0 && xbtn.top() >= rect.top() + 4.0;
                     if chrome && x_fits && !pb.is_live() && !pb.is_local() && p.status() == Status::Playing {
                         let x_resp = ui.interact(xbtn, egui::Id::unique("export_btn"), egui::Sense::click());
@@ -3759,7 +3817,7 @@ impl App {
                     // Next episode button (">>" as two triangles), left of "CC":
                     // episodes with a next one only; hidden when it would not fit
                     // inside the video rect.
-                    let nbtn = btn.translate(egui::vec2(-114.0, 0.0));
+                    let nbtn = btn.translate(egui::vec2(-152.0, 0.0));
                     let fits = nbtn.left() >= rect.left() + 4.0 && nbtn.top() >= rect.top() + 4.0;
                     if chrome
                         && fits
@@ -3844,6 +3902,9 @@ impl App {
             }
             if let Some(lang) = remove_sub {
                 self.remove_imported(&lang);
+            }
+            if toggle_mute {
+                self.toggle_mute();
             }
             if toggle_pause {
                 self.toggle_pause();

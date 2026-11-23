@@ -97,6 +97,7 @@ pub const KEYS: &[Section] = &[
         title: "While a movie or episode plays",
         rows: &[
             row("Space", "Pause / resume (also live)"),
+            row("M", "Mute / unmute the local sound (recording and sharing keep the audio)"),
             row("Left / Right", "Jump 10 seconds back / forward"),
             row("Shift+Right", "Next episode (the >> button)"),
             row("C", "Subtitle menu: Up/Down + Enter pick, Esc closes"),
